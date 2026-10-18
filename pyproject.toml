@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-assembledrecipes"
+description = "拼装一次，处处直读：LoRA 拼装配方缓存 + 逐层流水开关"
+version = "1.0.0"
+license = {text = "Apache-2.0"}
+dependencies = ["safetensors"]
+
+[project.urls]
+Repository = "https://github.com/PLACEHOLDER/ComfyUI-AssembledRecipes"
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "AssembledRecipes"
+Icon = ""
