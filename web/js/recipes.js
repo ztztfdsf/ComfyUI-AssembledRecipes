@@ -2,6 +2,21 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
+
+// ── 诊断上报（浏览器 → 服务端日志）──
+function diag(stage, extra) {
+  try {
+    api.fetchApi("/assembled-recipes/diag", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stage, ts: Date.now(), url: location.href, ...(extra || {}) }),
+    });
+  } catch (e) { /* ignore */ }
+}
+diag("module-loaded", { hasApp: !!app, hasApi: !!api, hasExtMgr: !!app?.extensionManager });
+window.addEventListener("error", (e) => diag("window-error", { msg: String(e.message || e.error), src: e.filename, line: e.lineno }));
+window.addEventListener("unhandledrejection", (e) => diag("promise-error", { msg: String(e.reason) }));
+
 const REPO_URL = "https://github.com/ztztfdsf/ComfyUI-AssembledRecipes";
 const REPO_TEXT = "github.com/ztztfdsf/ComfyUI-AssembledRecipes";
 
@@ -37,6 +52,7 @@ app.registerExtension({
   name: "AssembledRecipes.Gallery",
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (nodeData?.name !== "RecipeGallery (AssembledRecipes)") return;
+    diag("gallery-hook", { hasAddDOM: typeof nodeType.prototype.addDOMWidget, hasCreated: typeof nodeType.prototype.onNodeCreated });
 
     const COLS = 2, PAD = 8, GAP = 8, CARD_H = 130, IMG_H = 96;
     const HEADER = 18;
@@ -62,6 +78,7 @@ app.registerExtension({
       };
       node._arRefresh();
       try { node.setSize([380, 520]); } catch (e) {}
+      diag("gallery-node-created", { size: node.size, widgets: (node.widgets || []).map((w) => w.name) });
       return r;
     };
 
@@ -75,6 +92,7 @@ app.registerExtension({
 
     proto.onDrawForeground = function (ctx) {
       const ar = this._ar;
+      if (!this._arDiagDraw) { this._arDiagDraw = true; diag("gallery-first-draw", { hasState: !!ar, size: this.size }); }
       if (!ar || this.flags?.collapsed) {
         ctx.save();
         ctx.font = "9px sans-serif";

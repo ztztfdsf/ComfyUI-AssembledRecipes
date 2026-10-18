@@ -70,12 +70,23 @@ async def preview(request):
     return web.Response(status=404)
 
 
+async def diag(request):
+    """前端诊断上报：浏览器把状态 POST 过来，落到服务端日志。"""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {"raw": await request.text()}
+    print(f"[AssembledRecipes][DIAG] {json.dumps(data, ensure_ascii=False)[:600]}", flush=True)
+    return web.json_response({"ok": True})
+
+
 def register_routes():
     if PromptServer is None or not hasattr(PromptServer, "instance") or PromptServer.instance is None:
         return False
     PromptServer.instance.routes.get("/assembled-recipes/list")(list_recipes)
     PromptServer.instance.routes.post("/assembled-recipes/delete")(delete_recipe)
     PromptServer.instance.routes.get("/assembled-recipes/preview/{name}")(preview)
+    PromptServer.instance.routes.post("/assembled-recipes/diag")(diag)
     return True
 
 
