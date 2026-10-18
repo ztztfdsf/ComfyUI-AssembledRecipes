@@ -469,12 +469,79 @@ class RecipeGallery:
         return (model, "")
 
 
+
+class DeepClean:
+    """深度清理：卸载模型权重到内存 + 强制把显存缓存池还给驱动。
+
+    比普通 empty_cache 更彻底：unload → gc → synchronize → empty_cache → ipc_collect → 再 empty。
+    放在跑图链开头（模型加载之前或之后均可，之后=连刚加载的也一并腾出，采样时按需重载）。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "unload_models": ("BOOLEAN", {"default": True, "tooltip": "把已加载模型权重卸回内存(跑图时按需重载)"}),
+                "force_empty_cache": ("BOOLEAN", {"default": True, "tooltip": "强制把显存缓存池还给驱动(不占内存,下次重新申请)"}),
+            },
+            "optional": {
+                "model_pass": ("MODEL", {"lazy": True}),
+                "image_pass": ("IMAGE", {"lazy": True}),
+                "any_input": ("*", {"lazy": True}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "IMAGE", "STRING")
+    RETURN_NAMES = ("model", "image", "report")
+    FUNCTION = "clean"
+    CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "深度清理：模型卸回内存 + 显存缓存池强制还给驱动。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
+
+    def check_lazy_status(self, **kwargs):
+        return [k for k in ("model_pass", "image_pass", "any_input") if k in kwargs]
+
+    def clean(self, unload_models=True, force_empty_cache=True, model_pass=None, image_pass=None, any_input=None):
+        def free_mb():
+            try:
+                return model_management.get_free_memory() / (1024 ** 2)
+            except Exception:
+                return -1.0
+
+        before = free_mb()
+        if unload_models:
+            try:
+                model_management.unload_all_models()
+            except Exception as e:
+                print(f"[AssembledRecipes] unload 失败: {e}")
+        import gc
+        gc.collect()
+        if force_empty_cache:
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            for _ in range(3):
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    break
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+                gc.collect()
+        after = free_mb()
+        report = f"free {before:.0f}MB -> {after:.0f}MB (freed {after - before:.0f}MB)"
+        print(f"[AssembledRecipes] 深度清理: {report}", flush=True)
+        return (model_pass, image_pass, report)
+
 NODE_CLASS_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": RecipeSaveAssembled,
     "RecipeLoad (AssembledRecipes)": RecipeLoadAssembled,
     "StreamToggle (AssembledRecipes)": StreamToggle,
     "RecipeGallery (AssembledRecipes)": RecipeGallery,
     "RecipeRouter (AssembledRecipes)": RecipeRouter,
+    "DeepClean (AssembledRecipes)": DeepClean,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": "配方·保存快照",
@@ -482,4 +549,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeGallery (AssembledRecipes)": "配方·画廊选择",
     "RecipeRouter (AssembledRecipes)": "配方·惰性路由",
     "StreamToggle (AssembledRecipes)": "配方·逐层流水开关",
+    "DeepClean (AssembledRecipes)": "配方·深度清理",
 }
