@@ -60,6 +60,24 @@ async def delete_recipe(request):
     return web.json_response({"ok": True})
 
 
-if PromptServer is not None:
+async def preview(request):
+    name = os.path.basename(request.match_info.get("name", ""))
+    name = os.path.splitext(name)[0]
+    for ext in (".preview.jpg", ".preview.png"):
+        p = os.path.join(RECIPES_DIR, name + ext)
+        if os.path.exists(p):
+            return web.FileResponse(p)
+    return web.Response(status=404)
+
+
+def register_routes():
+    if PromptServer is None or not hasattr(PromptServer, "instance") or PromptServer.instance is None:
+        return False
     PromptServer.instance.routes.get("/assembled-recipes/list")(list_recipes)
     PromptServer.instance.routes.post("/assembled-recipes/delete")(delete_recipe)
+    PromptServer.instance.routes.get("/assembled-recipes/preview/{name}")(preview)
+    return True
+
+
+if not register_routes():
+    print("[AssembledRecipes] PromptServer 未就绪，路由稍后注册")

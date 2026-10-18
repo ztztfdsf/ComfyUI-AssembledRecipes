@@ -1,23 +1,74 @@
-// AssembledRecipes 配方管理面板：浏览已拼装配方 + 删除（软删除到 trash/）
+// AssembledRecipes 配方画廊：瀑布流浏览已拼装配方（点选即用、可删除）
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+
+const CARD_CSS = `
+  .ar-masonry { column-count: 2; column-gap: 8px; }
+  .ar-card { break-inside: avoid; border: 1px solid #444; border-radius: 8px; padding: 6px; margin-bottom: 8px; cursor: pointer; background: #222; }
+  .ar-card:hover { border-color: #8af; }
+  .ar-card.selected { border-color: #6c6; box-shadow: 0 0 6px #6c6; }
+  .ar-card img { width: 100%; border-radius: 4px; display: block; background: #111; min-height: 60px; }
+  .ar-card .nm { font-weight: 600; font-size: 12px; word-break: break-all; margin-top: 4px; }
+  .ar-card .meta { opacity: .7; font-size: 10px; }
+  .ar-card button { margin-top: 4px; font-size: 10px; color: #f66; }
+  .ar-empty { opacity: .6; font-size: 12px; padding: 12px; text-align: center; }
+`;
 
 async function listRecipes() {
   const r = await api.fetchApi("/assembled-recipes/list");
   return (await r.json()).recipes || [];
 }
-
 async function deleteRecipe(name) {
-  const r = await api.fetchApi("/assembled-recipes/delete", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+  await api.fetchApi("/assembled-recipes/delete", {
+    method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
   });
-  return r.ok;
 }
-
 function fmtSize(b) {
   return b > 1 << 30 ? (b / (1 << 30)).toFixed(2) + " GiB" : (b / (1 << 20)).toFixed(1) + " MiB";
+}
+
+function buildGallery(container, { onSelect, getSelected, compact }) {
+  const style = document.createElement("style");
+  style.textContent = CARD_CSS;
+  container.appendChild(style);
+  const masonry = document.createElement("div");
+  masonry.className = "ar-masonry";
+  if (compact) masonry.style.columnCount = "1";
+  container.appendChild(masonry);
+
+  const render = async () => {
+    masonry.innerHTML = "加载中…";
+    let recipes = [];
+    try { recipes = await listRecipes(); } catch (e) { masonry.innerHTML = "加载失败: " + e; return; }
+    if (!recipes.length) { masonry.innerHTML = '<div class="ar-empty">（暂无配方——跑一张带「配方快照·保存」的图）</div>'; return; }
+    masonry.innerHTML = "";
+    const sel = getSelected ? getSelected() : null;
+    for (const r of recipes) {
+      const base = r.name.replace(/\.safetensors$/, "");
+      const card = document.createElement("div");
+      card.className = "ar-card" + (sel && (sel === base || sel === r.name) ? " selected" : "");
+      card.innerHTML = `
+        <img src="/assembled-recipes/preview/${encodeURIComponent(r.name)}" onerror="this.style.opacity=.25" loading="lazy">
+        <div class="nm">${base}</div>
+        <div class="meta">${fmtSize(r.size)} · ${r.created || ""}</div>
+        ${r.lora_info ? `<div class="meta">LoRA: ${r.lora_info}</div>` : ""}
+        <button>删除</button>`;
+      card.onclick = (ev) => {
+        if (ev.target.tagName === "BUTTON") return;
+        onSelect && onSelect(r.name);
+        render();
+      };
+      card.querySelector("button").onclick = async (ev) => {
+        ev.stopPropagation();
+        if (!confirm(`删除配方 ${base} ？（移入 trash/）`)) return;
+        await deleteRecipe(r.name);
+        render();
+      };
+      masonry.appendChild(card);
+    }
+  };
+  return render;
 }
 
 app.registerExtension({
@@ -25,54 +76,43 @@ app.registerExtension({
   setup() {
     app.extensionManager.registerSidebarTab({
       id: "assembled-recipes",
-      title: "配方缓存",
-      icon: "pi pi-database",
+      title: "配方画廊",
+      icon: "pi pi-images",
       type: "custom",
       render: (el) => {
         const box = document.createElement("div");
-        box.style.cssText = "padding:10px;display:flex;flex-direction:column;gap:8px;height:100%;overflow:auto;";
-        box.innerHTML = `
-          <div style="display:flex;gap:6px;">
-            <button id="ar-refresh" style="flex:1;">刷新</button>
-          </div>
-          <div id="ar-list" style="display:flex;flex-direction:column;gap:6px;"></div>
-          <div style="opacity:.6;font-size:11px;">删除 = 移入 models/assembled_recipes/trash/（可手动找回）</div>`;
+        box.style.cssText = "padding:8px;height:100%;overflow:auto;";
+        const head = document.createElement("div");
+        head.innerHTML = `<button id="ar-refresh" style="width:100%;margin-bottom:8px;">刷新</button>`;
+        const body = document.createElement("div");
+        box.appendChild(head); box.appendChild(body);
         el.appendChild(box);
-
-        const render = async () => {
-          const list = box.querySelector("#ar-list");
-          list.innerHTML = "加载中…";
-          try {
-            const recipes = await listRecipes();
-            if (!recipes.length) {
-              list.innerHTML = "（暂无配方）";
-              return;
-            }
-            list.innerHTML = "";
-            for (const r of recipes) {
-              const card = document.createElement("div");
-              card.style.cssText = "border:1px solid #444;border-radius:6px;padding:8px;";
-              card.innerHTML = `
-                <div style="font-weight:600;word-break:break-all;">${r.name}</div>
-                <div style="opacity:.8;font-size:11px;">${fmtSize(r.size)} · ${r.created || ""}</div>
-                ${r.lora_info ? `<div style="opacity:.7;font-size:11px;">LoRA: ${r.lora_info}</div>` : ""}
-                ${r.note ? `<div style="opacity:.7;font-size:11px;">${r.note}</div>` : ""}
-                <button data-name="${r.name}" style="margin-top:6px;color:#f66;">删除</button>`;
-              card.querySelector("button").onclick = async (ev) => {
-                if (!confirm(`删除配方 ${r.name} ？（移入 trash/）`)) return;
-                ev.target.disabled = true;
-                await deleteRecipe(r.name);
-                render();
-              };
-              list.appendChild(card);
-            }
-          } catch (e) {
-            list.innerHTML = "加载失败: " + e;
-          }
-        };
-        box.querySelector("#ar-refresh").onclick = render;
+        const render = buildGallery(body, {});
+        head.querySelector("#ar-refresh").onclick = render;
         render();
       },
     });
+  },
+
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData.name !== "RecipeGallery (AssembledRecipes)") return;
+    const onNodeCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+      const node = this;
+      const container = document.createElement("div");
+      container.style.cssText = "max-height:360px;overflow:auto;padding:2px;";
+      node.addDOMWidget("ar_gallery", "ar_gallery", container, { serialize: false });
+      const render = buildGallery(container, {
+        getSelected: () => (node.widgets?.find(w => w.name === "selected_recipe")?.value) || "",
+        onSelect: (name) => {
+          const w = node.widgets?.find(w => w.name === "selected_recipe");
+          if (w) { w.value = name.replace(/\.safetensors$/, ""); node.setDirtyCanvas?.(true, true); }
+        },
+      });
+      node._arRender = render;
+      render();
+      return r;
+    };
   },
 });

@@ -11,6 +11,7 @@
 
 import json
 import os
+import sys
 import time
 import types
 
@@ -85,22 +86,57 @@ class RecipeSaveAssembled:
             return (image,)
 
         base = model.model if hasattr(model, "model") else model
-        state = {k: v.detach().to("cpu").contiguous() for k, v in base.state_dict().items()}
+        merged = {k.replace("diffusion_model.", "", 1): v.detach().to("cpu").contiguous()
+                  for k, v in base.state_dict().items()}
 
         import safetensors.torch
-        safetensors.torch.save_file(state, path)
+        from safetensors import safe_open
+
+        # 源文件路径（loaders 会把来源记在 cached_patcher_init）
+        src_path = None
+        ci = getattr(model, "cached_patcher_init", None)
+        if ci and len(ci) > 1 and ci[1]:
+            cand = ci[1][0]
+            if isinstance(cand, str) and os.path.exists(cand):
+                src_path = cand
+
+        if src_path:
+            # 全量镜像源文件（保留 comfy_quant / comfy_attention.config 等元数据张量），
+            # 被 LoRA 改过的权重用合并值覆盖
+            with safe_open(src_path, framework="pt") as f:
+                out = {}
+                for k in f.keys():
+                    out[k] = merged[k] if k in merged else f.get_tensor(k)
+                safetensors.torch.save_file(out, path, metadata=f.metadata())
+            print(f"[AssembledRecipes] 配方(全量镜像)已保存: {name} "
+                  f"({os.path.getsize(path):,} B, 源={os.path.basename(src_path)})")
+        else:
+            safetensors.torch.save_file(merged, path)
+            print(f"[AssembledRecipes] 配方(纯权重,无源文件)已保存: {name} ({os.path.getsize(path):,} B)")
 
         meta = {
             "name": name,
             "note": note or "",
             "lora_info": lora_info or "",
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "tensors": len(state),
+            "tensors": len(merged),
             "bytes": os.path.getsize(path),
+            "source": os.path.basename(src_path) if src_path else "",
         }
         with open(os.path.join(RECIPES_DIR, name + ".json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=1)
-        print(f"[AssembledRecipes] 配方已保存: {name} ({meta['bytes']:,} B)")
+
+        # 缩略图（画廊瀑布流用）
+        try:
+            from PIL import Image
+            import numpy as np
+            arr = image[0].detach().to("cpu").numpy()
+            arr = (np.clip(arr, 0, 1) * 255).astype("uint8")
+            im = Image.fromarray(arr)
+            im.thumbnail((320, 320))
+            im.save(os.path.join(RECIPES_DIR, name + ".preview.jpg"), quality=85)
+        except Exception as e:
+            print(f"[AssembledRecipes] 缩略图生成失败(不影响配方): {e}")
         return (image,)
 
 
@@ -114,6 +150,9 @@ class RecipeLoadAssembled:
                 "recipe": (recipe_files(),),
                 "streaming": ("BOOLEAN", {"default": False, "tooltip": "逐层流水：显存峰值极小，稍慢；显存紧张/爆表时开"}),
             },
+            "optional": {
+                "recipe_name": ("STRING", {"forceInput": True, "tooltip": "画廊节点点选的名字会覆盖上面的下拉"}),
+            },
         }
 
     RETURN_TYPES = ("MODEL",)
@@ -126,9 +165,23 @@ class RecipeLoadAssembled:
         p = os.path.join(RECIPES_DIR, recipe)
         return f"{os.path.getmtime(p) if os.path.exists(p) else 0}:{streaming}"
 
-    def load(self, recipe, streaming=False):
+    def load(self, recipe, streaming=False, recipe_name=None):
+        if recipe_name:
+            recipe = recipe_name if recipe_name.endswith(".safetensors") else recipe_name + ".safetensors"
         path = os.path.join(RECIPES_DIR, recipe)
-        patcher = comfy.sd.load_diffusion_model(path)
+        try:
+            patcher = comfy.sd.load_diffusion_model(path)
+        except Exception:
+            # 拆分 qkv / 量化配方走 moss-image 插件加载器（与来源模型同款）
+            import importlib.util
+            moss = os.path.join(folder_paths.base_path, "custom_nodes", "moss-image", "loaders.py")
+            if not os.path.exists(moss):
+                raise
+            spec = importlib.util.spec_from_file_location("moss_image_loaders", moss)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["moss_image_loaders"] = mod
+            spec.loader.exec_module(mod)
+            patcher = mod.load_model(path, "default")
         if streaming:
             patcher = enable_streaming(patcher)
         print(f"[AssembledRecipes] 配方直读: {recipe} | 逐层流水={streaming}")
@@ -159,13 +212,60 @@ class StreamToggle:
         return (model,)
 
 
+
+
+class RecipeGallery:
+    """画廊瀑布流选配方：点卡片直出 MODEL（跳过合并风暴）。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "selected_recipe": ("STRING", {"default": ""}),
+                "streaming": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "recipe_name")
+    FUNCTION = "load"
+    CATEGORY = "AssembledRecipes"
+
+    @classmethod
+    def IS_CHANGED(cls, selected_recipe, streaming):
+        return f"{selected_recipe}:{streaming}"
+
+    def load(self, selected_recipe, streaming=False):
+        recipe = selected_recipe if selected_recipe.endswith(".safetensors") else selected_recipe + ".safetensors"
+        path = os.path.join(RECIPES_DIR, recipe)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"配方不存在: {recipe}（先跑一次带保存的图）")
+        try:
+            patcher = comfy.sd.load_diffusion_model(path)
+        except Exception:
+            import importlib.util
+            moss = os.path.join(folder_paths.base_path, "custom_nodes", "moss-image", "loaders.py")
+            if not os.path.exists(moss):
+                raise
+            spec = importlib.util.spec_from_file_location("moss_image_loaders", moss)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["moss_image_loaders"] = mod
+            spec.loader.exec_module(mod)
+            patcher = mod.load_model(path, "default")
+        if streaming:
+            patcher = enable_streaming(patcher)
+        print(f"[AssembledRecipes] 画廊直读: {recipe} | 逐层流水={streaming}")
+        return (patcher, recipe)
+
 NODE_CLASS_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": RecipeSaveAssembled,
     "RecipeLoad (AssembledRecipes)": RecipeLoadAssembled,
     "StreamToggle (AssembledRecipes)": StreamToggle,
+    "RecipeGallery (AssembledRecipes)": RecipeGallery,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": "配方快照·保存 (AssembledRecipes)",
     "RecipeLoad (AssembledRecipes)": "配方快照·直读 (AssembledRecipes)",
     "StreamToggle (AssembledRecipes)": "逐层流水开关 (AssembledRecipes)",
+    "RecipeGallery (AssembledRecipes)": "配方画廊 (AssembledRecipes)",
 }
