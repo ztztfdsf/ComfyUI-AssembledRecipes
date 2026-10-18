@@ -218,6 +218,7 @@ class RecipeSaveAssembled:
     RETURN_NAMES = ("image",)
     FUNCTION = "snapshot"
     CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "生成结束后把已拼装(含 LoRA)的权重存成配方。名字留空=按 LoRA 组合自动命名。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
     def snapshot(self, model, image, recipe_name, note="", lora_info=None):
         if not (recipe_name or "").strip():
@@ -315,6 +316,7 @@ class RecipeLoadAssembled:
     RETURN_NAMES = ("model",)
     FUNCTION = "load"
     CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "直读配方(零 LoRA 拼装)。streaming=逐层流水，显存峰值≈单层。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
     @classmethod
     def IS_CHANGED(cls, recipe, streaming):
@@ -360,6 +362,7 @@ class StreamToggle:
     RETURN_NAMES = ("model",)
     FUNCTION = "apply"
     CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "MODEL 直通 + 逐层流水开关(权重逐层上卡，显存峰值≈单层)。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
     def apply(self, model, streaming=False):
         if streaming:
@@ -390,6 +393,7 @@ class RecipeRouter:
     RETURN_NAMES = ("model", "used_recipe")
     FUNCTION = "route"
     CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "填组合名=命中配方就直读、不执行 LoRA 分支(省拼装)；留空=走 LoRA 分支。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
     @staticmethod
     def _resolve(recipe_key):
@@ -434,6 +438,7 @@ class RecipeGallery:
     RETURN_NAMES = ("model", "recipe_name")
     FUNCTION = "load"
     CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "画布瀑布流点选配方，直接出 MODEL(跳过拼装)。× 删除缓存。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
     @classmethod
     def IS_CHANGED(cls, selected_recipe, streaming):
@@ -469,9 +474,9 @@ NODE_CLASS_MAPPINGS = {
     "RecipeRouter (AssembledRecipes)": RecipeRouter,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "RecipeSave (AssembledRecipes)": "配方快照·保存 (AssembledRecipes)",
-    "RecipeLoad (AssembledRecipes)": "配方快照·直读 (AssembledRecipes)",
-    "StreamToggle (AssembledRecipes)": "逐层流水开关 (AssembledRecipes)",
-    "RecipeGallery (AssembledRecipes)": "配方画廊 (AssembledRecipes)",
-    "RecipeRouter (AssembledRecipes)": "配方路由·有则直读 (AssembledRecipes)",
+    "RecipeSave (AssembledRecipes)": "配方·保存快照",
+    "RecipeLoad (AssembledRecipes)": "配方·直读加载",
+    "RecipeGallery (AssembledRecipes)": "配方·画廊选择",
+    "RecipeRouter (AssembledRecipes)": "配方·惰性路由",
+    "StreamToggle (AssembledRecipes)": "配方·逐层流水开关",
 }
