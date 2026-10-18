@@ -418,7 +418,7 @@ class RecipeRouter:
             print(f"[AssembledRecipes] 路由命中配方（跳过拼装）: {os.path.basename(path)}")
             return (patcher, os.path.basename(path))
         if model is None:
-            raise ValueError("配方不存在且没有兜底 model（检查连线）")
+            raise ValueError("【AssembledRecipes】配方不存在，且兜底 model 输入是空的——请把 LoRA 输出接到本节点的 model 输入")
         print("[AssembledRecipes] 路由未命中配方 → 走 LoRA 分支")
         return (model, "")
 
@@ -464,7 +464,7 @@ class RecipeGallery:
             print(f"[AssembledRecipes] 画廊直读配方（跳过拼装）: {os.path.basename(path)}")
             return (patcher, os.path.basename(path))
         if model is None:
-            raise ValueError("没选配方也没有兜底 model（检查连线）")
+            raise ValueError("【AssembledRecipes】没选配方，且兜底 model 输入是空的——请把 LoRA 输出接到本节点的 model 输入")
         print("[AssembledRecipes] 画廊未选配方 → 走兜底 model 分支")
         return (model, "")
 
