@@ -535,6 +535,63 @@ class DeepClean:
         print(f"[AssembledRecipes] 深度清理: {report}", flush=True)
         return (model_pass, image_pass, report)
 
+
+class FreeVram:
+    """把非主模型（文本编码器等）卸回内存，只留要采样的模型。
+
+    放在「编码完成后、采样之前」：会等所有 conditioning 就绪再动手，
+    然后把除 model 输入之外的已加载模型全部 offload 到内存，并清显存缓存。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"model": ("MODEL",)},
+            "optional": {
+                "conditioning_1": ("CONDITIONING", {"tooltip": "接正/负条件（用于保证本节点在编码之后执行）"}),
+                "conditioning_2": ("CONDITIONING",),
+                "conditioning_3": ("CONDITIONING",),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "report")
+    FUNCTION = "free"
+    CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "采样前把文本编码器等非主模型卸回内存（省 5G+ 显存），只留要采样的模型。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
+
+    def free(self, model, conditioning_1=None, conditioning_2=None, conditioning_3=None):
+        # MODEL 输入本身就是 ModelPatcher；current_loaded_models 里存的也是 patcher
+        keep_patcher = model
+        before = model_management.get_free_memory()
+        keep = []
+        for lm in list(model_management.current_loaded_models):
+            m = lm.model
+            if m is None:
+                continue
+            same = m is keep_patcher
+            if not same and hasattr(m, "is_clone"):
+                try:
+                    same = m.is_clone(keep_patcher)
+                except Exception:
+                    same = False
+            if same:
+                keep.append(lm)
+        names = [type(getattr(lm.model, "model", lm.model)).__name__
+                 for lm in model_management.current_loaded_models if lm not in keep]
+        print(f"[AssembledRecipes] 已加载: {[type(getattr(lm.model,'model',lm.model)).__name__ for lm in model_management.current_loaded_models]} | 保留 {len(keep)} 个", flush=True)
+        try:
+            model_management.free_memory(1e30, model_management.get_torch_device(), keep_loaded=keep)
+        except Exception as e:
+            print(f"[AssembledRecipes] free_memory 失败，退回卸载全部: {e}", flush=True)
+            model_management.unload_all_models()
+        model_management.soft_empty_cache()
+        after = model_management.get_free_memory()
+        report = (f"卸回内存: {', '.join(names) if names else '无'} | "
+                  f"空闲 {before / 2**20:.0f}MB -> {after / 2**20:.0f}MB")
+        print(f"[AssembledRecipes] {report}", flush=True)
+        return (model, report)
+
 NODE_CLASS_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": RecipeSaveAssembled,
     "RecipeLoad (AssembledRecipes)": RecipeLoadAssembled,
@@ -542,6 +599,7 @@ NODE_CLASS_MAPPINGS = {
     "RecipeGallery (AssembledRecipes)": RecipeGallery,
     "RecipeRouter (AssembledRecipes)": RecipeRouter,
     "DeepClean (AssembledRecipes)": DeepClean,
+    "FreeVram (AssembledRecipes)": FreeVram,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": "配方·保存快照",
@@ -550,4 +608,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeRouter (AssembledRecipes)": "配方·惰性路由",
     "StreamToggle (AssembledRecipes)": "配方·逐层流水开关",
     "DeepClean (AssembledRecipes)": "配方·深度清理",
+    "FreeVram (AssembledRecipes)": "配方·踢编码器回内存",
 }
