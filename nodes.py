@@ -11,6 +11,7 @@
 
 import json
 import os
+import re
 import sys
 import time
 import types
@@ -55,6 +56,89 @@ def enable_streaming(patcher):
     patcher._assembled_streaming = True
     return patcher
 
+
+
+PREVIEW_SUFFIXES = [
+    ".preview.webp", ".preview.png", ".preview.jpg", ".preview.jpeg",
+    ".webp", ".png", ".jpg", ".jpeg", ".example.0.jpeg",
+]
+
+
+def _parse_lora_info(text):
+    """<lora:name:strength[:clip]> → [(name, strength)]"""
+    return [(m.group(1), m.group(2))
+            for m in re.finditer(r"<lora:([^:>]+):([0-9.]+)(?::([0-9.]+))?>", text or "")]
+
+
+def _find_lora_preview(lora_name):
+    try:
+        roots = folder_paths.get_folder_paths("loras")
+    except Exception:
+        return None
+    rel = lora_name.replace(chr(92), "/")
+    for root in roots:
+        base = os.path.join(root, rel)
+        d = os.path.dirname(base)
+        b = os.path.basename(base)
+        for suf in PREVIEW_SUFFIXES:
+            p = os.path.join(d, b + suf)
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def _compose_lora_preview(lora_entries, height=300):
+    """把组合里每个 LoRA 的预览图横排合成一张，图上写 LoRA 名。"""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return None
+    tiles = []
+    for name, strength in lora_entries:
+        p = _find_lora_preview(name)
+        if not p:
+            continue
+        try:
+            im = Image.open(p).convert("RGB")
+        except Exception:
+            continue
+        w = max(1, int(im.width * height / max(1, im.height)))
+        tiles.append((im.resize((w, height)), f"{os.path.basename(name)} :{strength}"))
+    if not tiles:
+        return None
+    total_w = min(sum(t[0].width for t in tiles), 2400)
+    canvas = Image.new("RGB", (max(total_w, 64), height + 26), (24, 24, 24))
+    draw = ImageDraw.Draw(canvas)
+    font = None
+    for fp in ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/arial.ttf"):
+        try:
+            font = ImageFont.truetype(fp, 18)
+            break
+        except Exception:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+    x = 0
+    for im, label in tiles:
+        if x + im.width > canvas.width:
+            im = im.crop((0, 0, max(1, canvas.width - x), im.height))
+        canvas.paste(im, (x, 0))
+        draw.text((x + 6, height + 3), label, fill=(255, 255, 255), font=font)
+        x += im.width
+        if x >= canvas.width:
+            break
+    return canvas
+
+
+def _save_thumb(img_obj, path, size=(320, 320)):
+    try:
+        im = img_obj.copy()
+        im.thumbnail(size)
+        im.save(path, quality=85)
+        return True
+    except Exception as e:
+        print(f"[AssembledRecipes] 缩略图保存失败: {e}")
+        return False
 
 class RecipeSaveAssembled:
     """生成链尾部快照：把当前已拼装（含 LoRA 补丁）的权重存成配方。"""
@@ -126,17 +210,23 @@ class RecipeSaveAssembled:
         with open(os.path.join(RECIPES_DIR, name + ".json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=1)
 
-        # 缩略图（画廊瀑布流用）
-        try:
-            from PIL import Image
-            import numpy as np
-            arr = image[0].detach().to("cpu").numpy()
-            arr = (np.clip(arr, 0, 1) * 255).astype("uint8")
-            im = Image.fromarray(arr)
-            im.thumbnail((320, 320))
-            im.save(os.path.join(RECIPES_DIR, name + ".preview.jpg"), quality=85)
-        except Exception as e:
-            print(f"[AssembledRecipes] 缩略图生成失败(不影响配方): {e}")
+        # 封面：优先 LoRA 预览合成图（图上写 LoRA 名），否则退回生成图缩略
+        preview_path = os.path.join(RECIPES_DIR, name + ".preview.jpg")
+        entries = _parse_lora_info(lora_info or "")
+        composed = _compose_lora_preview(entries) if entries else None
+        if composed is not None:
+            _save_thumb(composed, preview_path, size=(720, 720))
+            print(f"[AssembledRecipes] 封面=LoRA 合成图 ({len(entries)} 个)")
+        else:
+            try:
+                from PIL import Image
+                import numpy as np
+                arr = image[0].detach().to("cpu").numpy()
+                arr = (np.clip(arr, 0, 1) * 255).astype("uint8")
+                _save_thumb(Image.fromarray(arr), preview_path)
+                print("[AssembledRecipes] 封面=生成图缩略")
+            except Exception as e:
+                print(f"[AssembledRecipes] 封面生成失败(不影响配方): {e}")
         return (image,)
 
 

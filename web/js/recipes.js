@@ -7,7 +7,12 @@ const CARD_CSS = `
   .ar-card { break-inside: avoid; border: 1px solid #444; border-radius: 8px; padding: 6px; margin-bottom: 8px; cursor: pointer; background: #222; }
   .ar-card:hover { border-color: #8af; }
   .ar-card.selected { border-color: #6c6; box-shadow: 0 0 6px #6c6; }
+  .ar-card { position: relative; }
   .ar-card img { width: 100%; border-radius: 4px; display: block; background: #111; min-height: 60px; }
+  .ar-del { position: absolute; right: 8px; top: 8px; width: 22px; height: 22px; border-radius: 50%;
+            background: rgba(200,40,40,.85); color: #fff; border: none; cursor: pointer; font-size: 14px;
+            line-height: 20px; text-align: center; padding: 0; }
+  .ar-del:hover { background: rgba(240,60,60,1); }
   .ar-card .nm { font-weight: 600; font-size: 12px; word-break: break-all; margin-top: 4px; }
   .ar-card .meta { opacity: .7; font-size: 10px; }
   .ar-card button { margin-top: 4px; font-size: 10px; color: #f66; }
@@ -50,16 +55,16 @@ function buildGallery(container, { onSelect, getSelected, compact }) {
       card.className = "ar-card" + (sel && (sel === base || sel === r.name) ? " selected" : "");
       card.innerHTML = `
         <img src="/assembled-recipes/preview/${encodeURIComponent(r.name)}" onerror="this.style.opacity=.25" loading="lazy">
+        <button class="ar-del" title="删除缓存">×</button>
         <div class="nm">${base}</div>
         <div class="meta">${fmtSize(r.size)} · ${r.created || ""}</div>
-        ${r.lora_info ? `<div class="meta">LoRA: ${r.lora_info}</div>` : ""}
-        <button>删除</button>`;
+        ${r.lora_info ? `<div class="meta">LoRA: ${r.lora_info}</div>` : ""}`;
       card.onclick = (ev) => {
-        if (ev.target.tagName === "BUTTON") return;
+        if (ev.target.classList?.contains("ar-del")) return;
         onSelect && onSelect(r.name);
         render();
       };
-      card.querySelector("button").onclick = async (ev) => {
+      card.querySelector(".ar-del").onclick = async (ev) => {
         ev.stopPropagation();
         if (!confirm(`删除配方 ${base} ？（移入 trash/）`)) return;
         await deleteRecipe(r.name);
