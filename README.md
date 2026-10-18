@@ -50,6 +50,12 @@
 前端带自动修复：加载工作流后若发现「模型链断了」（画廊/清理节点的 MODEL 输入空着），
 会自动从上游接上，并在浏览器控制台打印 `[AssembledRecipes] 自动补线 N 根`。
 
+## 交流与反馈
+
+**Discord 服务器**：https://discord.gg/6JjXGccYG
+
+有问题、Bug、需求都可以来提。
+
 ## 安装
 
 ComfyUI Manager 搜 `AssembledRecipes`，或：
