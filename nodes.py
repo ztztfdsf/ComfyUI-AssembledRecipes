@@ -43,6 +43,22 @@ def _sanitize(name: str) -> str:
     return name or f"recipe_{int(time.time())}"
 
 
+def _load_any(path):
+    """优先原生加载；失败回退 moss-image 插件加载器（拆分 qkv 量化配方）。"""
+    try:
+        return comfy.sd.load_diffusion_model(path)
+    except Exception:
+        moss = os.path.join(folder_paths.base_path, "custom_nodes", "moss-image", "loaders.py")
+        if not os.path.exists(moss):
+            raise
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("moss_image_loaders", moss)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["moss_image_loaders"] = mod
+        spec.loader.exec_module(mod)
+        return mod.load_model(path, "default")
+
+
 def enable_streaming(patcher):
     """实例级绑定：强制逐层流水（不动核心类，只包我们自己的实例）。"""
     orig = patcher.partially_load
@@ -204,6 +220,15 @@ class RecipeSaveAssembled:
     CATEGORY = "AssembledRecipes"
 
     def snapshot(self, model, image, recipe_name, note="", lora_info=None):
+        if not (recipe_name or "").strip():
+            entries = _parse_lora_info(lora_info or "")
+            if entries:
+                recipe_name = "auto_" + "+".join(
+                    _sanitize(n.split("/")[-1].replace(".safetensors", "")) for n, _s in entries)
+                print(f"[AssembledRecipes] 自动命名: {recipe_name}")
+            else:
+                print("[AssembledRecipes] 名字为空且无 LoRA 信息，跳过快照")
+                return (image,)
         name = _sanitize(recipe_name)
         path = os.path.join(RECIPES_DIR, name + ".safetensors")
         if os.path.exists(path):
@@ -345,6 +370,54 @@ class StreamToggle:
 
 
 
+
+class RecipeRouter:
+    """按组合键路由：有配方→直读配方（不执行 model 分支）；没有→执行 model 分支（LoRA 拼装）并返回。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "recipe_key": ("STRING", {"default": "", "tooltip": "配方名/组合键；例：auto_Nyalia+QAQ。留空=强制走 model 分支"}),
+                "streaming": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "model": ("MODEL", {"lazy": True, "tooltip": "兜底分支：只有配方不存在时才会执行（避免拼装费）"}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "used_recipe")
+    FUNCTION = "route"
+    CATEGORY = "AssembledRecipes"
+
+    @staticmethod
+    def _resolve(recipe_key):
+        key = (recipe_key or "").strip()
+        if not key:
+            return None
+        fname = key if key.endswith(".safetensors") else key + ".safetensors"
+        path = os.path.join(RECIPES_DIR, fname)
+        return path if os.path.exists(path) else None
+
+    def check_lazy_status(self, recipe_key="", streaming=False, model=None):
+        if self._resolve(recipe_key):
+            return []
+        return ["model"]
+
+    def route(self, recipe_key="", streaming=False, model=None):
+        path = self._resolve(recipe_key)
+        if path:
+            patcher = _load_any(path)
+            if streaming:
+                patcher = enable_streaming(patcher)
+            print(f"[AssembledRecipes] 路由命中配方（跳过拼装）: {os.path.basename(path)}")
+            return (patcher, os.path.basename(path))
+        if model is None:
+            raise ValueError("配方不存在且没有兜底 model（检查连线）")
+        print("[AssembledRecipes] 路由未命中配方 → 走 LoRA 分支")
+        return (model, "")
+
 class RecipeGallery:
     """画廊瀑布流选配方：点卡片直出 MODEL（跳过合并风暴）。"""
 
@@ -393,10 +466,12 @@ NODE_CLASS_MAPPINGS = {
     "RecipeLoad (AssembledRecipes)": RecipeLoadAssembled,
     "StreamToggle (AssembledRecipes)": StreamToggle,
     "RecipeGallery (AssembledRecipes)": RecipeGallery,
+    "RecipeRouter (AssembledRecipes)": RecipeRouter,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": "配方快照·保存 (AssembledRecipes)",
     "RecipeLoad (AssembledRecipes)": "配方快照·直读 (AssembledRecipes)",
     "StreamToggle (AssembledRecipes)": "逐层流水开关 (AssembledRecipes)",
     "RecipeGallery (AssembledRecipes)": "配方画廊 (AssembledRecipes)",
+    "RecipeRouter (AssembledRecipes)": "配方路由·有则直读 (AssembledRecipes)",
 }
