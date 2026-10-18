@@ -343,3 +343,74 @@ app.registerExtension({
     }
   },
 });
+
+
+// ── 自动补线：模型链断了自动接上（只动我们自己的节点 + VRAM_Debug 清理节点）──
+function autoRepair(reason) {
+  const graph = app.graph;
+  if (!graph || !graph._nodes) return;
+  const nodes = graph._nodes;
+  const has = (n, kw) => (n.type || "").includes(kw);
+  const modelOut = (n) => {
+    const idx = (n.outputs || []).findIndex((o) => o.type === "MODEL");
+    return idx >= 0 ? idx : -1;
+  };
+  const modelIn = (n) => (n.inputs || []).findIndex((i) => i.name === "model" || i.name === "model_pass");
+  const freeOut = (n, idx) => !n.outputs[idx].links || n.outputs[idx].links.length === 0;
+
+  const galleries = nodes.filter((n) => has(n, "RecipeGallery") || has(n, "RecipeRouter"));
+  const vds = nodes.filter((n) => has(n, "VRAM_Debug"));
+  const sources = nodes.filter((n) => has(n, "Lora Loader") || has(n, "UNETLoader"));
+  let fixed = 0;
+
+  // ① 清理节点缺 model_pass 输入 → 从左侧的加载器/LoRA 接上
+  for (const d of vds) {
+    const ii = modelIn(d);
+    if (ii < 0) continue;
+    if (d.inputs[ii].link != null) continue;
+    const up = sources.filter((s) => s.pos[0] < d.pos[0] && modelOut(s) >= 0);
+    if (!up.length) continue;
+    const src = up.sort((a, b) => b.pos[0] - a.pos[0])[0];
+    try {
+      src.connect(modelOut(src), d, ii);
+      fixed++;
+      diag("autorepair-vd", { from: src.type, to: d.title || d.type });
+    } catch (e) { diag("autorepair-vd-fail", { err: String(e) }); }
+  }
+
+  // ② 画廊缺 model 输入 → 优先接左边空闲的 model_pass 输出，其次接 LoRA
+  for (const g of galleries) {
+    const ii = (g.inputs || []).findIndex((i) => i.name === "model");
+    if (ii < 0 || g.inputs[ii].link != null) continue;
+    let src = null;
+    const cands = vds.filter((d) => d.pos[0] < g.pos[0] && modelOut(d) >= 0)
+      .map((d) => ({ d, slot: d.outputs.findIndex((o) => o.name === "model_pass") }))
+      .filter((x) => x.slot >= 0);
+    const preferred = cands.find((x) => freeOut(x.d, x.slot)) || cands[0];
+    if (preferred) src = { n: preferred.d, slot: preferred.slot };
+    else {
+      const ls = sources.filter((s) => s.pos[0] < g.pos[0] && modelOut(s) >= 0);
+      if (ls.length) src = { n: ls.sort((a, b) => b.pos[0] - a.pos[0])[0], slot: modelOut(ls.sort((a, b) => b.pos[0] - a.pos[0])[0]) };
+    }
+    if (src) {
+      try {
+        src.n.connect(src.slot, g, ii);
+        fixed++;
+        diag("autorepair-gallery", { from: src.n.type, to: g.type });
+      } catch (e) { diag("autorepair-gallery-fail", { err: String(e) }); }
+    }
+  }
+
+  if (fixed) {
+    graph.setDirtyCanvas(true, true);
+    console.warn(`[AssembledRecipes] 自动补线 ${fixed} 根（${reason}）`);
+  }
+  return fixed;
+}
+
+app.registerExtension({
+  name: "AssembledRecipes.AutoRepair",
+  async afterConfigureGraph() { setTimeout(() => autoRepair("graph-loaded"), 300); },
+  async setup() { setTimeout(() => autoRepair("page-load"), 2000); },
+  async loadedGraphNode() { setTimeout(() => autoRepair("node-loaded"), 600); },
+});
