@@ -1,22 +1,25 @@
-// AssembledRecipes 配方画廊：瀑布流浏览已拼装配方（点选即用、可删除）
+// AssembledRecipes 配方画廊：瀑布流浏览已拼装配方（点选即用、× 删除）
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
+const REPO_URL = "https://github.com/ztztfdsf/ComfyUI-AssembledRecipes";
+const REPO_TEXT = "github.com/ztztfdsf/ComfyUI-AssembledRecipes";
+
 const CARD_CSS = `
-  .ar-masonry { column-count: 2; column-gap: 8px; }
-  .ar-card { break-inside: avoid; border: 1px solid #444; border-radius: 8px; padding: 6px; margin-bottom: 8px; cursor: pointer; background: #222; }
+  .ar-wrap { width: 100%; height: 100%; overflow: auto; box-sizing: border-box; }
+  .ar-masonry { column-count: 2; column-gap: 8px; padding: 4px; }
+  .ar-card { position: relative; break-inside: avoid; border: 1px solid #444; border-radius: 8px;
+             padding: 6px; margin: 0 0 8px 0; cursor: pointer; background: #222; overflow: hidden; }
   .ar-card:hover { border-color: #8af; }
-  .ar-card.selected { border-color: #6c6; box-shadow: 0 0 6px #6c6; }
-  .ar-card { position: relative; }
-  .ar-card img { width: 100%; border-radius: 4px; display: block; background: #111; min-height: 60px; }
+  .ar-card.selected { border-color: #6c6; box-shadow: 0 0 8px #6c6; }
+  .ar-card img { width: 100%; border-radius: 4px; display: block; background: #111; min-height: 40px; }
+  .ar-card .nm { font-weight: 600; font-size: 12px; word-break: break-all; margin-top: 4px; color: #eee; }
+  .ar-card .meta { opacity: .7; font-size: 10px; color: #ccc; }
   .ar-del { position: absolute; right: 8px; top: 8px; width: 22px; height: 22px; border-radius: 50%;
             background: rgba(200,40,40,.85); color: #fff; border: none; cursor: pointer; font-size: 14px;
             line-height: 20px; text-align: center; padding: 0; }
   .ar-del:hover { background: rgba(240,60,60,1); }
-  .ar-card .nm { font-weight: 600; font-size: 12px; word-break: break-all; margin-top: 4px; }
-  .ar-card .meta { opacity: .7; font-size: 10px; }
-  .ar-card button { margin-top: 4px; font-size: 10px; color: #f66; }
-  .ar-empty { opacity: .6; font-size: 12px; padding: 12px; text-align: center; }
+  .ar-empty { opacity: .65; font-size: 12px; padding: 12px; text-align: center; color: #ddd; }
 `;
 
 async function listRecipes() {
@@ -33,20 +36,27 @@ function fmtSize(b) {
   return b > 1 << 30 ? (b / (1 << 30)).toFixed(2) + " GiB" : (b / (1 << 20)).toFixed(1) + " MiB";
 }
 
-function buildGallery(container, { onSelect, getSelected, compact }) {
+function buildGallery(container, { onSelect, getSelected, columns = 2 } = {}) {
   const style = document.createElement("style");
   style.textContent = CARD_CSS;
   container.appendChild(style);
+  const wrap = document.createElement("div");
+  wrap.className = "ar-wrap";
   const masonry = document.createElement("div");
   masonry.className = "ar-masonry";
-  if (compact) masonry.style.columnCount = "1";
-  container.appendChild(masonry);
+  masonry.style.columnCount = String(columns);
+  wrap.appendChild(masonry);
+  container.appendChild(wrap);
 
   const render = async () => {
     masonry.innerHTML = "加载中…";
     let recipes = [];
-    try { recipes = await listRecipes(); } catch (e) { masonry.innerHTML = "加载失败: " + e; return; }
-    if (!recipes.length) { masonry.innerHTML = '<div class="ar-empty">（暂无配方——跑一张带「配方快照·保存」的图）</div>'; return; }
+    try { recipes = await listRecipes(); }
+    catch (e) { masonry.innerHTML = `<div class="ar-empty">加载失败: ${e}</div>`; return; }
+    if (!recipes.length) {
+      masonry.innerHTML = '<div class="ar-empty">（暂无配方——跑一张带「配方快照·保存」的图）</div>';
+      return;
+    }
     masonry.innerHTML = "";
     const sel = getSelected ? getSelected() : null;
     for (const r of recipes) {
@@ -54,11 +64,12 @@ function buildGallery(container, { onSelect, getSelected, compact }) {
       const card = document.createElement("div");
       card.className = "ar-card" + (sel && (sel === base || sel === r.name) ? " selected" : "");
       card.innerHTML = `
-        <img src="/assembled-recipes/preview/${encodeURIComponent(r.name)}" onerror="this.style.opacity=.25" loading="lazy">
+        <img src="/assembled-recipes/preview/${encodeURIComponent(r.name)}" loading="lazy"
+             onerror="this.style.opacity=.2;this.alt='(无预览)'">
         <button class="ar-del" title="删除缓存">×</button>
         <div class="nm">${base}</div>
         <div class="meta">${fmtSize(r.size)} · ${r.created || ""}</div>
-        ${r.lora_info ? `<div class="meta">LoRA: ${r.lora_info}</div>` : ""}`;
+        ${r.lora_info ? `<div class="meta">${r.lora_info}</div>` : ""}`;
       card.onclick = (ev) => {
         if (ev.target.classList?.contains("ar-del")) return;
         onSelect && onSelect(r.name);
@@ -76,56 +87,73 @@ function buildGallery(container, { onSelect, getSelected, compact }) {
   return render;
 }
 
+// ① 画布节点：配方画廊（DOM 控件必须声明 surfaces.canvas=shown，否则不显示）
 app.registerExtension({
-  name: "AssembledRecipes.Panel",
-  setup() {
-    app.extensionManager.registerSidebarTab({
-      id: "assembled-recipes",
-      title: "配方画廊",
-      icon: "pi pi-images",
-      type: "custom",
-      render: (el) => {
-        const box = document.createElement("div");
-        box.style.cssText = "padding:8px;height:100%;overflow:auto;";
-        const head = document.createElement("div");
-        head.innerHTML = `<button id="ar-refresh" style="width:100%;margin-bottom:8px;">刷新</button>`;
-        const body = document.createElement("div");
-        box.appendChild(head); box.appendChild(body);
-        el.appendChild(box);
-        const render = buildGallery(body, {});
-        head.querySelector("#ar-refresh").onclick = render;
-        render();
-      },
-    });
-  },
-
+  name: "AssembledRecipes.GalleryNode",
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData.name !== "RecipeGallery (AssembledRecipes)") return;
-    const onNodeCreated = nodeType.prototype.onNodeCreated;
+    if (nodeData?.name !== "RecipeGallery (AssembledRecipes)") return;
+    const orig = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
-      const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+      const r = orig ? orig.apply(this, arguments) : undefined;
       const node = this;
       const container = document.createElement("div");
-      container.style.cssText = "max-height:360px;overflow:auto;padding:2px;";
-      node.addDOMWidget("ar_gallery", "ar_gallery", container, { serialize: false });
+      container.style.cssText = "width:100%;height:360px;min-height:220px;overflow:auto;background:#1b1b1b;border-radius:6px;";
+      node.addDOMWidget("ar_gallery", "ar_gallery", container, {
+        serialize: false,
+        hideOnZoom: false,
+        surfaces: { canvas: "shown", vueNode: "never", panel: "never" },
+      });
       const render = buildGallery(container, {
-        getSelected: () => (node.widgets?.find(w => w.name === "selected_recipe")?.value) || "",
+        columns: 2,
+        getSelected: () => node.widgets?.find((w) => w.name === "selected_recipe")?.value || "",
         onSelect: (name) => {
-          const w = node.widgets?.find(w => w.name === "selected_recipe");
-          if (w) { w.value = name.replace(/\.safetensors$/, ""); node.setDirtyCanvas?.(true, true); }
+          const w = node.widgets?.find((w) => w.name === "selected_recipe");
+          if (w) {
+            w.value = name.replace(/\.safetensors$/, "");
+            node.setDirtyCanvas?.(true, true);
+            app.graph?.setDirtyCanvas?.(true, true);
+          }
         },
       });
       node._arRender = render;
-      render();
+      try { node.setSize([360, 500]); } catch (e) {}
+      setTimeout(render, 50);
       return r;
     };
   },
 });
 
-// —— 节点角落显示 GitHub 地址（点击打开）——
-const REPO_URL = "https://github.com/ztztfdsf/ComfyUI-AssembledRecipes";
-const REPO_TEXT = "github.com/ztztfdsf/ComfyUI-AssembledRecipes";
+// ② 侧边栏面板
+app.registerExtension({
+  name: "AssembledRecipes.Panel",
+  setup() {
+    try {
+      app.extensionManager.registerSidebarTab({
+        id: "assembled-recipes",
+        title: "配方画廊",
+        icon: "pi pi-images",
+        type: "custom",
+        render: (el) => {
+          const box = document.createElement("div");
+          box.style.cssText = "padding:8px;height:100%;overflow:auto;box-sizing:border-box;";
+          const head = document.createElement("div");
+          head.innerHTML = `<button id="ar-refresh" style="width:100%;margin-bottom:8px;">刷新</button>`;
+          const body = document.createElement("div");
+          box.appendChild(head);
+          box.appendChild(body);
+          el.appendChild(box);
+          const render = buildGallery(body, { columns: 2 });
+          head.querySelector("#ar-refresh").onclick = render;
+          render();
+        },
+      });
+    } catch (e) {
+      console.warn("[AssembledRecipes] 侧边栏注册失败:", e);
+    }
+  },
+});
 
+// ③ 节点右下角显示 GitHub 地址（点击打开）
 app.registerExtension({
   name: "AssembledRecipes.RepoCorner",
   async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -147,7 +175,7 @@ app.registerExtension({
     };
 
     const origDown = nodeType.prototype.onMouseDown;
-    nodeType.prototype.onMouseDown = function (e, localPos, graphCanvas) {
+    nodeType.prototype.onMouseDown = function (e, localPos) {
       const r = this._repoRect;
       if (r && localPos && localPos[0] >= r.x && localPos[0] <= r.x + r.w
           && localPos[1] >= r.y && localPos[1] <= r.y + r.h) {
