@@ -6,7 +6,7 @@ license = {text = "Apache-2.0"}
 dependencies = ["safetensors"]
 
 [project.urls]
-Repository = "https://github.com/PLACEHOLDER/ComfyUI-AssembledRecipes"
+Repository = "https://github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
 [tool.comfy]
 PublisherId = ""

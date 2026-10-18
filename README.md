@@ -33,7 +33,7 @@ ComfyUI Manager 搜 `AssembledRecipes`，或：
 
 ```bash
 cd custom_nodes
-git clone https://github.com/<you>/ComfyUI-AssembledRecipes
+git clone https://github.com/ztztfdsf/ComfyUI-AssembledRecipes
 # 重启 ComfyUI
 ```
 
