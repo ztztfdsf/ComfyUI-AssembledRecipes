@@ -121,3 +121,40 @@ app.registerExtension({
     };
   },
 });
+
+// —— 节点角落显示 GitHub 地址（点击打开）——
+const REPO_URL = "https://github.com/ztztfdsf/ComfyUI-AssembledRecipes";
+const REPO_TEXT = "github.com/ztztfdsf/ComfyUI-AssembledRecipes";
+
+app.registerExtension({
+  name: "AssembledRecipes.RepoCorner",
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+    if (!nodeData?.name || !nodeData.name.includes("(AssembledRecipes)")) return;
+
+    const origDraw = nodeType.prototype.onDrawForeground;
+    nodeType.prototype.onDrawForeground = function (ctx) {
+      if (origDraw) origDraw.apply(this, arguments);
+      if (this.flags?.collapsed) return;
+      ctx.save();
+      ctx.font = "10px sans-serif";
+      const w = ctx.measureText(REPO_TEXT).width;
+      const x = Math.max(4, this.size[0] - w - 8);
+      const y = this.size[1] - 6;
+      this._repoRect = { x: x - 2, y: y - 11, w: w + 4, h: 13 };
+      ctx.fillStyle = "rgba(120,170,255,0.9)";
+      ctx.fillText(REPO_TEXT, x, y);
+      ctx.restore();
+    };
+
+    const origDown = nodeType.prototype.onMouseDown;
+    nodeType.prototype.onMouseDown = function (e, localPos, graphCanvas) {
+      const r = this._repoRect;
+      if (r && localPos && localPos[0] >= r.x && localPos[0] <= r.x + r.w
+          && localPos[1] >= r.y && localPos[1] <= r.y + r.h) {
+        window.open(REPO_URL, "_blank");
+        return true;
+      }
+      return origDown ? origDown.apply(this, arguments) : false;
+    };
+  },
+});
