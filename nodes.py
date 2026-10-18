@@ -423,48 +423,51 @@ class RecipeRouter:
         return (model, "")
 
 class RecipeGallery:
-    """画廊瀑布流选配方：点卡片直出 MODEL（跳过合并风暴）。"""
+    """画廊点选配方；没选就走惰性兜底 model（不选=零额外开销）。"""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "selected_recipe": ("STRING", {"default": ""}),
+                "selected_recipe": ("STRING", {"default": "", "tooltip": "画布上点卡片自动填；留空=走兜底 model(正常 LoRA 链路)"}),
                 "streaming": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "model": ("MODEL", {"lazy": True, "tooltip": "兜底分支：只有没选配方时才会执行"}),
             },
         }
 
     RETURN_TYPES = ("MODEL", "STRING")
-    RETURN_NAMES = ("model", "recipe_name")
+    RETURN_NAMES = ("model", "used_recipe")
     FUNCTION = "load"
     CATEGORY = "AssembledRecipes"
-    DESCRIPTION = "画布瀑布流点选配方，直接出 MODEL(跳过拼装)。× 删除缓存。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
+    DESCRIPTION = "画布瀑布流点选配方直读(跳过拼装)；不选则走兜底 model 分支。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
-    @classmethod
-    def IS_CHANGED(cls, selected_recipe, streaming):
-        return f"{selected_recipe}:{streaming}"
+    @staticmethod
+    def _resolve(selected_recipe):
+        key = (selected_recipe or "").strip()
+        if not key:
+            return None
+        fname = key if key.endswith(".safetensors") else key + ".safetensors"
+        path = os.path.join(RECIPES_DIR, fname)
+        return path if os.path.exists(path) else None
 
-    def load(self, selected_recipe, streaming=False):
-        recipe = selected_recipe if selected_recipe.endswith(".safetensors") else selected_recipe + ".safetensors"
-        path = os.path.join(RECIPES_DIR, recipe)
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"配方不存在: {recipe}（先跑一次带保存的图）")
-        try:
-            patcher = comfy.sd.load_diffusion_model(path)
-        except Exception:
-            import importlib.util
-            moss = os.path.join(folder_paths.base_path, "custom_nodes", "moss-image", "loaders.py")
-            if not os.path.exists(moss):
-                raise
-            spec = importlib.util.spec_from_file_location("moss_image_loaders", moss)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["moss_image_loaders"] = mod
-            spec.loader.exec_module(mod)
-            patcher = mod.load_model(path, "default")
-        if streaming:
-            patcher = enable_streaming(patcher)
-        print(f"[AssembledRecipes] 画廊直读: {recipe} | 逐层流水={streaming}")
-        return (patcher, recipe)
+    def check_lazy_status(self, selected_recipe="", streaming=False, model=None):
+        return [] if self._resolve(selected_recipe) else ["model"]
+
+    def load(self, selected_recipe="", streaming=False, model=None):
+        path = self._resolve(selected_recipe)
+        if path:
+            patcher = _load_any(path)
+            if streaming:
+                patcher = enable_streaming(patcher)
+            print(f"[AssembledRecipes] 画廊直读配方（跳过拼装）: {os.path.basename(path)}")
+            return (patcher, os.path.basename(path))
+        if model is None:
+            raise ValueError("没选配方也没有兜底 model（检查连线）")
+        print("[AssembledRecipes] 画廊未选配方 → 走兜底 model 分支")
+        return (model, "")
+
 
 NODE_CLASS_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": RecipeSaveAssembled,
