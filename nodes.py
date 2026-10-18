@@ -65,25 +65,66 @@ PREVIEW_SUFFIXES = [
 
 
 def _parse_lora_info(text):
-    """<lora:name:strength[:clip]> → [(name, strength)]"""
-    return [(m.group(1), m.group(2))
-            for m in re.finditer(r"<lora:([^:>]+):([0-9.]+)(?::([0-9.]+))?>", text or "")]
+    """支持 <lora:name:strength[:clip]> 与 "name:strength, name2:0.8" 两种写法。"""
+    text = (text or "").replace(chr(10), ",").replace(chr(13), ",")
+    out = [(m.group(1), m.group(2))
+           for m in re.finditer(r"<lora:([^:>]+):([0-9.]+)(?::([0-9.]+))?>", text)]
+    if out:
+        return out
+    for tok in re.split("[,;]+", text):
+        tok = tok.strip()
+        if not tok:
+            continue
+        m = re.match(r"^(.+?)[\s]*:[\s]*([0-9.]+)$", tok)
+        if m:
+            out.append((m.group(1).strip(), m.group(2)))
+        else:
+            out.append((tok, ""))
+    return out
 
 
 def _find_lora_preview(lora_name):
+    """按 LoRA 名找预览图：先精确路径，再模糊匹配（名字只是简称时也能命中）。"""
     try:
         roots = folder_paths.get_folder_paths("loras")
     except Exception:
         return None
-    rel = lora_name.replace(chr(92), "/")
-    for root in roots:
-        base = os.path.join(root, rel)
-        d = os.path.dirname(base)
-        b = os.path.basename(base)
+    rel = (lora_name or "").replace(chr(92), "/").strip()
+    if not rel:
+        return None
+    stem = os.path.splitext(rel)[0]
+
+    def first_preview(dir_path, base_name):
         for suf in PREVIEW_SUFFIXES:
-            p = os.path.join(d, b + suf)
+            p = os.path.join(dir_path, base_name + suf)
             if os.path.exists(p):
                 return p
+        return None
+
+    # ① 精确
+    for root in roots:
+        base = os.path.join(root, stem)
+        p = first_preview(os.path.dirname(base), os.path.basename(base))
+        if p:
+            return p
+
+    # ② 模糊：沿目录树找名字互相包含的 safetensors
+    needle = os.path.basename(stem).lower()
+    hits = []
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root):
+            for fn in files:
+                low = fn.lower()
+                if any(low.endswith(s) for s in PREVIEW_SUFFIXES):
+                    continue
+                if needle and needle in os.path.splitext(low)[0]:
+                    hits.append((dirpath, os.path.splitext(fn)[0]))
+            if len(hits) > 40:
+                break
+    for dir_path, base_name in hits:
+        p = first_preview(dir_path, base_name)
+        if p:
+            return p
     return None
 
 
