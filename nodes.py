@@ -803,7 +803,7 @@ NODE_CLASS_MAPPINGS = {
     "ReleasePhantomVram (AssembledRecipes)": ReleasePhantomVram,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "RecipeSave (AssembledRecipes)": "配方·保存快照",
+    "RecipeSave (AssembledRecipes)": "配方保存",
     "RecipeLoad (AssembledRecipes)": "配方·直读加载",
     "RecipeGallery (AssembledRecipes)": "配方·画廊选择",
     "RecipeRouter (AssembledRecipes)": "配方·惰性路由",
