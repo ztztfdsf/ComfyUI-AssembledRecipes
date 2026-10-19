@@ -685,6 +685,103 @@ class VramModeFix:
         print(f"[AssembledRecipes] {report}", flush=True)
         return (model, report)
 
+class ReleasePhantomVram:
+    '''释放「虚空显存」：torch 缓存池预留未用部分 + 可丢弃的补丁备份。
+
+    收工位用。drop_patch_backups=True 时把 LoRA 合并留下的原权重备份丢掉（约等于模型体积）；
+    前提：下次换组合/重跑会从干净基座重新打补丁（本工作流满足）。若同一 patcher 要回滚补丁，不要开。
+    '''
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "drop_patch_backups": ("BOOLEAN", {"default": True, "tooltip": "丢掉 LoRA 合并的原权重备份（可腾出接近模型体积的显存）；会失去对当前补丁的回滚能力"}),
+            },
+            "optional": {
+                "image_pass": ("IMAGE", {"lazy": True}),
+                "any_input": ("*", {"lazy": True}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "report")
+    FUNCTION = "release"
+    CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "释放虚空显存：清 torch 池预留 + 可选丢弃补丁备份。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
+
+    @staticmethod
+    def _torch_stats():
+        try:
+            import torch
+            st = torch.cuda.memory_stats()
+            return st.get('reserved_bytes.all.current', 0), st.get('active_bytes.all.current', 0)
+        except Exception:
+            return 0, 0
+
+    def check_lazy_status(self, **kwargs):
+        return [k for k in ("image_pass", "any_input") if k in kwargs]
+
+    def release(self, drop_patch_backups=True, image_pass=None, any_input=None):
+        import gc
+        import torch
+        res0, act0 = self._torch_stats()
+        free0 = model_management.get_free_memory() / 2 ** 20
+
+        dropped = drop_bytes = 0
+        if drop_patch_backups:
+            seen = set()
+            candidates = []
+            try:
+                import comfy.model_patcher as mp
+                for obj in gc.get_objects():
+                    try:
+                        if isinstance(obj, mp.ModelPatcher) and id(obj) not in seen:
+                            seen.add(id(obj))
+                            candidates.append(obj)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            for p in candidates:
+                try:
+                    for attr in ('backup', 'backup_buffers', 'hook_backup', 'object_patches_backup'):
+                        d = getattr(p, attr, None)
+                        if isinstance(d, dict) and d:
+                            for v in list(d.values()):
+                                try:
+                                    w = getattr(v, 'weight', v)
+                                    if torch.is_tensor(w): drop_bytes += w.nelement() * w.element_size()
+                                except Exception:
+                                    pass
+                            d.clear()
+                            dropped += 1
+                except Exception:
+                    pass
+
+        for _ in range(3):
+            try:
+                model_management.soft_empty_cache()
+            except Exception:
+                pass
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        gc.collect()
+
+        res1, act1 = self._torch_stats()
+        free1 = model_management.get_free_memory() / 2 ** 20
+        report = (f"池预留 {res0/2**30:.2f}G->{res1/2**30:.2f}G | 活跃 {act0/2**30:.2f}G->{act1/2**30:.2f}G | "
+                  f"丢弃备份 {dropped} 份≈{drop_bytes//2**20}MB | 驱动空闲 {free0:.0f}->{free1:.0f}MB")
+        print(f"[AssembledRecipes] 释放虚空: {report}", flush=True)
+        return (image_pass, report)
+
+
 NODE_CLASS_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": RecipeSaveAssembled,
     "RecipeLoad (AssembledRecipes)": RecipeLoadAssembled,
@@ -694,6 +791,7 @@ NODE_CLASS_MAPPINGS = {
     "DeepClean (AssembledRecipes)": DeepClean,
     "FreeVram (AssembledRecipes)": FreeVram,
     "VramModeFix (AssembledRecipes)": VramModeFix,
+    "ReleasePhantomVram (AssembledRecipes)": ReleasePhantomVram,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": "配方·保存快照",
@@ -704,4 +802,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DeepClean (AssembledRecipes)": "配方·深度清理",
     "FreeVram (AssembledRecipes)": "配方·踢编码器回内存",
     "VramModeFix (AssembledRecipes)": "配方·显存策略纠正",
+    "ReleasePhantomVram (AssembledRecipes)": "配方·释放虚空显存",
 }
