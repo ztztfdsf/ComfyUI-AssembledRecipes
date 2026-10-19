@@ -209,59 +209,6 @@ app.registerExtension({
   },
 });
 
-// ───────────────────────── 侧边栏面板（DOM 悬浮层） ─────────────────────────
-app.registerExtension({
-  name: "AssembledRecipes.Panel",
-  setup() {
-    try {
-      app.extensionManager.registerSidebarTab({
-        id: "assembled-recipes",
-        title: "配方画廊",
-        icon: "pi pi-images",
-        type: "custom",
-        render: (el) => {
-          const box = document.createElement("div");
-          box.style.cssText = "padding:8px;height:100%;overflow:auto;box-sizing:border-box;color:#ddd;";
-          box.innerHTML = `<button id="ar-refresh" style="width:100%;margin-bottom:8px;">刷新</button>
-                           <div id="ar-grid" style="column-count:2;column-gap:8px;"></div>`;
-          el.appendChild(box);
-          const grid = box.querySelector("#ar-grid");
-          const render = async () => {
-            grid.innerHTML = "加载中…";
-            let list = [];
-            try { list = await fetchRecipes(); } catch (e) { grid.innerHTML = "加载失败"; return; }
-            if (!list.length) { grid.innerHTML = "（暂无配方）"; return; }
-            grid.innerHTML = "";
-            for (const it of list) {
-              const base = it.name.replace(/\.safetensors$/, "");
-              const card = document.createElement("div");
-              card.style.cssText = "position:relative;break-inside:avoid;border:1px solid #444;border-radius:8px;padding:6px;margin-bottom:8px;background:#222;";
-              card.innerHTML = `
-                <img src="/assembled-recipes/preview/${encodeURIComponent(it.name)}" style="width:100%;border-radius:4px;display:block;background:#111;" onerror="this.style.opacity=.2">
-                <div style="font-weight:600;font-size:12px;word-break:break-all;margin-top:4px;"></div>
-                <div style="opacity:.7;font-size:10px;">${fmtSize(it.size)} · ${it.created || ""}</div>
-                <button style="position:absolute;right:6px;top:6px;width:20px;height:20px;border-radius:50%;background:rgba(200,40,40,.9);color:#fff;border:none;cursor:pointer;">×</button>`;
-              card.querySelector("div").textContent = base;
-              card.querySelector("button").onclick = async (ev) => {
-                ev.stopPropagation();
-                if (!confirm(`删除配方 ${base} ？（移入 trash/）`)) return;
-                await deleteRecipe(it.name);
-                render();
-              };
-              grid.appendChild(card);
-            }
-          };
-          box.querySelector("#ar-refresh").onclick = render;
-          render();
-        },
-      });
-    } catch (e) {
-      console.warn("[AssembledRecipes] 侧边栏注册失败:", e);
-    }
-  },
-});
-
-
 // ── 自动补线：模型链断了自动接上（只动我们自己的节点 + VRAM_Debug 清理节点）──
 function autoRepair(reason) {
   const graph = app.graph;
