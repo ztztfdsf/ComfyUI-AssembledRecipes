@@ -69,12 +69,20 @@ function mountGalleryDOM(node) {
   root.innerHTML = `
     <div class="ar-head">
       <button class="ar-refresh" type="button">🔄 刷新</button>
+      <button class="ar-cancel" type="button" style="display:none" title="清除选中，回到兜底分支">✕ 取消选择</button>
       <span class="ar-count"></span>
       <a class="ar-repo" href="${REPO_URL}" target="_blank" rel="noreferrer">${REPO_TEXT}</a>
     </div>
     <div class="ar-grid"><div class="ar-empty">加载中…</div></div>`;
   const grid = root.querySelector(".ar-grid");
   const countEl = root.querySelector(".ar-count");
+  const cancelBtn = root.querySelector(".ar-cancel");
+  const setSel = (v) => {
+    const w = node.widgets?.find((x) => x.name === "selected_recipe");
+    if (w) w.value = v;
+    for (const c of grid.querySelectorAll(".ar-card")) c.classList.toggle("sel", c.dataset.base === v);
+    if (cancelBtn) cancelBtn.style.display = v ? "" : "none";
+  };
 
   const refresh = async () => {
     grid.innerHTML = `<div class="ar-empty">加载中…</div>`;
@@ -96,6 +104,7 @@ function mountGalleryDOM(node) {
       const base = it.name.replace(/\.safetensors$/, "");
       const card = document.createElement("div");
       card.className = "ar-card" + (base === sel ? " sel" : "");
+      card.dataset.base = base;
       const img = document.createElement("img");
       img.src = `/assembled-recipes/preview/${encodeURIComponent(it.name)}`;
       img.onerror = () => { img.style.opacity = ".2"; };
@@ -113,10 +122,10 @@ function mountGalleryDOM(node) {
       card.append(img, nm, mt, del);
 
       card.addEventListener("click", () => {
+        // 再点已选中的卡片 = 取消选择（回到兜底分支）
         const w = node.widgets?.find((x) => x.name === "selected_recipe");
-        if (w) w.value = base;
-        for (const c of grid.querySelectorAll(".ar-card")) c.classList.remove("sel");
-        card.classList.add("sel");
+        const cur = (w?.value || "").replace(/\.safetensors$/, "");
+        setSel(cur === base ? "" : base);
       });
       del.addEventListener("click", async (ev) => {
         ev.stopPropagation();
@@ -128,6 +137,7 @@ function mountGalleryDOM(node) {
     }
   };
   root.querySelector(".ar-refresh").addEventListener("click", refresh);
+  if (cancelBtn) cancelBtn.addEventListener("click", () => setSel(""));
 
   // Nodes 2.0 按 (node id, widget name, widget type) 复用渲染行，所以 type 要带实例后缀
   const type = `ar_gallery__inst_${(_galInst++).toString(36)}`;

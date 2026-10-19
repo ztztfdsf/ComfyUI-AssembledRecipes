@@ -228,6 +228,12 @@ class RecipeSaveAssembled:
     DESCRIPTION = "生成结束后把已拼装(含 LoRA)的权重存成配方。名字留空=按 LoRA 组合自动命名。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
     def snapshot(self, model, image, recipe_name, note="", lora_info=None):
+        # 单/无 LoRA 没有融合成本，存 5.4G 配方纯浪费——直接跳过（lora_info 未接线时维持旧行为）
+        if lora_info is not None:
+            _active = _parse_lora_info(lora_info or "")
+            if len(_active) < 2:
+                print(f"[AssembledRecipes] 激活 LoRA {len(_active)} 个（<2 无融合成本），不存配方")
+                return (image,)
         if not (recipe_name or "").strip():
             entries = _parse_lora_info(lora_info or "")
             if entries:
