@@ -592,6 +592,50 @@ class FreeVram:
         print(f"[AssembledRecipes] {report}", flush=True)
         return (model, report)
 
+
+class VramModeFix:
+    """纠正启动参数造成的显存策略（纯节点，不改启动器/命令行）。
+
+    `--highvram` 会把 vram_state 钉成 HIGH_VRAM 并关掉动态显存，导致模型全部驻留、
+    一采样就 OOM；本节点在运行时把策略纠正回 NORMAL_VRAM + 智能内存，效果等价于
+    去掉 `--highvram`，但完全靠图内节点完成。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {"model": ("MODEL", {"tooltip": "接在加载器后面；输出原样透传"})},
+        }
+
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "report")
+    FUNCTION = "fix"
+    CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "运行时纠正 --highvram 造成的全驻留策略（不改启动参数）。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
+
+    def fix(self, model=None):
+        mm = model_management
+        changes = []
+        try:
+            if mm.vram_state == mm.VRAMState.HIGH_VRAM:
+                mm.vram_state = mm.VRAMState.NORMAL_VRAM
+                changes.append("HIGH_VRAM → NORMAL_VRAM")
+        except Exception as e:
+            print(f"[AssembledRecipes] 切换 vram_state 失败: {e}", flush=True)
+        try:
+            if mm.DISABLE_SMART_MEMORY:
+                mm.DISABLE_SMART_MEMORY = False
+                changes.append("智能内存: 关 → 开")
+        except Exception:
+            pass
+        mm.soft_empty_cache()
+        free = mm.get_free_memory() / 2**20
+        report = ("显存策略: " + ("; ".join(changes) if changes else "本来就是动态模式，无需纠正")
+                  + f" | 空闲 {free:.0f}MB")
+        print(f"[AssembledRecipes] {report}", flush=True)
+        return (model, report)
+
 NODE_CLASS_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": RecipeSaveAssembled,
     "RecipeLoad (AssembledRecipes)": RecipeLoadAssembled,
@@ -600,6 +644,7 @@ NODE_CLASS_MAPPINGS = {
     "RecipeRouter (AssembledRecipes)": RecipeRouter,
     "DeepClean (AssembledRecipes)": DeepClean,
     "FreeVram (AssembledRecipes)": FreeVram,
+    "VramModeFix (AssembledRecipes)": VramModeFix,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": "配方·保存快照",
@@ -609,4 +654,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "StreamToggle (AssembledRecipes)": "配方·逐层流水开关",
     "DeepClean (AssembledRecipes)": "配方·深度清理",
     "FreeVram (AssembledRecipes)": "配方·踢编码器回内存",
+    "VramModeFix (AssembledRecipes)": "配方·显存策略纠正",
 }
