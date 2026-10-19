@@ -500,6 +500,40 @@ class DeepClean:
     def check_lazy_status(self, **kwargs):
         return [k for k in ("model_pass", "image_pass", "any_input") if k in kwargs]
 
+    @staticmethod
+    def _evict_staged(keep_modules=()):
+        """驱逐 aimdo 的暂存权重镜像（ModelVBAR 驻留页），不动保留模型。"""
+        try:
+            import gc
+            import comfy_aimdo.model_vbar as mv
+        except Exception as e:
+            return 0, 0, f"无 aimdo，跳过 ({e})"
+        keep = set()
+        for m in keep_modules:
+            for v in (getattr(m, "dynamic_vbars", None) or {}).values():
+                keep.add(id(v))
+        n = freed = 0
+        seen = 0
+        try:
+            objs = gc.get_objects()
+        except Exception:
+            objs = []
+        for obj in objs:
+            try:
+                if isinstance(obj, mv.ModelVBAR):
+                    seen += 1
+                    if id(obj) not in keep:
+                        freed += int(obj.free_memory(2 ** 62) or 0)
+                        obj.set_watermark(0)
+                        n += 1
+            except Exception:
+                pass
+        try:
+            total = int(mv.vbars_analyze() or 0)
+        except Exception:
+            total = -1
+        return n, freed, f"vbar 总数 {seen} 保留 {len(keep)} 剩余驻留 {total // 2**20}MB"
+
     def clean(self, unload_models=True, force_empty_cache=True, model_pass=None, image_pass=None, any_input=None):
         def free_mb():
             try:
@@ -530,6 +564,17 @@ class DeepClean:
                 except Exception:
                     pass
                 gc.collect()
+        # 驱逐 aimdo 暂存镜像（只保护仍加载的主模型，如 DiT）
+        keep_mods = []
+        try:
+            for lm in list(model_management.current_loaded_models):
+                mod = getattr(lm, 'real_model', None) or getattr(getattr(lm, 'model', None), 'model', None)
+                if mod is not None:
+                    keep_mods.append(mod)
+        except Exception:
+            pass
+        n_v, freed_v, note_v = self._evict_staged(keep_mods)
+        print(f"[AssembledRecipes] {note_v}", flush=True)
         after = free_mb()
         report = f"free {before:.0f}MB -> {after:.0f}MB (freed {after - before:.0f}MB)"
         print(f"[AssembledRecipes] 深度清理: {report}", flush=True)
@@ -551,16 +596,20 @@ class FreeVram:
                 "conditioning_1": ("CONDITIONING", {"tooltip": "接正/负条件（用于保证本节点在编码之后执行）"}),
                 "conditioning_2": ("CONDITIONING",),
                 "conditioning_3": ("CONDITIONING",),
+                "image_pass": ("IMAGE", {"lazy": True, "tooltip": "可选：只用来保证本节点在出图之后执行（收工位用）"}),
             },
         }
 
-    RETURN_TYPES = ("MODEL", "STRING")
-    RETURN_NAMES = ("model", "report")
+    RETURN_TYPES = ("MODEL", "STRING", "IMAGE")
+    RETURN_NAMES = ("model", "report", "image")
     FUNCTION = "free"
     CATEGORY = "AssembledRecipes"
     DESCRIPTION = "采样前把文本编码器等非主模型卸回内存（省 5G+ 显存），只留要采样的模型。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
-    def free(self, model, conditioning_1=None, conditioning_2=None, conditioning_3=None):
+    def check_lazy_status(self, model=None, **kwargs):
+        return [k for k in ("conditioning_1", "conditioning_2", "conditioning_3", "image_pass") if k in kwargs]
+
+    def free(self, model, conditioning_1=None, conditioning_2=None, conditioning_3=None, image_pass=None):
         # MODEL 输入本身就是 ModelPatcher；current_loaded_models 里存的也是 patcher
         keep_patcher = model
         before = model_management.get_free_memory()
@@ -590,7 +639,7 @@ class FreeVram:
         report = (f"卸回内存: {', '.join(names) if names else '无'} | "
                   f"空闲 {before / 2**20:.0f}MB -> {after / 2**20:.0f}MB")
         print(f"[AssembledRecipes] {report}", flush=True)
-        return (model, report)
+        return (model, report, image_pass)
 
 
 class VramModeFix:
