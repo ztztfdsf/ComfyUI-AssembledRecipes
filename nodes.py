@@ -80,6 +80,13 @@ PREVIEW_SUFFIXES = [
 ]
 
 
+def _fmt_strength(s):
+    try:
+        return f"{float(s):g}"
+    except Exception:
+        return str(s).strip()
+
+
 def _parse_lora_info(text):
     """支持 <lora:name:strength[:clip]> 与 "name:strength, name2:0.8" 两种写法。"""
     text = (text or "").replace(chr(10), ",").replace(chr(13), ",")
@@ -225,7 +232,9 @@ class RecipeSaveAssembled:
             entries = _parse_lora_info(lora_info or "")
             if entries:
                 recipe_name = "auto_" + "+".join(
-                    _sanitize(n.split("/")[-1].replace(".safetensors", "")) for n, _s in entries)
+                    _sanitize(n.split("/")[-1].replace(".safetensors", ""))
+                    + ("@" + _fmt_strength(s) if s not in (None, "") else "")
+                    for n, s in entries)
                 print(f"[AssembledRecipes] 自动命名: {recipe_name}")
             else:
                 print("[AssembledRecipes] 名字为空且无 LoRA 信息，跳过快照")
@@ -233,7 +242,7 @@ class RecipeSaveAssembled:
         name = _sanitize(recipe_name)
         path = os.path.join(RECIPES_DIR, name + ".safetensors")
         if os.path.exists(path):
-            print(f"[AssembledRecipes] 配方已存在，跳过快照: {name}")
+            print(f"[AssembledRecipes] 同名同配置已存过，跳过快照: {name}")
             return (image,)
 
         base = model.model if hasattr(model, "model") else model
