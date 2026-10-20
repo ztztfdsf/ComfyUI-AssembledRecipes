@@ -1187,13 +1187,22 @@ class ReverseLayoutCaption:
                     body = e.read().decode()[:300]
                 except Exception:
                     pass
+                blob = (str(e) + " " + body).lower()
                 print(f"[AssembledRecipes] 布局反推: num_ctx={num_ctx} 失败: {e} {body}", flush=True)
-                if num_ctx > 4096 and self._looks_like_resource_error(str(e), body):
-                    num_ctx = max(4096, num_ctx // 2)
-                    print(f"[AssembledRecipes] 布局反推: 疑似显存不够，降级重试 num_ctx={num_ctx}", flush=True)
+                timeout_like = "timed out" in blob or "timeout" in blob
+                resource_like = self._looks_like_resource_error(str(e), body)
+                if attempt < 3 and (timeout_like or resource_like):
+                    wait = 15 if timeout_like else 2
+                    if timeout_like:
+                        print(f"[AssembledRecipes] 布局反推: 疑似与模型加载并行抢显存，等 {wait}s 再试（第 {attempt + 2}/4 次）", flush=True)
+                    if resource_like and num_ctx > 4096:
+                        num_ctx = max(4096, num_ctx // 2)
+                        print(f"[AssembledRecipes] 布局反推: 显存类错误，降级重试 num_ctx={num_ctx}", flush=True)
+                    time.sleep(wait)
                     continue
                 break
-        raise RuntimeError(f"布局反推失败（最后一次 num_ctx={num_ctx}）: {last_err}")
+        raise RuntimeError(f"布局反推失败（最后一次 num_ctx={num_ctx}）: {last_err}——"
+                           f"若反复如此：反推与模型加载并行抢显存，可先单开反推组跑反推，或把 max_ctx 调小（如 16384）")
 
 
 NODE_CLASS_MAPPINGS = {
