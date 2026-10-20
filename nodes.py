@@ -823,6 +823,12 @@ class ReverseServiceAutostart:
     RETURN_NAMES = ("image",)
     FUNCTION = "ensure"
     CATEGORY = "AssembledRecipes"
+
+    @classmethod
+    def IS_CHANGED(cls, image, service_url, wait_seconds):
+        # 服务状态是外部世界，不随图内输入变化——返回 NaN 禁用执行缓存，每次都真检
+        return float("NaN")
+
     DESCRIPTION = "反推前自动拉起 Ollama 服务（exe 放 ComfyUI/ollama/，模型库 ComfyUI/models/LLM）。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
     @staticmethod
