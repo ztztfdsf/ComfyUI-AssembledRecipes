@@ -69,7 +69,9 @@
 | VAE flux2-vae（336M） | `models/vae/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/vae/flux2-vae.safetensors) |
 | 反推模型 Huihui-Qwen3-VL-4B-Instruct-abliterated（8.9G，HF transformers 布局整个目录） | `models/LLM/Huihui-Qwen3-VL-4B-Instruct-abliterated/` | [下载](https://huggingface.co/huihui-ai/Huihui-Qwen3-VL-4B-Instruct-abliterated) |
 
-- 官方 DiT 是融合 qkv 版，本仓库加载器需要拆分版：用 `tools/split_qkv.py` 把 9216 行 qkv 权重字节级无损拆成 q/k/v（`python tools/split_qkv.py 源.safetensors 输出_split.safetensors`），加载器指向 `_split` 文件。
+- **下载即用，无需拆分**：2026-10-16 起 ComfyUI（≥ v0.42）原生支持 MOSS，直接用核心简易节点 `UNETLoader` / `CLIPLoader(type=moss_image)` 加载官方融合版文件。低于 v0.42 的旧版本没有原生 MOSS 支持。
+- 社区 LoRA 多按融合 qkv 训练：原生融合链路下注意力权重可 **100%** 打进（旧拆分方案只能打进约六成）。
+- 本插件配方直读优先走 `comfy.sd.load_diffusion_model`（融合/原生格式），旧拆分格式配方自动回退 moss-image 插件加载器。
 - 反推依赖 `transformers>=4.57`（ComfyUI 整合包一般已带，缺了 `pip install transformers`）。模型走进程内直载，无外部服务、无黑框；首次反推时从盘加载入内存（~30s），之后常驻内存免盘读。
 
 ## 交流与反馈
@@ -91,6 +93,7 @@ git clone https://github.com/ztztfdsf/ComfyUI-AssembledRecipes
 ## 说明
 
 - 配方 = 完整模型权重（含量化格式与 `comfy_quant` 元数据），体积 ≈ 模型本身
+- 工作流加载器建议直接用 ComfyUI **核心简易节点**（`UNETLoader`/`CLIPLoader`），无需 moss-image 插件
 - 快照采用「源文件全量镜像 + 合并权重覆盖」，所以键集与源模型一字不差
 - 不修改 ComfyUI 核心；所有功能都是节点；逐层流水通过自有 patcher 实例绑定实现
 
