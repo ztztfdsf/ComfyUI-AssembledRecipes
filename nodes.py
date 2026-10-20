@@ -1102,6 +1102,7 @@ class ReverseLayoutCaption:
                 "service_url": ("STRING", {"default": "http://127.0.0.1:11434", "tooltip": "Ollama 服务地址"}),
                 "max_ctx": ("INT", {"default": 32768, "min": 4096, "max": 262144, "tooltip": "上下文封顶；实际取 min(模型上限, 此值)，失败自动对半降级"}),
                 "auto_unload": ("BOOLEAN", {"default": True, "tooltip": "反推完立即释放 Ollama 占用的显存"}),
+                "pre_clear": ("BOOLEAN", {"default": True, "tooltip": "反推前把 ComfyUI 全部模型卸回内存，显存同一时间只住一个模型"}),
             }
         }
 
@@ -1113,7 +1114,7 @@ class ReverseLayoutCaption:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        # VLM 是随机的：同一张图重跑也要重新反推，禁用执行缓存
+        # VLM 是随机的 + 清场是外部状态：同一张图重跑也要重新反推，禁用执行缓存
         return float("NaN")
 
     @staticmethod
@@ -1127,13 +1128,55 @@ class ReverseLayoutCaption:
         return base64.b64encode(buf.getvalue()).decode(), arr.shape[1], arr.shape[0]
 
     @staticmethod
+    def _settle_and_evict(settle_seconds=20):
+        """模型管理：等加载平息 → 全部卸回内存 → 只留反推模型上卡。
+
+        串行铁律：显存同一时间只住一个模型。反推前把 ComfyUI 侧的模型
+        （上张图的 DiT 热机房、预取器抢跑的编码器等）全部 free_memory 卸回内存，
+        反推完 Ollama 侧 keep_alive=0 自动退场，再轮到编码器。
+        """
+        from comfy import model_management as mm
+        t0 = time.time()
+        last = None
+        while time.time() - t0 < settle_seconds:
+            try:
+                cur = mm.get_free_memory()
+            except Exception:
+                break
+            if last is not None and abs(cur - last) < 128 * 2**20:
+                break
+            last = cur
+            time.sleep(2)
+        wait_s = time.time() - t0
+        before = mm.get_free_memory() / 2**20
+        names = []
+        try:
+            for lm in list(mm.current_loaded_models):
+                names.append(type(getattr(lm.model, "model", lm.model)).__name__)
+        except Exception:
+            pass
+        try:
+            device = mm.get_torch_device()
+            mm.free_memory(1e30, device, keep_loaded=[])
+        except Exception as e:
+            print(f"[AssembledRecipes] 反推前清场: free_memory 异常 {e}", flush=True)
+        try:
+            mm.soft_empty_cache()
+        except Exception:
+            pass
+        after = mm.get_free_memory() / 2**20
+        print(f"[AssembledRecipes] 反推前清场: 等待 {wait_s:.0f}s | 卸载 {names or '无'} | 空闲 {before:.0f}→{after:.0f}MB", flush=True)
+
+    @staticmethod
     def _looks_like_resource_error(msg, body):
         blob = (msg + " " + body).lower()
         return any(k in blob for k in ("memory", "out of", "oom", "alloc", "not enough", "kv", "llama-server", "cuda"))
 
-    def caption(self, image, rule, user_prompt, model, service_url, max_ctx, auto_unload):
+    def caption(self, image, rule, user_prompt, model, service_url, max_ctx, auto_unload, pre_clear):
         import urllib.error as _ue
         import urllib.request as _ur
+        if pre_clear:
+            self._settle_and_evict()
         hp = _ensure_ollama_service(service_url, 45)
         if hp is None:
             raise RuntimeError(f"Ollama 服务不可用（{service_url}）且无法自动拉起——请把 ollama.exe+lib 放进 ComfyUI/ollama/")
