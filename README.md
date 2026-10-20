@@ -8,7 +8,7 @@
 量化模型 + LoRA 时，ComfyUI 每次加载都要「反量化 → 合并补丁 → 重新量化」，
 一个组合几分钟；换组合再拼一次。本插件把拼好的权重落盘复用，**拼一次，用一辈子**。
 
-## 节点（12 个）
+## 节点（11 个）
 
 | 节点 | 作用 |
 |---|---|
@@ -19,6 +19,10 @@
 | **配方·逐层流水开关** | MODEL 直通 + 逐层流水开关。逐层流水 = 权重逐 block 按需上卡，显存峰值 = 单层 + 激活，永不爆表，代价是稍慢 |
 | **配方·深度清理** | 最彻底的清理：卸载全部模型 + `gc` + `synchronize` + `empty_cache ×3` + `ipc_collect`。用于真挤 / 跑前清残渣 |
 | **配方·踢编码器回内存** | 放在**编码之后、采样之前**：吃 model + 正负条件（保证时序），把除主模型外的已加载模型（文本编码器等 5G+）offload 回内存并清缓存。走官方 `free_memory(keep_loaded=…)`，安全 |
+| **配方·显存策略纠正** | 运行时把 `--highvram` 纠回 NORMAL_VRAM + 重开 smart memory（等价摘掉启动参数，启动器零改动） |
+| **配方·释放虚空显存** | 清 torch 池预留 + 丢弃 LoRA 合并的原权重备份，实测释放 ~4.4GB |
+| **配方·布局反推** | **进程内直载** Qwen3-VL（transformers，零外部进程零黑框）反推出 MOSS 布局 JSON。显存串行铁律：反推前自动清场（全部卸回内存）→ 模型上卡独占 → 推理完退卡回内存（常驻缓存）。支持画廊提示词喂入补全角色、输出详细 desc |
+| **配方·反推JSON清洗** | 反推输出坏 JSON 的兜底（裸换行/字符串bbox/截断/纯废话都接得住），接 `CreateBoundingBoxes` 前垫一道 |
 
 ## 用法
 
@@ -63,11 +67,10 @@
 | DiT·Base 量化版 int8_convrot（5.4G） | `models/diffusion_models/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/diffusion_models/moss_image_base_int8_convrot.safetensors) |
 | 文本编码器 qwen3.5_9b_w4a8_gptq（7.3G） | `models/text_encoders/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/text_encoders/qwen3.5_9b_w4a8_gptq.safetensors) |
 | VAE flux2-vae（336M） | `models/vae/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/vae/flux2-vae.safetensors) |
-| 反推模型 qwen3-vl 去审查 4B（3.3G） | `models/LLM/`（Ollama 库） | [模型页](https://ollama.com/huihui_ai/qwen3-vl-abliterated)，`ollama pull huihui_ai/qwen3-vl-abliterated:4b-instruct-q4_K_M` |
-| Ollama 运行时（27M） | `ComfyUI/ollama/` | [下载](https://ollama.com/download/windows) |
+| 反推模型 Huihui-Qwen3-VL-4B-Instruct-abliterated（8.9G，HF transformers 布局整个目录） | `models/LLM/Huihui-Qwen3-VL-4B-Instruct-abliterated/` | [下载](https://huggingface.co/huihui-ai/Huihui-Qwen3-VL-4B-Instruct-abliterated) |
 
 - 官方 DiT 是融合 qkv 版，本仓库加载器需要拆分版：用 `tools/split_qkv.py` 把 9216 行 qkv 权重字节级无损拆成 q/k/v（`python tools/split_qkv.py 源.safetensors 输出_split.safetensors`），加载器指向 `_split` 文件。
-- 机器重启后 Ollama 进程会消失——工作流里的「配方·反推服务自启」节点在反推前自动拉起，通常无需手动干预。
+- 反推依赖 `transformers>=4.57`（ComfyUI 整合包一般已带，缺了 `pip install transformers`）。模型走进程内直载，无外部服务、无黑框；首次反推时从盘加载入内存（~30s），之后常驻内存免盘读。
 
 ## 交流与反馈
 
