@@ -9,6 +9,7 @@
 权重逐 block 按需上卡算完即走——显存峰值 = 单块 + 激活，永不爆表。
 """
 
+import base64
 import json
 import os
 import re
@@ -799,6 +800,53 @@ class ReleasePhantomVram:
         return (image_pass, report)
 
 
+def _ollama_host_port(service_url):
+    from urllib.parse import urlparse
+    raw = service_url if "://" in service_url else "http://" + service_url
+    p = urlparse(raw)
+    return p.hostname or "127.0.0.1", p.port or 11434
+
+
+def _port_alive(host, port, timeout=1.0):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _ensure_ollama_service(service_url, wait_seconds=45):
+    """确保 Ollama 服务在线；不在则从 ComfyUI/ollama/ 自动拉起。返回 (host, port) 或 None。"""
+    host, port = _ollama_host_port(service_url)
+    if _port_alive(host, port, 1.5):
+        return host, port
+    base = folder_paths.base_path
+    exe = os.path.join(base, "ollama", "ollama.exe")
+    if not os.path.isfile(exe):
+        print(f"[AssembledRecipes] 反推服务未启动，且找不到 {exe}——请把 ollama.exe+lib 放进 ComfyUI/ollama/", flush=True)
+        return None
+    env = os.environ.copy()
+    env["OLLAMA_HOST"] = f"{host}:{port}"
+    env["OLLAMA_MODELS"] = os.path.join(base, "models", "LLM")
+    try:
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        proc = subprocess.Popen([exe, "serve"], env=env, creationflags=flags,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                stdin=subprocess.DEVNULL, close_fds=True)
+        print(f"[AssembledRecipes] 反推服务自启: 已拉起 ollama (pid {proc.pid}) | 模型库 {env['OLLAMA_MODELS']}，等待就绪...", flush=True)
+    except Exception as e:
+        print(f"[AssembledRecipes] 拉起 ollama 失败: {e}", flush=True)
+        return None
+    t0 = time.time()
+    while time.time() - t0 < wait_seconds:
+        if _port_alive(host, port, 1.0):
+            print(f"[AssembledRecipes] 反推服务就绪: {host}:{port} ({time.time() - t0:.1f}s)", flush=True)
+            return host, port
+        time.sleep(0.5)
+    print(f"[AssembledRecipes] 反推服务 {wait_seconds}s 内未就绪", flush=True)
+    return None
+
+
 class ReverseServiceAutostart:
     """反推服务（Ollama）自动启动。
 
@@ -833,51 +881,16 @@ class ReverseServiceAutostart:
 
     @staticmethod
     def _alive(host, port, timeout=1.0):
-        try:
-            with socket.create_connection((host, port), timeout=timeout):
-                return True
-        except Exception:
-            return False
+        return _port_alive(host, port, timeout)
 
     def ensure(self, image, service_url, wait_seconds):
-        from urllib.parse import urlparse
-        raw = service_url if "://" in service_url else "http://" + service_url
-        p = urlparse(raw)
-        host = p.hostname or "127.0.0.1"
-        port = p.port or 11434
-
-        if self._alive(host, port, 1.5):
+        host, port = _ollama_host_port(service_url)
+        if _port_alive(host, port, 1.5):
             print(f"[AssembledRecipes] 反推服务在线: {host}:{port}", flush=True)
             return (image,)
-
-        base = folder_paths.base_path
-        exe = os.path.join(base, "ollama", "ollama.exe")
-        if not os.path.isfile(exe):
-            print(f"[AssembledRecipes] 反推服务未启动，且找不到 {exe}——"
-                  f"请把 ollama.exe 放进 ComfyUI/ollama/（下载见使用说明第八章），本次放行。", flush=True)
-            return (image,)
-
-        env = os.environ.copy()
-        env["OLLAMA_HOST"] = f"{host}:{port}"
-        models_dir = os.path.join(base, "models", "LLM")
-        env["OLLAMA_MODELS"] = models_dir
-        try:
-            flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-            proc = subprocess.Popen([exe, "serve"], env=env, creationflags=flags,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    stdin=subprocess.DEVNULL, close_fds=True)
-            print(f"[AssembledRecipes] 反推服务自启: 已拉起 ollama (pid {proc.pid}) | 模型库 {models_dir}，等待就绪...", flush=True)
-        except Exception as e:
-            print(f"[AssembledRecipes] 拉起 ollama 失败: {e}", flush=True)
-            return (image,)
-
-        t0 = time.time()
-        while time.time() - t0 < wait_seconds:
-            if self._alive(host, port, 1.0):
-                print(f"[AssembledRecipes] 反推服务就绪: {host}:{port} ({time.time() - t0:.1f}s)", flush=True)
-                return (image,)
-            time.sleep(0.5)
-        print(f"[AssembledRecipes] 反推服务 {wait_seconds}s 内未就绪，放行（反推节点会自行报错）", flush=True)
+        hp = _ensure_ollama_service(service_url, wait_seconds)
+        if hp is None and not _port_alive(host, port, 1.0):
+            print("[AssembledRecipes] 反推服务不可用，放行（反推节点会自行报错）", flush=True)
         return (image,)
 
 
@@ -1057,6 +1070,131 @@ class ReverseJsonSanitize:
         return (result,)
 
 
+_LAYOUT_RULE_DEFAULT = ("你是图像布局反推器。识别图中所有主要对象、人物和文字块，只输出一个 JSON 数组，不要输出任何其他文字或 markdown 标记。"
+    "每个元素格式：{\"type\":\"obj\",\"bbox\":[ymin,xmin,ymax,xmax],\"desc\":\"英文自然语言提示词\"}；"
+    "画面中的文字用 {\"type\":\"text\",\"bbox\":[ymin,xmin,ymax,xmax],\"text\":\"文字原文\",\"desc\":\"英文自然语言说明\"}。"
+    "desc 一律使用英文自然语言提示词（像写给画师的英文描述句，例如 a girl with cat ears wearing a yellow sweater, frowning），"
+    "不要用中文、不要用标签堆砌；唯独 text 字段保留画面文字的原文原样（含大小写与语言）。"
+    "若用户消息中附带了画廊提示词（角色名/风格标签），遇到不认识的角色或概念时，用它来补全 desc 中的角色名与细节。"
+    "坐标是 0~1000 的归一化值，顺序为 [上,左,下,右]（yxyx）。"
+    "bbox 必须是 4 个纯数字组成的数组，如 [12,34,56,78]，禁止加引号或合并成字符串。所有框按从背景到前景排列。")
+
+
+class ReverseLayoutCaption:
+    """MOSS 布局反推（自研 Ollama 直连，上下文拉满）。
+
+    甩开第三方反推节点的小窗口（它给单图只预留 512 token 输出，复杂图必截断）：
+    - 直连 Ollama /api/chat，num_ctx 按 /api/show 查询的模型上限（qwen3-vl 为 262144）拉满，
+    - 由 max_ctx 封顶（默认 32768，显存不够自动对半降级重试：32768→16384→8192→4096）；
+    - 反推完 keep_alive=0 立即释放显存；
+    - 输出坏 JSON 由下游「配方·反推JSON清洗」兑底。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "要反推的图"}),
+                "rule": ("STRING", {"multiline": True, "default": _LAYOUT_RULE_DEFAULT, "tooltip": "反推规则（system 提示词）"}),
+                "user_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "画廊提示词等角色参考资料，遇到不认识的角色用它补全"}),
+                "model": ("STRING", {"default": "huihui_ai/qwen3-vl-abliterated:4b-instruct-q4_K_M", "tooltip": "Ollama 模型名"}),
+                "service_url": ("STRING", {"default": "http://127.0.0.1:11434", "tooltip": "Ollama 服务地址"}),
+                "max_ctx": ("INT", {"default": 32768, "min": 4096, "max": 262144, "tooltip": "上下文封顶；实际取 min(模型上限, 此值)，失败自动对半降级"}),
+                "auto_unload": ("BOOLEAN", {"default": True, "tooltip": "反推完立即释放 Ollama 占用的显存"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "caption"
+    CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "自研布局反推：Ollama 直连、上下文拉满、显存自动降级。下游接「配方·反推JSON清洗」。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # VLM 是随机的：同一张图重跑也要重新反推，禁用执行缓存
+        return float("NaN")
+
+    @staticmethod
+    def _image_to_b64(image):
+        import io
+        from PIL import Image
+        t = image[0].clamp(0, 1).cpu().numpy()
+        arr = (t * 255.0).round().astype("uint8")
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode(), arr.shape[1], arr.shape[0]
+
+    @staticmethod
+    def _looks_like_resource_error(msg, body):
+        blob = (msg + " " + body).lower()
+        return any(k in blob for k in ("memory", "out of", "oom", "alloc", "not enough", "kv", "llama-server", "cuda"))
+
+    def caption(self, image, rule, user_prompt, model, service_url, max_ctx, auto_unload):
+        import urllib.error as _ue
+        import urllib.request as _ur
+        hp = _ensure_ollama_service(service_url, 45)
+        if hp is None:
+            raise RuntimeError(f"Ollama 服务不可用（{service_url}）且无法自动拉起——请把 ollama.exe+lib 放进 ComfyUI/ollama/")
+        base = f"http://{hp[0]}:{hp[1]}"
+
+        num_ctx = int(max_ctx)
+        try:
+            rq = _ur.Request(base + "/api/show", data=json.dumps({"model": model}).encode(),
+                             headers={"Content-Type": "application/json"})
+            info = json.load(_ur.urlopen(rq, timeout=15)).get("model_info", {})
+            lens = [int(v) for k, v in info.items() if "context_length" in k.lower() and isinstance(v, (int, float))]
+            if lens:
+                num_ctx = min(num_ctx, max(lens))
+        except Exception as e:
+            print(f"[AssembledRecipes] 布局反推: 查询模型上下文上限失败（按 {num_ctx} 用）: {e}", flush=True)
+
+        b64, iw, ih = self._image_to_b64(image)
+        if image.shape[0] > 1:
+            print(f"[AssembledRecipes] 布局反推: 批量 {image.shape[0]} 张，只取第一张", flush=True)
+        user_content = ((user_prompt or "").strip() + "\n\n" if (user_prompt or "").strip() else "") \
+            + "Analyze the image and output ONLY the JSON array as instructed."
+
+        t0 = time.time()
+        last_err = None
+        for attempt in range(4):
+            payload = {
+                "model": model, "stream": False,
+                "keep_alive": "0" if auto_unload else "5m",
+                "messages": [
+                    {"role": "system", "content": rule},
+                    {"role": "user", "content": user_content, "images": [b64]},
+                ],
+                "options": {"num_ctx": num_ctx, "temperature": 0.2},
+            }
+            try:
+                rq = _ur.Request(base + "/api/chat", data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+                resp = json.load(_ur.urlopen(rq, timeout=300))
+                if isinstance(resp, dict) and resp.get("error"):
+                    raise RuntimeError(str(resp["error"]))
+                text_out = (resp.get("message") or {}).get("content", "")
+                warn = " | ⚠ 输出触顶(done=length)，尾部交给清洗节点兜底" if resp.get("done_reason") == "length" else ""
+                print(f"[AssembledRecipes] 布局反推: {iw}x{ih} | num_ctx={num_ctx} | "
+                      f"提示词 {resp.get('prompt_eval_count', '?')} tok + 输出 {resp.get('eval_count', '?')} tok | "
+                      f"文本 {len(text_out)} 字符 | 耗时 {time.time() - t0:.1f}s{warn}", flush=True)
+                return (text_out,)
+            except Exception as e:
+                last_err = e
+                body = ""
+                try:
+                    body = e.read().decode()[:300]
+                except Exception:
+                    pass
+                print(f"[AssembledRecipes] 布局反推: num_ctx={num_ctx} 失败: {e} {body}", flush=True)
+                if num_ctx > 4096 and self._looks_like_resource_error(str(e), body):
+                    num_ctx = max(4096, num_ctx // 2)
+                    print(f"[AssembledRecipes] 布局反推: 疑似显存不够，降级重试 num_ctx={num_ctx}", flush=True)
+                    continue
+                break
+        raise RuntimeError(f"布局反推失败（最后一次 num_ctx={num_ctx}）: {last_err}")
+
+
 NODE_CLASS_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": RecipeSaveAssembled,
     "RecipeLoad (AssembledRecipes)": RecipeLoadAssembled,
@@ -1069,6 +1207,7 @@ NODE_CLASS_MAPPINGS = {
     "ReleasePhantomVram (AssembledRecipes)": ReleasePhantomVram,
     "ReverseServiceAutostart (AssembledRecipes)": ReverseServiceAutostart,
     "ReverseJsonSanitize (AssembledRecipes)": ReverseJsonSanitize,
+    "ReverseLayoutCaption (AssembledRecipes)": ReverseLayoutCaption,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": "配方保存",
@@ -1082,4 +1221,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ReleasePhantomVram (AssembledRecipes)": "配方·释放虚空显存",
     "ReverseServiceAutostart (AssembledRecipes)": "配方·反推服务自启",
     "ReverseJsonSanitize (AssembledRecipes)": "配方·反推JSON清洗",
+    "ReverseLayoutCaption (AssembledRecipes)": "配方·布局反推",
 }
