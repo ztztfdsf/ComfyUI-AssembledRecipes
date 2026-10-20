@@ -8,7 +8,7 @@
 量化模型 + LoRA 时，ComfyUI 每次加载都要「反量化 → 合并补丁 → 重新量化」，
 一个组合几分钟；换组合再拼一次。本插件把拼好的权重落盘复用，**拼一次，用一辈子**。
 
-## 节点（7 个）
+## 节点（8 个）
 
 | 节点 | 作用 |
 |---|---|
@@ -54,6 +54,20 @@
 
 前端带自动修复：加载工作流后若发现「模型链断了」（画廊/清理节点的 MODEL 输入空着），
 会自动从上游接上，并在浏览器控制台打印 `[AssembledRecipes] 自动补线 N 根`。
+
+## 模型下载与放置（一键直达）
+
+| 文件 | 放哪 | 下载 |
+|---|---|---|
+| DiT·SFT 量化版 int8_convrot（5.4G） | `models/diffusion_models/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/diffusion_models/moss_image_sft_int8_convrot.safetensors) |
+| DiT·Base 量化版 int8_convrot（5.4G） | `models/diffusion_models/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/diffusion_models/moss_image_base_int8_convrot.safetensors) |
+| 文本编码器 qwen3.5_9b_w4a8_gptq（7.3G） | `models/text_encoders/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/text_encoders/qwen3.5_9b_w4a8_gptq.safetensors) |
+| VAE flux2-vae（336M） | `models/vae/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/vae/flux2-vae.safetensors) |
+| 反推模型 qwen3-vl 去审查 4B（3.3G） | `models/LLM/`（Ollama 库） | [模型页](https://ollama.com/huihui_ai/qwen3-vl-abliterated)，`ollama pull huihui_ai/qwen3-vl-abliterated:4b-instruct-q4_K_M` |
+| Ollama 运行时（27M） | `ComfyUI/ollama/` | [下载](https://ollama.com/download/windows) |
+
+- 官方 DiT 是融合 qkv 版，本仓库加载器需要拆分版：用 `tools/split_qkv.py` 把 9216 行 qkv 权重字节级无损拆成 q/k/v（`python tools/split_qkv.py 源.safetensors 输出_split.safetensors`），加载器指向 `_split` 文件。
+- 机器重启后 Ollama 进程会消失——工作流里的「配方·反推服务自启」节点在反推前自动拉起，通常无需手动干预。
 
 ## 交流与反馈
 

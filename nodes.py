@@ -12,6 +12,8 @@
 import json
 import os
 import re
+import socket
+import subprocess
 import sys
 import time
 import types
@@ -797,6 +799,82 @@ class ReleasePhantomVram:
         return (image_pass, report)
 
 
+class ReverseServiceAutostart:
+    """反推服务（Ollama）自动启动。
+
+    机器重启后 Ollama 服务会消失（症状：反推节点报 "All connection attempts failed"）。
+    本节点接在反推图源与反推节点之间，image 原样透传，仅负责保证反推执行前服务在线：
+    - 先探测服务地址，活着就直接放行（零开销）；
+    - 不活着则从 ComfyUI/ollama/ollama.exe 启动（模型库自动指向 ComfyUI/models/LLM），
+      轮询等待就绪，上限 wait_seconds 秒。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "透传；接在反推图源切换与反推节点之间"}),
+                "service_url": ("STRING", {"default": "http://127.0.0.1:11434", "tooltip": "Ollama 服务地址"}),
+                "wait_seconds": ("INT", {"default": 45, "min": 5, "max": 300, "tooltip": "等待服务就绪的上限秒数"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "ensure"
+    CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "反推前自动拉起 Ollama 服务（exe 放 ComfyUI/ollama/，模型库 ComfyUI/models/LLM）。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
+
+    @staticmethod
+    def _alive(host, port, timeout=1.0):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except Exception:
+            return False
+
+    def ensure(self, image, service_url, wait_seconds):
+        from urllib.parse import urlparse
+        raw = service_url if "://" in service_url else "http://" + service_url
+        p = urlparse(raw)
+        host = p.hostname or "127.0.0.1"
+        port = p.port or 11434
+
+        if self._alive(host, port, 1.5):
+            print(f"[AssembledRecipes] 反推服务在线: {host}:{port}", flush=True)
+            return (image,)
+
+        base = folder_paths.base_path
+        exe = os.path.join(base, "ollama", "ollama.exe")
+        if not os.path.isfile(exe):
+            print(f"[AssembledRecipes] 反推服务未启动，且找不到 {exe}——"
+                  f"请把 ollama.exe 放进 ComfyUI/ollama/（下载见使用说明第八章），本次放行。", flush=True)
+            return (image,)
+
+        env = os.environ.copy()
+        env["OLLAMA_HOST"] = f"{host}:{port}"
+        models_dir = os.path.join(base, "models", "LLM")
+        env["OLLAMA_MODELS"] = models_dir
+        try:
+            flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            proc = subprocess.Popen([exe, "serve"], env=env, creationflags=flags,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    stdin=subprocess.DEVNULL, close_fds=True)
+            print(f"[AssembledRecipes] 反推服务自启: 已拉起 ollama (pid {proc.pid}) | 模型库 {models_dir}，等待就绪...", flush=True)
+        except Exception as e:
+            print(f"[AssembledRecipes] 拉起 ollama 失败: {e}", flush=True)
+            return (image,)
+
+        t0 = time.time()
+        while time.time() - t0 < wait_seconds:
+            if self._alive(host, port, 1.0):
+                print(f"[AssembledRecipes] 反推服务就绪: {host}:{port} ({time.time() - t0:.1f}s)", flush=True)
+                return (image,)
+            time.sleep(0.5)
+        print(f"[AssembledRecipes] 反推服务 {wait_seconds}s 内未就绪，放行（反推节点会自行报错）", flush=True)
+        return (image,)
+
+
 NODE_CLASS_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": RecipeSaveAssembled,
     "RecipeLoad (AssembledRecipes)": RecipeLoadAssembled,
@@ -807,6 +885,7 @@ NODE_CLASS_MAPPINGS = {
     "FreeVram (AssembledRecipes)": FreeVram,
     "VramModeFix (AssembledRecipes)": VramModeFix,
     "ReleasePhantomVram (AssembledRecipes)": ReleasePhantomVram,
+    "ReverseServiceAutostart (AssembledRecipes)": ReverseServiceAutostart,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": "配方保存",
@@ -818,4 +897,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FreeVram (AssembledRecipes)": "配方·踢编码器回内存",
     "VramModeFix (AssembledRecipes)": "配方·显存策略纠正",
     "ReleasePhantomVram (AssembledRecipes)": "配方·释放虚空显存",
+    "ReverseServiceAutostart (AssembledRecipes)": "配方·反推服务自启",
 }
