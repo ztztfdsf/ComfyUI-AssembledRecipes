@@ -881,6 +881,182 @@ class ReverseServiceAutostart:
         return (image,)
 
 
+class ReverseJsonSanitize:
+    """清洗反推节点吐出的布局 JSON，喂给 CreateBoundingBoxes 的 bboxes 口。
+
+    反推模型偶尔产出病 JSON：字符串里夹裸换行、bbox 写成字符串、输出被上下文截断等，
+    核心的 CreateBoundingBoxes 会直接抛 "not valid JSON" 炸整张图。本节点容错修复：
+    1) 剖掉 markdown 围栏与前后废话，定位 JSON 数组主体；
+    2) 修复字符串字面量里的裸控制字符（换行/回车/制表转义）；
+    3) 截断则回退到最后一个完整元素（字符串感知扫描）再闭合；
+    4) 逐元素校验：bbox 统一转 4 个 0~1000 整数（字符串形式自动拆），非法元素丢弃；
+    5) 全军覆没时输出 []（退回普通文生图，不炸链路）。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"text": ("STRING", {"tooltip": "接反推节点的描述输出"})}}
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("json",)
+    FUNCTION = "sanitize"
+    CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "修复反推输出的病 JSON（裸换行/字符串 bbox/截断），喂给边界框画布。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
+
+    @staticmethod
+    def _fix_raw_control(s):
+        out = []
+        in_str = esc = False
+        for ch in s:
+            if in_str:
+                if esc:
+                    out.append(ch)
+                    esc = False
+                elif ch == "\\":
+                    out.append(ch)
+                    esc = True
+                elif ch == '"':
+                    out.append(ch)
+                    in_str = False
+                elif ch == "\n":
+                    out.append("\\n")
+                elif ch == "\r":
+                    out.append("\\r")
+                elif ch == "\t":
+                    out.append("\\t")
+                elif ord(ch) < 0x20:
+                    out.append("\\u%04x" % ord(ch))
+                else:
+                    out.append(ch)
+            else:
+                if ch == '"':
+                    in_str = True
+                out.append(ch)
+        return "".join(out)
+
+    @staticmethod
+    def _truncate_to_complete(s):
+        """字符串感知地找最后一个完整元素的闭括号，截到那里再闭合数组。"""
+        cut = -1
+        in_str = esc = False
+        depth = 0
+        for idx, ch in enumerate(s):
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch in "[{":
+                depth += 1
+            elif ch in "}]":
+                depth -= 1
+                if depth == 1 and ch == "}":
+                    cut = idx
+        if cut < 0:
+            return None
+        return s[:cut + 1] + "]"
+
+    @staticmethod
+    def _clean_bbox(b):
+        if isinstance(b, str):
+            b = [b]
+        if not isinstance(b, (list, tuple)):
+            return None, False
+        if len(b) == 4 and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in b):
+            nums = [float(v) for v in b]
+            fixed = False
+        else:
+            joined = " ".join(str(v) for v in b)
+            nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", joined)][:4]
+            fixed = True
+        if len(nums) != 4:
+            return None, fixed
+        return [int(round(max(0.0, min(1000.0, n)))) for n in nums], fixed
+
+    def sanitize(self, text):
+        report = []
+        raw = text or ""
+        s = raw.strip()
+        if "```" in s:
+            for part in s.split("```"):
+                p = part.strip()
+                if p[:4].lower() == "json":
+                    p = p[4:].strip()
+                if p.startswith("["):
+                    s = p
+                    break
+        i = s.find("[")
+        data = None
+        if i >= 0:
+            j = s.rfind("]")
+            candidates = []
+            if j > i:
+                candidates.append(s[i:j + 1])
+            if not s[i:].rstrip().endswith("]"):
+                candidates.append(s[i:])  # 截断场景：rfind 切到内括号时用全文尾重试
+            for arr in candidates:
+                if data is not None:
+                    break
+                try:
+                    data = json.loads(arr)
+                    break
+                except Exception:
+                    pass
+                fixed = self._fix_raw_control(arr)
+                try:
+                    data = json.loads(fixed)
+                    report.append("修复字符串内裸控制字符")
+                    break
+                except Exception:
+                    pass
+                trunc = self._truncate_to_complete(fixed)
+                if trunc:
+                    try:
+                        data = json.loads(trunc)
+                        report.append("截断回退到最后完整元素")
+                        break
+                    except Exception:
+                        pass
+        out, dropped, bbox_fixed = [], 0, 0
+        if isinstance(data, list):
+            for e in data:
+                if not isinstance(e, dict):
+                    dropped += 1
+                    continue
+                bbox, fixed = self._clean_bbox(e.get("bbox"))
+                if bbox is None:
+                    dropped += 1
+                    continue
+                if fixed:
+                    bbox_fixed += 1
+                etype = "text" if str(e.get("type", "")).strip().lower() == "text" else "obj"
+                desc = str(e.get("desc", "")).strip() or "unknown"
+                item = {"type": etype, "bbox": bbox, "desc": desc}
+                if etype == "text":
+                    txt = str(e.get("text", "")).strip()
+                    if not txt:
+                        dropped += 1
+                        continue
+                    item["text"] = txt
+                out.append(item)
+        elif data is None:
+            report.append("未解析出布局，输出空布局")
+        msg = f"保留 {len(out)} 个框"
+        if dropped:
+            msg += f"，丢弃 {dropped} 个坏元素"
+        if bbox_fixed:
+            msg += f"，修复 {bbox_fixed} 个字符串 bbox"
+        report.append(msg)
+        result = json.dumps(out, ensure_ascii=False)
+        print(f"[AssembledRecipes] 反推JSON清洗: {'; '.join(report)} | 输出 {len(result)} 字符", flush=True)
+        return (result,)
+
+
 NODE_CLASS_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": RecipeSaveAssembled,
     "RecipeLoad (AssembledRecipes)": RecipeLoadAssembled,
@@ -892,6 +1068,7 @@ NODE_CLASS_MAPPINGS = {
     "VramModeFix (AssembledRecipes)": VramModeFix,
     "ReleasePhantomVram (AssembledRecipes)": ReleasePhantomVram,
     "ReverseServiceAutostart (AssembledRecipes)": ReverseServiceAutostart,
+    "ReverseJsonSanitize (AssembledRecipes)": ReverseJsonSanitize,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": "配方保存",
@@ -904,4 +1081,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VramModeFix (AssembledRecipes)": "配方·显存策略纠正",
     "ReleasePhantomVram (AssembledRecipes)": "配方·释放虚空显存",
     "ReverseServiceAutostart (AssembledRecipes)": "配方·反推服务自启",
+    "ReverseJsonSanitize (AssembledRecipes)": "配方·反推JSON清洗",
 }
