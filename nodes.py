@@ -1140,6 +1140,40 @@ class ReverseLayoutCaption:
         return (text_out,)
 
 
+
+class BlankToNone:
+    """空字符串 → None（让下游「Any Switch」等真正回落到备用输入）。
+
+    背景：rgthree 的 Any Switch 只跳过 None，不跳过 ""。而 Aaalice 的
+    PromptSelector / BooruGallery 在「没选任何条目」时输出的正是空字符串，
+    于是它会抢走开关的优先位、把后面接的提示词输入框整个吃掉。
+    本节点把空白文本换成 None，开关就能正确回落到下一个输入。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"forceInput": True, "tooltip": "待检查的文本"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "convert"
+    CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "空/纯空白的文本 → None，让 Any Switch 之类正确回落到下一个输入（修画廊空选择吃提示词的坑）。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")  # 永不缓存，每次按当前值判断
+
+    def convert(self, text):
+        s = (text or "")
+        if s.strip():
+            return (s,)
+        return (None,)
+
 NODE_CLASS_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": RecipeSaveAssembled,
     "RecipeLoad (AssembledRecipes)": RecipeLoadAssembled,
@@ -1152,6 +1186,7 @@ NODE_CLASS_MAPPINGS = {
     "ReleasePhantomVram (AssembledRecipes)": ReleasePhantomVram,
     "ReverseJsonSanitize (AssembledRecipes)": ReverseJsonSanitize,
     "ReverseLayoutCaption (AssembledRecipes)": ReverseLayoutCaption,
+    "BlankToNone (AssembledRecipes)": BlankToNone,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": "配方保存",
@@ -1165,4 +1200,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ReleasePhantomVram (AssembledRecipes)": "配方·释放虚空显存",
     "ReverseJsonSanitize (AssembledRecipes)": "配方·反推JSON清洗",
     "ReverseLayoutCaption (AssembledRecipes)": "配方·布局反推",
+    "BlankToNone (AssembledRecipes)": "配方·空串转无",
 }
