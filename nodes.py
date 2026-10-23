@@ -906,10 +906,13 @@ class ReverseLayoutCaption:
         return float("NaN")
 
     @staticmethod
-    def _trim_user_prompt(text, max_chars=200):
+    def _trim_user_prompt(text, max_chars=100):
         """画廊标签动辄几百个，全喂进去模型会把每个 tag 都框出来（实测 227 框）。
 
         只保留开头最关键的若干个（角色名/作品名通常排在最前），够模型认人即可。
+        截到 100 字符：前几个总是「作品名 + 角色名」，再往后就是装束/身体部位 tag，
+        那是角色的默认形象而非这张画面的实际内容，留着会让 VLM 把图上没有的衣物
+        （灰裙、领带、过膝袜）硬写进 desc。
         """
         t = (text or "").strip()
         if not t:
