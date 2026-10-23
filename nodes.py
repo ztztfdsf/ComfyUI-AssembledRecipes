@@ -813,14 +813,19 @@ class ReverseJsonSanitize:
 _VLM_CACHE = {}  # 模型目录 -> (processor, model) 内存常驻缓存
 
 
+# 规则要点：限死框数（防过度分割）、禁止把画廊 tag 逐条变框、desc 15~30 词（防 token 爆炸）
 _LAYOUT_RULE_DEFAULT = (
-    "你是图像布局反推器。识别图中所有主要对象、人物和文字块——每个独立可见的实体（人物、动物、物体、背景中的显著主体、文字块）都必须有自己的框，不要合并，也不要遗漏次要对象。"
+    "你是图像布局反推器。只框画面中的主要视觉主体，**最多 10 个框**，按重要程度取舍："
+    "①人物 / 动物：每个角色一个框，框住整个身体轮廓，不要把头发、眼睛、衣服、手拆成多个框；"
+    "②大型显著物体：占据画面明显位置的道具或家具；"
+    "③文字块：画面中出现的文字，整段文字一个框。"
+    "绝对不要为发丝、眼睛、衣褶、饰品、背景光斑、装饰星星、细小图案这类细节单独建框；宁可少框，也不要拆碎。"
     "只输出一个 JSON 数组，不要输出任何其他文字或 markdown 标记。每个元素格式：{\"type\":\"obj\",\"bbox\":[ymin,xmin,ymax,xmax],\"desc\":\"英文自然语言提示词\"}；"
     "画面中的文字用 {\"type\":\"text\",\"bbox\":[ymin,xmin,ymax,xmax],\"text\":\"文字原文\",\"desc\":\"英文自然语言说明\"}。"
-    "desc 一律使用英文自然语言提示词，写得详细完整：像写给画师的一段英文描述句，包含主体外观、发型发色、服装与材质、颜色、姿势动作、表情、朝向、"
-    "与镜头的距离（close-up / upper body / half body / full body）等所有可见信息，每条 desc 至少 15~40 个英文单词，宁可详细不可简略；"
-    "不要用中文、不要用标签堆砌；唯独 text 字段保留画面文字的原文原样（含大小写与语言）。"
-    "若用户消息中附带了画廊提示词（角色名/风格标签），遇到不认识的角色或概念时，用它来补全 desc 中的角色名与细节。"
+    "desc MUST be written in ENGLISH ONLY — never Chinese, never Japanese, never tag lists. Each desc is 15~30 English words and must cover: appearance, hair style & color, outfit & material, colors, pose & expression, facing, and shot distance (close-up / upper body / half body / full body). "
+    "Example of a valid desc: \"a young anime girl with teal twin-tails, wearing a dark grey uniform with a cyan necktie and black gloves, both hands covering her mouth, blushing with averted eyes, upper body shot\"."
+    "唯独 text 字段保留画面文字的原文原样（含大小写与语言）。"
+    "若用户消息里附带了一串图库标签（tag），那只是用来确认角色身份与画风参考的资料，**绝不要把其中的标签逐条变成框**，也不要因为标签里提到某个身体部位或衣物就为它单独建框。"
     "坐标是 0~1000 的归一化值，顺序为 [上,左,下,右]（yxyx）。bbox 必须是 4 个纯数字组成的数组，如 [12,34,56,78]，禁止加引号或合并成字符串。所有框按从背景到前景排列。")
 
 
@@ -857,6 +862,27 @@ class ReverseLayoutCaption:
     def IS_CHANGED(cls, **kwargs):
         # VLM 是随机的 + 清场是外部状态：同一张图重跑也要重新反推，禁用执行缓存
         return float("NaN")
+
+    @staticmethod
+    def _trim_user_prompt(text, max_chars=200):
+        """画廊标签动辄几百个，全喂进去模型会把每个 tag 都框出来（实测 227 框）。
+
+        只保留开头最关键的若干个（角色名/作品名通常排在最前），够模型认人即可。
+        """
+        t = (text or "").strip()
+        if not t:
+            return ""
+        parts = [x.strip() for x in t.replace("\n", ", ").split(",") if x.strip()]
+        out, total = [], 0
+        for p in parts:
+            if total + len(p) + 2 > max_chars:
+                break
+            out.append(p)
+            total += len(p) + 2
+        trimmed = ", ".join(out)
+        if trimmed and len(trimmed) < len(t):
+            print(f"[AssembledRecipes] 画廊标签裁剪: {len(t)} → {len(trimmed)} 字符（{len(parts)} 个 tag 取 {len(out)} 个）", flush=True)
+        return trimmed
 
     @staticmethod
     def _image_to_pil(image, max_side=640):
@@ -940,8 +966,11 @@ class ReverseLayoutCaption:
         pil = self._image_to_pil(image)
         if image.shape[0] > 1:
             print(f"[AssembledRecipes] 布局反推: 批量 {image.shape[0]} 张，只取第一张", flush=True)
-        user_content = ((user_prompt or "").strip() + "\n\n" if (user_prompt or "").strip() else "") \
+        up = self._trim_user_prompt(user_prompt)
+        user_content = (
+            (up + "\n\n" if up else "")
             + "Analyze the image and output ONLY the JSON array as instructed."
+        )
         messages = [
             {"role": "system", "content": rule},
             {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_content}]},
