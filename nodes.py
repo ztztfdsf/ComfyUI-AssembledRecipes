@@ -731,6 +731,97 @@ class ReverseJsonSanitize:
             return None, fixed
         return [int(round(max(0.0, min(1000.0, n)))) for n in nums], fixed
 
+    @staticmethod
+    def _looks_like_corner_signature(e):
+        """角落里的 Title-Case 单词 -> 疑似作者签名（如 Qianliu）。
+
+        署名常单独出现、不带任何关键词，但位置有特征：挤在画面边缘（签名习惯），
+        且是首字母大写的纯字母单词/短名。招牌与 UI 常用全大写（CAFE / START）或不在边缘。
+        """
+        if str(e.get("type", "")).strip().lower() != "text":
+            return False
+        txt = str(e.get("text", "")).strip()
+        if not txt or len(txt) > 24 or " " in txt.strip():
+            return False
+        if not re.fullmatch(r"[A-Z][A-Za-z]{2,23}", txt):
+            return False
+        b = e.get("bbox")
+        if not (isinstance(b, (list, tuple)) and len(b) == 4):
+            return False
+        y0, x0, y1, x1 = [float(v) for v in b]
+        edge = 150.0
+        return min(x0, y0, 1000.0 - x1, 1000.0 - y1) <= edge
+
+    @staticmethod
+    def _area(b):
+        y0, x0, y1, x1 = [float(v) for v in b]
+        return max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+    @classmethod
+    def _is_signature_cluster(cls, b, meta_bboxes):
+        """署名簇连坐：只对「小区域」生效。
+
+        署名一组挤在角落（FANBOX + Qianliu + 邮箱），互相重叠。但全图主体 obj
+        的 bbox 也天然包含角标——那种大框绝不能连坐（实测误杀过主体框）。
+        因此要求双方都是局部小块（<= 图 25%）且重叠明显。
+        """
+        if cls._area(b) > 250000.0:  # 1000x1000 的 25%
+            return False
+        for mb in meta_bboxes:
+            if cls._area(mb) > 250000.0:
+                continue
+            if cls._overlap_ratio(b, mb) >= 0.3:
+                return True
+        return False
+
+    @staticmethod
+    def _overlap_ratio(a, b):
+        ay0, ax0, ay1, ax1 = [float(v) for v in a]
+        by0, bx0, by1, bx1 = [float(v) for v in b]
+        iw = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+        ih = max(0.0, min(ay1, by1) - max(ay0, by0))
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        amin = min((ax1 - ax0) * (ay1 - ay0), (bx1 - bx0) * (by1 - by0))
+        return inter / amin if amin > 0 else 0.0
+
+    @staticmethod
+    def _is_meta_element(e):
+        """水印 / 画师署名 / AI 声明 / 版权商用声明 / 链接 / 签名 → 一律丢弃。
+
+        这类文字不是画面内容，是图的「外部元信息」，反推进布局会在重绘时把它
+        烙进新图（还会把画师名洗成自己的签名）。规则里已经禁止模型建框，但纯
+        规则约束是概率性的（实测带水印图仍被框出 5 个烂框），这里做确定性兜底。
+        """
+        if not isinstance(e, dict):
+            return False
+        etype = str(e.get("type", "")).strip().lower()
+        blob = " ".join([
+            str(e.get("text", "")),
+            str(e.get("desc", "")),
+        ]).lower()
+        if not blob.strip():
+            return False
+        # 链接 / 邮箱 / 社交 handle
+        if re.search(r"https?://|www\.|\b\S+@\S+\.(?:com|cc|net|org|jp|me|io|dev|to|gg)\b|@\w{2,}", blob):
+            return True
+        # 常见平台与作者名指向
+        if re.search(r"fanbox|pixiv|fantia|patreon|booth\.pm|skeb|gumroad|artstation|deviantart|twitter|x\.com|telegram|discord", blob):
+            return True
+        # AI 生成声明 / 禁止 AI
+        if re.search(r"ai[\s-]?generated|aigc|#ai\b|\bai\s*art\b|no\s*ai|not\s*for\s*ai|do\s*not\s*train|noai|禁止\s*ai|严禁\s*ai|ai\s*(禁止|训练|学习)", blob):
+            return True
+        # 版权 / 商用 / 转载声明
+        if re.search(r"copyright|all\s*rights\s*reserved|©|™|严禁商用|禁止商用|商用|禁止转载|转载禁止|无断|二禁|do\s*not\s*(repost|use|share)|unauthori[sz]ed", blob):
+            return True
+        # 署名 / 签名 / 水印：text 框直接丢；obj 框只在 desc 明确说它是水印/签名时才丢
+        if etype == "text" and re.search(r"signature|watermark|credit|illustration\s*by|drawn\s*by|art\s*by|illust\s*by|签名|水印|画师|作者|绘制", blob):
+            return True
+        if etype == "obj" and re.search(r"watermark|signature|水印|签名|署名", blob):
+            return True
+        return False
+
     def sanitize(self, text):
         report = []
         raw = text or ""
@@ -775,11 +866,25 @@ class ReverseJsonSanitize:
                         break
                     except Exception:
                         pass
-        out, dropped, bbox_fixed = [], 0, 0
+        out, dropped, bbox_fixed, meta_dropped = [], 0, 0, 0
         if isinstance(data, list):
-            for e in data:
-                if not isinstance(e, dict):
-                    dropped += 1
+            # 第一遍：定性谁是 meta（水印/署名/声明/链接/角落人名）
+            items = [e for e in data if isinstance(e, dict)]
+            meta_flags = [self._is_meta_element(e) or self._looks_like_corner_signature(e) for e in items]
+            meta_bboxes = []
+            for e, is_meta in zip(items, meta_flags):
+                if is_meta:
+                    b, _ = self._clean_bbox(e.get("bbox"))
+                    if b:
+                        meta_bboxes.append(b)
+            # 第二遍：署名常一组挤在一起（FANBOX + Qianliu + 邮箱），与 meta 区域重叠的同驱
+            for e, is_meta in zip(items, meta_flags):
+                if is_meta:
+                    meta_dropped += 1
+                    continue
+                b, _ = self._clean_bbox(e.get("bbox"))
+                if b and self._is_signature_cluster(b, meta_bboxes):
+                    meta_dropped += 1
                     continue
                 bbox, fixed = self._clean_bbox(e.get("bbox"))
                 if bbox is None:
@@ -802,6 +907,8 @@ class ReverseJsonSanitize:
         msg = f"保留 {len(out)} 个框"
         if dropped:
             msg += f"，丢弃 {dropped} 个坏元素"
+        if meta_dropped:
+            msg += f"，过滤水印/署名/声明 {meta_dropped} 个"
         if bbox_fixed:
             msg += f"，修复 {bbox_fixed} 个字符串 bbox"
         report.append(msg)
@@ -817,6 +924,17 @@ _VLM_CACHE = {}  # 模型目录 -> (processor, model) 内存常驻缓存
 _LAYOUT_RULE_DEFAULT = (
     '# 角色\n'
     '你是图像版面解析引擎，把画面拆成「布局元素」，供文生图按区域重绘。\n'
+    '\n'
+    '# 绝对禁框（最高优先级，无例外）\n'
+    '凡是图的「外部元信息」，不管长在画面哪个位置、不管多显眼，都视为不存在：不建框、不进 text、不进 desc。\n'
+    '禁止的类别（命中任一即丢）：\n'
+    '1. 水印：watermark、半透明角标、重复铺满的底纹文字。\n'
+    '2. 作者/画师署名与社交 handle：@xxxx、Qianliu、qianliu@fanbox.cc、FANBOX、PIXIV、Patreon、推特/X 用户名。\n'
+    '3. AI 生成声明：AI-generated、AIGC、#ai、no AI、not for AI、do not train、禁止 AI、严禁 AI。\n'
+    '4. 版权与商用声明：©、™、copyright、all rights reserved、严禁商用、禁止转载、do not repost、unauthorized。\n'
+    '5. 链接与签名：URL、邮箱、signature、签名。\n'
+    '对比：黑板上写的「欢迎」、招牌上的「CAFE」、对话框里的台词、UI 里的按钮文字 —— 这些是画面内容，正常建框。\n'
+    '判断标准：那行字是「画里」的还是「图上」的？图上的（作者盖上去的）一律不框。\n'
     '\n'
     '# 内部流程（只在心里做，不要输出）\n'
     '1. 先数画面里有几个主要主体：人物/动物各算一个主体，成段的文字算一个元素，占据显眼位置的大物体算一个元素。\n'
