@@ -654,7 +654,7 @@ class ReverseJsonSanitize:
     RETURN_NAMES = ("json",)
     FUNCTION = "sanitize"
     CATEGORY = "AssembledRecipes"
-    DESCRIPTION = "修复反推输出的病 JSON（裸换行/字符串 bbox/截断），喂给边界框画布。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
+    DESCRIPTION = "修复反推输出的病 JSON（裸换行/字符串 bbox/截断），并把坐标从 xyxy 转成 yxyx，喂给边界框画布。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
     @staticmethod
     def _fix_raw_control(s):
@@ -894,7 +894,11 @@ class ReverseJsonSanitize:
                     bbox_fixed += 1
                 etype = "text" if str(e.get("type", "")).strip().lower() == "text" else "obj"
                 desc = str(e.get("desc", "")).strip() or "unknown"
-                item = {"type": etype, "bbox": bbox, "desc": desc}
+                # 坐标序交换：模型按原生习惯输出 xyxy [x0,y0,x1,y1]，
+                # CreateBoundingBoxes 要 yxyx [y0,x0,y1,x1]。规则层拗不过模型（实测），
+                # 在这里确定性交换，保证下游永远吃到 yxyx。
+                yxyx = [bbox[1], bbox[0], bbox[3], bbox[2]]
+                item = {"type": etype, "bbox": yxyx, "desc": desc}
                 if etype == "text":
                     txt = str(e.get("text", "")).strip()
                     if not txt:
@@ -920,7 +924,7 @@ class ReverseJsonSanitize:
 _VLM_CACHE = {}  # 模型目录 -> (processor, model) 内存常驻缓存
 
 
-# 规则要点：限死框数（防过度分割）、禁止把画廊 tag 逐条变框、desc 15~30 词（防 token 爆炸）
+# 规则要点：限死框数（防过度分割）、禁止把画廊 tag 逐条变框、desc 120~220 词、坐标用模型原生的 xyxy（清洗节点统一转 yxyx）
 _LAYOUT_RULE_DEFAULT = (
     '# 角色\n'
     '你是图像版面解析引擎，把画面拆成「布局元素」，供文生图按区域重绘。\n'
@@ -941,6 +945,7 @@ _LAYOUT_RULE_DEFAULT = (
     '2. 同一主体的头发、眼睛、衣服、手、配饰全部属于它，只给它一个框，不拆。\n'
     '\n'
     '# 框选规则\n'
+    '- 多主体必须分开建框：画面里有几个人物/动物就建几个框，各自写各自的 desc，禁止把两个及以上的人合并进同一个框。只有画面确实只有一个主体时才允许整幅大框。\n'
     '- 框数上限 10 个，宁少勿多；超过 10 个说明你在把画面拆碎。\n'
     '- 人物 / 动物：框住整个轮廓（全身图含头顶到脚下，半身图到画面下沿或腰线）。\n'
     '- 文字块：整段文字一个框，不要一行一个框、不要一个字一个框。\n'
@@ -949,15 +954,15 @@ _LAYOUT_RULE_DEFAULT = (
     '- 禁止建框（任何情况下，包括 type=text）：水印、画师/作者署名、AI 生成声明（如 AI-generated、禁止AI使用）、版权与商用声明、网址链接、logo、签名等非画面内容文字——一律当作不存在：不建框、不输出、不描述。\n'
     '\n'
     '# 坐标\n'
-    '- 归一化 0~1000 的整数，顺序是 [上, 左, 下, 右]，也就是 ymin, xmin, ymax, xmax。\n'
-    '- 例：[0, 0, 1000, 1000] 是整张图；[0, 0, 500, 1000] 是画面上半部分整宽；[266, 570, 500, 797] 是画面中间偏右下的一块。\n'
-    '- 必须 ymin < ymax 且 xmin < xmax；四个值都是纯数字，不加引号、不写成字符串。\n'
+    '- 归一化 0~1000 的整数，顺序是 [左, 上, 右, 下]，也就是 xmin, ymin, xmax, ymax。\n'
+    '- 例：[0, 0, 1000, 1000] 是整张图；[0, 0, 1000, 500] 是画面上半部分整宽；[570, 266, 797, 500] 是画面中间偏右下的一块。\n'
+    '- 必须 xmin < xmax 且 ymin < ymax；四个值都是纯数字，不加引号、不写成字符串。\n'
     '\n'
     '# 输出（直接喂给「创建边界框」节点，字段必须严格照它的规则）\n'
     '只输出一个 JSON 数组。不要 markdown 代码块，不要解释，不要任何前后缀文字。\n'
     '数组元素两种形态：\n'
-    '{"type":"obj","bbox":[ymin,xmin,ymax,xmax],"desc":"英文描述"}\n'
-    '{"type":"text","bbox":[ymin,xmin,ymax,xmax],"text":"画面文字原文","desc":"英文说明"}\n'
+    '{"type":"obj","bbox":[xmin,ymin,xmax,ymax],"desc":"英文描述"}\n'
+    '{"type":"text","bbox":[xmin,ymin,xmax,ymax],"text":"画面文字原文","desc":"英文说明"}\n'
     '- type 只有 "text" 是特殊值，其余元素一律写 "obj"，不要自创别的类型。\n'
     '- text 字段只在 type 为 "text" 时出现；obj 元素不要带 text。\n'
     '- 可选字段 "color_palette"：能明确判断该区域主色调时，写最多 5 个十六进制色，如 ["#1b2a44","#d8c7a1"]；拿不准就整个字段省略，不要猜。\n'
@@ -965,7 +970,8 @@ _LAYOUT_RULE_DEFAULT = (
     '\n'
     '# desc 要求（按 MOSS 官方布局数据的详细程度写，别怕长）\n'
     '- 必须是英文，不得出现中文或日文。\n'
-    '- 每条 80~160 个英文单词，写成一个完整段落，详细到能照着这段重新画出来。框数上限 10 个，所以尽管写细，总量可控。\n'
+    '- 每条 120~220 个英文单词，写成一个完整段落，详细到能照着这段重新画出来。框数上限 10 个，所以尽管写细，总量可控。\n'
+    '- 长度不随框数缩水：即使画面里有多个主体、多个框，每条 desc 也必须独立保持 120 词以上，不要因为分了框就把每段写短。\n'
     '- 必须写到这些：\n'
     '  · 主体身份与外观（物种/性别/年龄段）、发型发色的长度与质感、有无角/耳/尾等特征；\n'
     '  · 服装的层数、材质、剪裁、颜色、配饰，要具体（例如 layered white ceremonial robes with wide draping sleeves）；\n'
@@ -979,10 +985,11 @@ _LAYOUT_RULE_DEFAULT = (
     '- 不写猜测、不写画外内容、不写「这张图展示了」这类套话。\n'
     '- 画面上的水印、画师/作者署名、AI 生成声明、版权与商用声明、网址链接等一律视为不存在：不建框、不输出 text、不写进任何 desc。\n'
     '\n'
-    '# 示例\n'
+    '# 示例（注意：两个人物就是两个框，各自描述各自的位置）\n'
     '[\n'
-    '{"type":"obj","bbox":[0,0,1000,1000],"desc":"a slim young woman with long silver hair and crimson eyes, wearing a black high-collar coat with silver buckles, standing with one hand on her hip and a faint smirk, facing the viewer, full body shot"},\n'
-    '{"type":"text","bbox":[30,77,207,312],"desc":"a line of white handwritten Japanese text at the upper left corner over a pale cyan background","text":"こんにちは"}\n'
+    '{"type":"obj","bbox":[0,60,480,1000],"desc":"a slim young woman with long silver hair and crimson eyes, wearing a black high-collar coat with silver buckles over a charcoal turtleneck dress, the coat left unbuttoned with its hem swaying slightly, standing with her weight on her right leg, one hand resting on her hip and the other hanging loosely at her side, her head turned a quarter to the left as she looks directly at the viewer with a faint confident smirk, occupying the left half of the frame, full body shot framed from a slightly low angle, cool ambient moonlight from the left casting soft shadows across the folds of her clothes"},\n'
+    '{"type":"obj","bbox":[520,40,1000,970],"desc":"a tall young man with short messy dark hair, wearing a loose grey hoodie and dark slim trousers, leaning against the right edge of the frame with his arms crossed, his gaze directed at the woman, warm rim light tracing his silhouette"},\n'
+    '{"type":"text","bbox":[77,30,207,312],"desc":"a line of white handwritten Japanese text at the upper left corner over a pale cyan background","text":"こんにちは"}\n'
     ']\n'
     '\n'
     '# 参考资料\n'

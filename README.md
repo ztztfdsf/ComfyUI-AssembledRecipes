@@ -18,8 +18,8 @@
 | **配方·深度清理** | 最彻底的清理：卸载全部模型 + `gc` + `synchronize` + `empty_cache ×3` + `ipc_collect`。用于真挤 / 跑前清残渣；可选丢弃 LoRA 合并留下的原权重备份（腾出≈模型体积，前提是下次从干净基座重打补丁） |
 | **配方·踢编码器回内存** | 放在**编码之后、采样之前**：吃 model + 正负条件（保证时序），把除主模型外的已加载模型（文本编码器等 5G+）offload 回内存并清缓存。走官方 `free_memory(keep_loaded=…)`，安全 |
 | **配方·显存策略纠正** | 运行时把 `--highvram` 纠回 NORMAL_VRAM + 重开 smart memory（等价摘掉启动参数，启动器零改动） |
-| **配方·布局反推** | **进程内直载** Qwen3-VL（transformers，零外部进程零黑框）反推出 MOSS 布局 JSON。显存串行铁律：反推前自动清场（全部卸回内存）→ 模型上卡独占 → 推理完退卡回内存（常驻缓存）。**框数硬上限 10 个**（只框人物/大型物体/文字块，不给发丝衣褶建框），desc 强制英文 15~30 词；画廊标签自动裁剪到 200 字符（防几百个 tag 被逐条变框，实测 227 框→2 框、19 分钟→30 秒）。输出详细 desc 但可控 |
-| **配方·反推JSON清洗** | 反推输出坏 JSON 的兜底（裸换行/字符串bbox/截断/纯废话都接得住），接 `CreateBoundingBoxes` 前垫一道 |
+| **配方·布局反推** | **进程内直载** Qwen3-VL（transformers，零外部进程零黑框）反推出 MOSS 布局 JSON。显存串行铁律：反推前自动清场（全部卸回内存）→ 模型上卡独占 → 推理完退卡回内存（常驻缓存）。**框数硬上限 10 个**（多主体强制分开建框，只框人物/大型物体/文字块，不给发丝衣褶建框），desc 强制英文 120~220 词连贯段落；水印/署名/AI声明/版权商用一律不建框（规则禁令 + 清洗节点确定性拦截双保险）；画廊标签自动裁剪到 100 字符（防几百个 tag 被逐条变框）。输出详细 desc 但可控 |
+| **配方·反推JSON清洗** | 反推输出坏 JSON 的兜底（裸换行/字符串bbox/截断/纯废话都接得住），并把坐标从模型原生的 xyxy 确定性转成 CreateBoundingBoxes 要的 yxyx；水印/署名/声明类框在这里硬拦（关键词黑名单 + 角落人名启发 + 署名簇连坐），接 `CreateBoundingBoxes` 前垫一道 |
 | **配方·空串转无** | 空/纯空白文本 → `None`。修「画廊空选择吃掉提示词」的坑：rgthree Any Switch 只跳过 `None` 不跳过 `""`，而画廊类节点没选内容时正好吐空字符串，会抢走开关优先位把下游提示词框整个吃掉。接在画廊输出与开关之间即可正确回落 |
 
 ## 用法
@@ -64,7 +64,7 @@
 | DiT·Base 量化版 int8_convrot（5.4G） | `models/diffusion_models/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/diffusion_models/moss_image_base_int8_convrot.safetensors) |
 | 文本编码器 qwen3.5_9b_w4a8_gptq（7.3G） | `models/text_encoders/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/text_encoders/qwen3.5_9b_w4a8_gptq.safetensors) |
 | VAE flux2-vae（336M） | `models/vae/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/vae/flux2-vae.safetensors) |
-| 反推模型 Huihui-Qwen3-VL-4B-Instruct-abliterated（8.9G，HF transformers 布局整个目录） | `models/LLM/Huihui-Qwen3-VL-4B-Instruct-abliterated/` | [下载](https://huggingface.co/huihui-ai/Huihui-Qwen3-VL-4B-Instruct-abliterated) |
+| 反推模型 Qwen3-VL-4B 去审查版（8.9G，HF transformers 布局整个目录）：`Qwen3-VL-4b-Heretic`（推荐，新法去审查）或 `Huihui-Qwen3-VL-4B-Instruct-abliterated` | `models/LLM/<模型目录>/` | [Heretic](https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic) · [Huihui](https://huggingface.co/huihui-ai/Huihui-Qwen3-VL-4B-Instruct-abliterated) |
 
 - **下载即用，无需拆分**：2026-10-16 起 ComfyUI（≥ v0.42）原生支持 MOSS，直接用核心简易节点 `UNETLoader` / `CLIPLoader(type=moss_image)` 加载官方融合版文件。低于 v0.42 的旧版本没有原生 MOSS 支持。
 - 社区 LoRA 多按融合 qkv 训练：原生融合链路下注意力权重可 **100%** 打进（旧拆分方案只能打进约六成）。
