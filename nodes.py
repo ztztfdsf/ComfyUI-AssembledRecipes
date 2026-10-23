@@ -312,55 +312,6 @@ class RecipeSaveAssembled:
         return (image,)
 
 
-class RecipeLoadAssembled:
-    """直读已拼装配方输出 MODEL（零 LoRA 拼装），可选逐层流水。"""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "recipe": (recipe_files(),),
-                "streaming": ("BOOLEAN", {"default": False, "tooltip": "逐层流水：显存峰值极小，稍慢；显存紧张/爆表时开"}),
-            },
-            "optional": {
-                "recipe_name": ("STRING", {"forceInput": True, "tooltip": "画廊节点点选的名字会覆盖上面的下拉"}),
-            },
-        }
-
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "load"
-    CATEGORY = "AssembledRecipes"
-    DESCRIPTION = "直读配方(零 LoRA 拼装)。streaming=逐层流水，显存峰值≈单层。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
-
-    @classmethod
-    def IS_CHANGED(cls, recipe, streaming):
-        p = os.path.join(RECIPES_DIR, recipe)
-        return f"{os.path.getmtime(p) if os.path.exists(p) else 0}:{streaming}"
-
-    def load(self, recipe, streaming=False, recipe_name=None):
-        if recipe_name:
-            recipe = recipe_name if recipe_name.endswith(".safetensors") else recipe_name + ".safetensors"
-        path = os.path.join(RECIPES_DIR, recipe)
-        try:
-            patcher = comfy.sd.load_diffusion_model(path)
-        except Exception:
-            # 拆分 qkv / 量化配方走 moss-image 插件加载器（与来源模型同款）
-            import importlib.util
-            moss = os.path.join(folder_paths.base_path, "custom_nodes", "moss-image", "loaders.py")
-            if not os.path.exists(moss):
-                raise
-            spec = importlib.util.spec_from_file_location("moss_image_loaders", moss)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["moss_image_loaders"] = mod
-            spec.loader.exec_module(mod)
-            patcher = mod.load_model(path, "default")
-        if streaming:
-            patcher = enable_streaming(patcher)
-        print(f"[AssembledRecipes] 配方直读: {recipe} | 逐层流水={streaming}")
-        return (patcher,)
-
-
 class StreamToggle:
     """MODEL 直通 + 逐层流水开关（给正常 LoRA 链路用）。"""
 
@@ -388,54 +339,6 @@ class StreamToggle:
 
 
 
-
-class RecipeRouter:
-    """按组合键路由：有配方→直读配方（不执行 model 分支）；没有→执行 model 分支（LoRA 拼装）并返回。"""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "recipe_key": ("STRING", {"default": "", "tooltip": "配方名/组合键；例：auto_Nyalia+QAQ。留空=强制走 model 分支"}),
-                "streaming": ("BOOLEAN", {"default": False}),
-            },
-            "optional": {
-                "model": ("MODEL", {"lazy": True, "tooltip": "兜底分支：只有配方不存在时才会执行（避免拼装费）"}),
-            },
-        }
-
-    RETURN_TYPES = ("MODEL", "STRING")
-    RETURN_NAMES = ("model", "used_recipe")
-    FUNCTION = "route"
-    CATEGORY = "AssembledRecipes"
-    DESCRIPTION = "填组合名=命中配方就直读、不执行 LoRA 分支(省拼装)；留空=走 LoRA 分支。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
-
-    @staticmethod
-    def _resolve(recipe_key):
-        key = (recipe_key or "").strip()
-        if not key:
-            return None
-        fname = key if key.endswith(".safetensors") else key + ".safetensors"
-        path = os.path.join(RECIPES_DIR, fname)
-        return path if os.path.exists(path) else None
-
-    def check_lazy_status(self, recipe_key="", streaming=False, model=None):
-        if self._resolve(recipe_key):
-            return []
-        return ["model"]
-
-    def route(self, recipe_key="", streaming=False, model=None):
-        path = self._resolve(recipe_key)
-        if path:
-            patcher = _load_any(path)
-            if streaming:
-                patcher = enable_streaming(patcher)
-            print(f"[AssembledRecipes] 路由命中配方（跳过拼装）: {os.path.basename(path)}")
-            return (patcher, os.path.basename(path))
-        if model is None:
-            raise ValueError("【AssembledRecipes】配方不存在，且兜底 model 输入是空的——请把 LoRA 输出接到本节点的 model 输入")
-        print("[AssembledRecipes] 路由未命中配方 → 走 LoRA 分支")
-        return (model, "")
 
 class RecipeGallery:
     """画廊点选配方；没选就走惰性兜底 model（不选=零额外开销）。"""
@@ -498,6 +401,7 @@ class DeepClean:
             "required": {
                 "unload_models": ("BOOLEAN", {"default": True, "tooltip": "把已加载模型权重卸回内存(跑图时按需重载)"}),
                 "force_empty_cache": ("BOOLEAN", {"default": True, "tooltip": "强制把显存缓存池还给驱动(不占内存,下次重新申请)"}),
+                "drop_patch_backups": ("BOOLEAN", {"default": False, "tooltip": "丢掉 LoRA 合并留下的原权重备份(可腾出接近模型体积的显存)；前提是下次从干净基座重打补丁"}),
             },
             "optional": {
                 "model_pass": ("MODEL", {"lazy": True}),
@@ -549,7 +453,7 @@ class DeepClean:
             total = -1
         return n, freed, f"vbar 总数 {seen} 保留 {len(keep)} 剩余驻留 {total // 2**20}MB"
 
-    def clean(self, unload_models=True, force_empty_cache=True, model_pass=None, image_pass=None, any_input=None):
+    def clean(self, unload_models=True, force_empty_cache=True, drop_patch_backups=False, model_pass=None, image_pass=None, any_input=None):
         def free_mb():
             try:
                 return model_management.get_free_memory() / (1024 ** 2)
@@ -557,6 +461,33 @@ class DeepClean:
                 return -1.0
 
         before = free_mb()
+        dropped = drop_bytes = 0
+        if drop_patch_backups:
+            import gc as _gc
+            try:
+                import comfy.model_patcher as _mp
+                seen = set()
+                for obj in _gc.get_objects():
+                    try:
+                        if not isinstance(obj, _mp.ModelPatcher) or id(obj) in seen:
+                            continue
+                        seen.add(id(obj))
+                        for attr in ('backup', 'backup_buffers', 'hook_backup', 'object_patches_backup'):
+                            d = getattr(obj, attr, None)
+                            if isinstance(d, dict) and d:
+                                for v in list(d.values()):
+                                    try:
+                                        w = getattr(v, 'weight', v)
+                                        if torch.is_tensor(w):
+                                            drop_bytes += w.nelement() * w.element_size()
+                                    except Exception:
+                                        pass
+                                d.clear()
+                                dropped += 1
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[AssembledRecipes] 丢补丁备份跳过: {e}")
         if unload_models:
             try:
                 model_management.unload_all_models()
@@ -592,6 +523,8 @@ class DeepClean:
         print(f"[AssembledRecipes] {note_v}", flush=True)
         after = free_mb()
         report = f"free {before:.0f}MB -> {after:.0f}MB (freed {after - before:.0f}MB)"
+        if dropped:
+            report += f" | 丢弃备份 {dropped} 份≈{drop_bytes // 2**20}MB"
         print(f"[AssembledRecipes] 深度清理: {report}", flush=True)
         return (model_pass, image_pass, report)
 
@@ -699,102 +632,6 @@ class VramModeFix:
                   + f" | 空闲 {free:.0f}MB")
         print(f"[AssembledRecipes] {report}", flush=True)
         return (model, report)
-
-class ReleasePhantomVram:
-    '''释放「虚空显存」：torch 缓存池预留未用部分 + 可丢弃的补丁备份。
-
-    收工位用。drop_patch_backups=True 时把 LoRA 合并留下的原权重备份丢掉（约等于模型体积）；
-    前提：下次换组合/重跑会从干净基座重新打补丁（本工作流满足）。若同一 patcher 要回滚补丁，不要开。
-    '''
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "drop_patch_backups": ("BOOLEAN", {"default": True, "tooltip": "丢掉 LoRA 合并的原权重备份（可腾出接近模型体积的显存）；会失去对当前补丁的回滚能力"}),
-            },
-            "optional": {
-                "image_pass": ("IMAGE", {"lazy": True}),
-                "any_input": ("*", {"lazy": True}),
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("image", "report")
-    FUNCTION = "release"
-    CATEGORY = "AssembledRecipes"
-    DESCRIPTION = "释放虚空显存：清 torch 池预留 + 可选丢弃补丁备份。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
-
-    @staticmethod
-    def _torch_stats():
-        try:
-            import torch
-            st = torch.cuda.memory_stats()
-            return st.get('reserved_bytes.all.current', 0), st.get('active_bytes.all.current', 0)
-        except Exception:
-            return 0, 0
-
-    def check_lazy_status(self, **kwargs):
-        return [k for k in ("image_pass", "any_input") if k in kwargs]
-
-    def release(self, drop_patch_backups=True, image_pass=None, any_input=None):
-        import gc
-        import torch
-        res0, act0 = self._torch_stats()
-        free0 = model_management.get_free_memory() / 2 ** 20
-
-        dropped = drop_bytes = 0
-        if drop_patch_backups:
-            seen = set()
-            candidates = []
-            try:
-                import comfy.model_patcher as mp
-                for obj in gc.get_objects():
-                    try:
-                        if isinstance(obj, mp.ModelPatcher) and id(obj) not in seen:
-                            seen.add(id(obj))
-                            candidates.append(obj)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            for p in candidates:
-                try:
-                    for attr in ('backup', 'backup_buffers', 'hook_backup', 'object_patches_backup'):
-                        d = getattr(p, attr, None)
-                        if isinstance(d, dict) and d:
-                            for v in list(d.values()):
-                                try:
-                                    w = getattr(v, 'weight', v)
-                                    if torch.is_tensor(w): drop_bytes += w.nelement() * w.element_size()
-                                except Exception:
-                                    pass
-                            d.clear()
-                            dropped += 1
-                except Exception:
-                    pass
-
-        for _ in range(3):
-            try:
-                model_management.soft_empty_cache()
-            except Exception:
-                pass
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-        try:
-            torch.cuda.ipc_collect()
-        except Exception:
-            pass
-        gc.collect()
-
-        res1, act1 = self._torch_stats()
-        free1 = model_management.get_free_memory() / 2 ** 20
-        report = (f"池预留 {res0/2**30:.2f}G->{res1/2**30:.2f}G | 活跃 {act0/2**30:.2f}G->{act1/2**30:.2f}G | "
-                  f"丢弃备份 {dropped} 份≈{drop_bytes//2**20}MB | 驱动空闲 {free0:.0f}->{free1:.0f}MB")
-        print(f"[AssembledRecipes] 释放虚空: {report}", flush=True)
-        return (image_pass, report)
 
 
 class ReverseJsonSanitize:
@@ -1176,14 +1013,11 @@ class BlankToNone:
 
 NODE_CLASS_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": RecipeSaveAssembled,
-    "RecipeLoad (AssembledRecipes)": RecipeLoadAssembled,
     "StreamToggle (AssembledRecipes)": StreamToggle,
     "RecipeGallery (AssembledRecipes)": RecipeGallery,
-    "RecipeRouter (AssembledRecipes)": RecipeRouter,
     "DeepClean (AssembledRecipes)": DeepClean,
     "FreeVram (AssembledRecipes)": FreeVram,
     "VramModeFix (AssembledRecipes)": VramModeFix,
-    "ReleasePhantomVram (AssembledRecipes)": ReleasePhantomVram,
     "ReverseJsonSanitize (AssembledRecipes)": ReverseJsonSanitize,
     "ReverseLayoutCaption (AssembledRecipes)": ReverseLayoutCaption,
     "BlankToNone (AssembledRecipes)": BlankToNone,
@@ -1192,12 +1026,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": "配方保存",
     "RecipeLoad (AssembledRecipes)": "配方·直读加载",
     "RecipeGallery (AssembledRecipes)": "配方·画廊选择",
-    "RecipeRouter (AssembledRecipes)": "配方·惰性路由",
     "StreamToggle (AssembledRecipes)": "配方·逐层流水开关",
     "DeepClean (AssembledRecipes)": "配方·深度清理",
     "FreeVram (AssembledRecipes)": "配方·踢编码器回内存",
     "VramModeFix (AssembledRecipes)": "配方·显存策略纠正",
-    "ReleasePhantomVram (AssembledRecipes)": "配方·释放虚空显存",
     "ReverseJsonSanitize (AssembledRecipes)": "配方·反推JSON清洗",
     "ReverseLayoutCaption (AssembledRecipes)": "配方·布局反推",
     "BlankToNone (AssembledRecipes)": "配方·空串转无",
