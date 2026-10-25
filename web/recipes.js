@@ -117,7 +117,7 @@ function mountGalleryDOM(node) {
       const del = document.createElement("button");
       del.className = "del";
       del.type = "button";
-      del.title = "删除（进 trash/ 可找回）";
+      del.title = "删除（彻底删除不可恢复，点删即删）";
       del.textContent = "×";
       card.append(img, nm, mt, del);
 
@@ -129,7 +129,6 @@ function mountGalleryDOM(node) {
       });
       del.addEventListener("click", async (ev) => {
         ev.stopPropagation();
-        if (!confirm(`删除配方 ${base} ？（移入 trash/ 可找回）`)) return;
         await deleteRecipe(it.name);
         refresh();
       });

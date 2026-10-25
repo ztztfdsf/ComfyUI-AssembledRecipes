@@ -1,12 +1,11 @@
-"""HTTP routes: 配方列表 / 删除（软删除到 trash/）。"""
+"""HTTP routes: 配方列表 / 删除（硬删除，文件彻底移除）。"""
 
 import json
 import os
-import shutil
 
 from aiohttp import web
 
-from .nodes import RECIPES_DIR, TRASH_DIR, recipe_files
+from .nodes import RECIPES_DIR, recipe_files
 
 try:
     from server import PromptServer
@@ -49,14 +48,12 @@ async def delete_recipe(request):
     src = os.path.join(RECIPES_DIR, name)
     if not os.path.exists(src):
         return web.json_response({"ok": False, "error": "not found"}, status=404)
-    dst = os.path.join(TRASH_DIR, name)
-    if os.path.exists(dst):
-        os.remove(dst)
-    shutil.move(src, dst)
-    meta = os.path.splitext(src)[0] + ".json"
-    if os.path.exists(meta):
-        shutil.move(meta, os.path.join(TRASH_DIR, os.path.basename(meta)))
-    print(f"[AssembledRecipes] 已移入 trash: {name}")
+    stem = os.path.splitext(src)[0]
+    os.remove(src)
+    for p in (stem + ".json", stem + ".preview.jpg", stem + ".preview.png"):
+        if os.path.exists(p):
+            os.remove(p)
+    print(f"[AssembledRecipes] 已彻底删除: {name}")
     return web.json_response({"ok": True})
 
 

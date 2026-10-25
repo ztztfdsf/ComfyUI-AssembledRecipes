@@ -22,9 +22,8 @@ import comfy.sd
 from comfy import model_management
 
 RECIPES_DIR = os.path.join(folder_paths.models_dir, "assembled_recipes")
-TRASH_DIR = os.path.join(RECIPES_DIR, "trash")
+TRASH_DIR = None  # 删除已改为硬删除，不再使用回收目录
 os.makedirs(RECIPES_DIR, exist_ok=True)
-os.makedirs(TRASH_DIR, exist_ok=True)
 
 STREAM_RESIDENT_BYTES = 0.1  # 驻留预算≈0 → 全流水
 
