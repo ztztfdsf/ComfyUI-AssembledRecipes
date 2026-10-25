@@ -400,7 +400,7 @@ class DeepClean:
             "required": {
                 "unload_models": ("BOOLEAN", {"default": True, "tooltip": "把已加载模型权重卸回内存(跑图时按需重载)"}),
                 "force_empty_cache": ("BOOLEAN", {"default": True, "tooltip": "强制把显存缓存池还给驱动(不占内存,下次重新申请)"}),
-                "drop_patch_backups": ("BOOLEAN", {"default": False, "tooltip": "丢掉 LoRA 合并留下的原权重备份(可腾出接近模型体积的显存)；前提是下次从干净基座重打补丁"}),
+                "drop_patch_backups": ("BOOLEAN", {"default": False, "tooltip": "【已禁用，勾了也不执行】原功能：丢掉 LoRA 合并留下的原权重备份。但 aimdo 动态加载下丢备份会把 LoRA 烤入永久化（切/关 LoRA 出鬼图），故强制保留，由下次加载自动还原"}),
             },
             "optional": {
                 "model_pass": ("MODEL", {"lazy": True}),
@@ -462,31 +462,11 @@ class DeepClean:
         before = free_mb()
         dropped = drop_bytes = 0
         if drop_patch_backups:
-            import gc as _gc
-            try:
-                import comfy.model_patcher as _mp
-                seen = set()
-                for obj in _gc.get_objects():
-                    try:
-                        if not isinstance(obj, _mp.ModelPatcher) or id(obj) in seen:
-                            continue
-                        seen.add(id(obj))
-                        for attr in ('backup', 'backup_buffers', 'hook_backup', 'object_patches_backup'):
-                            d = getattr(obj, attr, None)
-                            if isinstance(d, dict) and d:
-                                for v in list(d.values()):
-                                    try:
-                                        w = getattr(v, 'weight', v)
-                                        if torch.is_tensor(w):
-                                            drop_bytes += w.nelement() * w.element_size()
-                                    except Exception:
-                                        pass
-                                d.clear()
-                                dropped += 1
-                    except Exception:
-                        pass
-            except Exception as e:
-                print(f"[AssembledRecipes] 丢补丁备份跳过: {e}")
+            # 【已禁用】aimdo 动态加载下，丢备份会把 LoRA 补丁永久烤进常驻基模
+            # （切/关 LoRA 后出鬼图）；备份留在 CPU RAM，下次加载时 load() 开头的
+            # restore_loaded_backups() 会自动还原原权重。实测不丢备份不影响出图
+            # （备份不占显存，只占 CPU RAM）。
+            print("[AssembledRecipes] drop_patch_backups 已禁用（防 LoRA 烤入残留）：备份保留，由下次加载自动还原", flush=True)
         if unload_models:
             try:
                 model_management.unload_all_models()
@@ -1178,6 +1158,59 @@ class ReverseLayoutCaption:
 
 
 
+class ModelDetox:
+    """清除 vbar 常驻权重缓存，防止切换/关闭 LoRA 后残留生效（鬼图）。
+
+    上游 comfy-aimdo 的模块层缓存机制：LoRA 单跑完后，共享模块上的
+    _v_weight/_v_bias 存着「补丁+重量化」后的权重，后续单 vbar 签名命中
+    即直接复用 → 关掉 LoRA 依然生效、同种子出鬼图；/free 也洗不掉（挂
+    在模块对象上，不随卸载满理）。本节点在模型链上每单强制作废这些
+    缓存，让采样时从干净源重新 cast。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"model": ("MODEL",)}}
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "detox"
+    CATEGORY = "AssembledRecipes"
+    DESCRIPTION = "清除 vbar 常驻权重缓存，防止切换/关闭 LoRA 后残留生效（上游 comfy-aimdo bug 的图内补丁）。—— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
+
+    def detox(self, model):
+        cleared_cache = 0
+        cleared_sigs = 0
+        cleared_prefetch = 0
+        diag = {"modules": 0, "has_v": 0, "has_vsig": 0, "has_vweight": 0, "has_prefetch": 0, "has_pins": 0, "has_lowvram_fn": 0}
+        try:
+            root = model.model
+            diag["root_type"] = type(root).__name__
+            for m in root.modules():
+                diag["modules"] += 1
+                if hasattr(m, "_v"): diag["has_v"] += 1
+                if hasattr(m, "_v_signature"): diag["has_vsig"] += 1
+                if hasattr(m, "_v_weight"): diag["has_vweight"] += 1
+                if hasattr(m, "_prefetch"): diag["has_prefetch"] += 1
+                if m.__dict__.get("_pins"): diag["has_pins"] += 1
+                if getattr(m, "weight_lowvram_function", None) is not None: diag["has_lowvram_fn"] += 1
+                if hasattr(m, "_v_signature"):
+                    m._v_signature = None
+                    cleared_sigs += 1
+                for k in ("_v_weight", "_v_bias"):
+                    if hasattr(m, k):
+                        delattr(m, k)
+                        cleared_cache += 1
+                if hasattr(m, "_prefetch"):
+                    delattr(m, "_prefetch")
+                    cleared_prefetch += 1
+        except Exception as e:
+            print(f"[AssembledRecipes] ModelDetox 异常: {e}", flush=True)
+        print(f"[AssembledRecipes] ModelDetox 诊断: {diag}", flush=True)
+        print(f"[AssembledRecipes] ModelDetox: 作废签名 {cleared_sigs} | 清 resident 缓存 {cleared_cache} | 清 prefetch {cleared_prefetch}", flush=True)
+        return (model,)
+
+
 class BlankToNone:
     """空字符串 → None（让下游「Any Switch」等真正回落到备用输入）。
 
@@ -1221,6 +1254,7 @@ NODE_CLASS_MAPPINGS = {
     "ReverseJsonSanitize (AssembledRecipes)": ReverseJsonSanitize,
     "ReverseLayoutCaption (AssembledRecipes)": ReverseLayoutCaption,
     "BlankToNone (AssembledRecipes)": BlankToNone,
+    "ModelDetox (AssembledRecipes)": ModelDetox,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": "配方保存",
@@ -1233,4 +1267,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ReverseJsonSanitize (AssembledRecipes)": "配方·反推JSON清洗",
     "ReverseLayoutCaption (AssembledRecipes)": "配方·布局反推",
     "BlankToNone (AssembledRecipes)": "配方·空串转无",
+    "ModelDetox (AssembledRecipes)": "配方·清 LoRA 残留缓存（防鬼图）",
 }
