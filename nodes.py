@@ -1,12 +1,15 @@
 """Assembled model recipe cache for ComfyUI.
 
 拼装一次，落盘成配方；下次直读配方，跳过 LoRA 拼装。
-- RecipeSave (AssembledRecipes): 生成结束后把「已拼装权重」快照存盘（同名已存在则跳过）
-- RecipeLoad (AssembledRecipes): 直读配方文件输出 MODEL（零拼装），可选逐层流水
-- StreamToggle (AssembledRecipes): MODEL 直通，可选开启逐层流水（省显存、防换页）
-删除 = 移入 trash/ 子目录（软删除，可手动找回）。
-逐层流水原理：把 patcher 的 partially_load 的驻留预算钳到 ~0 字节，
-权重逐 block 按需上卡算完即走——显存峰值 = 单块 + 激活，永不爆表。
+- RecipeSave: 生成结束后把「已拼装权重」快照存盘（同名已存在则跳过）
+- RecipeGallery: 画布点选配方直读（不选=走兜底 LoRA 链）；配方删除=彻底硬删
+- StreamToggle: MODEL 直通，可选逐层流水（省显存、防换页）
+- DeepClean/FreeVram/VramModeFix: 显存治理（卸载/清池/策略纠正）
+- ReverseJsonSanitize/ReverseLayoutCaption/BlankToNone: 布局反推链容错
+
+【防鬼图】aimdo 动态加载下 LoRA 会烤进常驻权重，还原靠 patcher.backup；
+DeepClean 的 drop_patch_backups 已强制禁用（丢备份=烤入永久化）。
+所有节点带 [AR⏱] 计时插桩。
 """
 
 import json
@@ -26,6 +29,17 @@ TRASH_DIR = None  # 删除已改为硬删除，不再使用回收目录
 os.makedirs(RECIPES_DIR, exist_ok=True)
 
 STREAM_RESIDENT_BYTES = 0.1  # 驻留预算≈0 → 全流水
+
+
+def _timed(tag):
+    """计时上下文：with _timed("DeepClean"): ... → 打印 [AR⏱] DeepClean 123ms"""
+    class _T:
+        def __enter__(self):
+            self.t0 = time.perf_counter()
+            return self
+        def __exit__(self, *a):
+            print(f"[AR⏱] {tag} {(time.perf_counter() - self.t0) * 1000:.0f}ms", flush=True)
+    return _T()
 
 
 def recipe_files():
@@ -251,8 +265,9 @@ class RecipeSaveAssembled:
             return (image,)
 
         base = model.model if hasattr(model, "model") else model
-        merged = {k.replace("diffusion_model.", "", 1): v.detach().to("cpu").contiguous()
-                  for k, v in base.state_dict().items()}
+        with _timed("RecipeSave.state_dict→CPU"):
+            merged = {k.replace("diffusion_model.", "", 1): v.detach().to("cpu").contiguous()
+                      for k, v in base.state_dict().items()}
 
         import safetensors.torch
         from safetensors import safe_open
@@ -272,7 +287,8 @@ class RecipeSaveAssembled:
                 out = {}
                 for k in f.keys():
                     out[k] = merged[k] if k in merged else f.get_tensor(k)
-                safetensors.torch.save_file(out, path, metadata=f.metadata())
+                with _timed("RecipeSave.写盘5.4GB"):
+                    safetensors.torch.save_file(out, path, metadata=f.metadata())
             print(f"[AssembledRecipes] 配方(全量镜像)已保存: {name} "
                   f"({os.path.getsize(path):,} B, 源={os.path.basename(src_path)})")
         else:
@@ -330,9 +346,9 @@ class StreamToggle:
     DESCRIPTION = "MODEL 直通 + 逐层流水开关(权重逐层上卡，显存峰值≈单层)。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
     def apply(self, model, streaming=False):
-        if streaming:
-            model = enable_streaming(model)
-        print(f"[AssembledRecipes] 逐层流水={streaming}")
+        with _timed("StreamToggle"):
+            if streaming:
+                model = enable_streaming(model)
         return (model,)
 
 
@@ -373,17 +389,18 @@ class RecipeGallery:
         return [] if self._resolve(selected_recipe) else ["model"]
 
     def load(self, selected_recipe="", streaming=False, model=None):
-        path = self._resolve(selected_recipe)
-        if path:
-            patcher = _load_any(path)
-            if streaming:
-                patcher = enable_streaming(patcher)
-            print(f"[AssembledRecipes] 画廊直读配方（跳过拼装）: {os.path.basename(path)}")
-            return (patcher, os.path.basename(path))
-        if model is None:
-            raise ValueError("【AssembledRecipes】没选配方，且兜底 model 输入是空的——请把 LoRA 输出接到本节点的 model 输入")
-        print("[AssembledRecipes] 画廊未选配方 → 走兜底 model 分支")
-        return (model, "")
+        with _timed("RecipeGallery"):
+            path = self._resolve(selected_recipe)
+            if path:
+                patcher = _load_any(path)
+                if streaming:
+                    patcher = enable_streaming(patcher)
+                print(f"[AssembledRecipes] 画廊直读配方（跳过拼装）: {os.path.basename(path)}")
+                return (patcher, os.path.basename(path))
+            if model is None:
+                raise ValueError("【AssembledRecipes】没选配方，且兜底 model 输入是空的——请把 LoRA 输出接到本节点的 model 输入")
+            print("[AssembledRecipes] 画廊未选配方 → 走兜底 model 分支")
+            return (model, "")
 
 
 
@@ -420,12 +437,21 @@ class DeepClean:
 
     @staticmethod
     def _evict_staged(keep_modules=()):
-        """驱逐 aimdo 的暂存权重镜像（ModelVBAR 驻留页），不动保留模型。"""
+        """驱逐 aimdo 的暂存权重镜像（ModelVBAR 驻留页），不动保留模型。
+
+        先用 C 层 vbars_analyze() 预检：驻留 0MB 时直接跳过 gc 全堆扫描
+        （实测每单扫描都是 0 命中，白扫几百毫秒）。"""
         try:
             import gc
             import comfy_aimdo.model_vbar as mv
         except Exception as e:
             return 0, 0, f"无 aimdo，跳过 ({e})"
+        try:
+            total = int(mv.vbars_analyze() or 0)
+        except Exception:
+            total = -1
+        if total <= 0:
+            return 0, 0, "vbar 驻留 0MB，跳过扫描"
         keep = set()
         for m in keep_modules:
             for v in (getattr(m, "dynamic_vbars", None) or {}).values():
@@ -446,13 +472,13 @@ class DeepClean:
                         n += 1
             except Exception:
                 pass
-        try:
-            total = int(mv.vbars_analyze() or 0)
-        except Exception:
-            total = -1
         return n, freed, f"vbar 总数 {seen} 保留 {len(keep)} 剩余驻留 {total // 2**20}MB"
 
     def clean(self, unload_models=True, force_empty_cache=True, drop_patch_backups=False, model_pass=None, image_pass=None, any_input=None):
+        with _timed("DeepClean"):
+            return self._clean_impl(unload_models, force_empty_cache, drop_patch_backups, model_pass, image_pass, any_input)
+
+    def _clean_impl(self, unload_models, force_empty_cache, drop_patch_backups, model_pass, image_pass, any_input):
         def free_mb():
             try:
                 return model_management.get_free_memory() / (1024 ** 2)
@@ -479,15 +505,16 @@ class DeepClean:
                 torch.cuda.synchronize()
             except Exception:
                 pass
+            # 自适应清池：第一轮没清出新东西就停（固定三轮实测纯浪费 ~600ms）
             for _ in range(3):
                 try:
+                    before_empty = model_management.get_free_memory()
                     torch.cuda.empty_cache()
-                except Exception:
-                    break
-                try:
                     torch.cuda.ipc_collect()
                 except Exception:
-                    pass
+                    break
+                if model_management.get_free_memory() - before_empty < 8 * 2**20:
+                    break
                 gc.collect()
         # 驱逐 aimdo 暂存镜像（只保护仍加载的主模型，如 DiT）
         keep_mods = []
@@ -537,35 +564,34 @@ class FreeVram:
         return [k for k in ("conditioning_1", "conditioning_2", "conditioning_3", "image_pass") if k in kwargs]
 
     def free(self, model, conditioning_1=None, conditioning_2=None, conditioning_3=None, image_pass=None):
-        # MODEL 输入本身就是 ModelPatcher；current_loaded_models 里存的也是 patcher
-        keep_patcher = model
-        before = model_management.get_free_memory()
-        keep = []
-        for lm in list(model_management.current_loaded_models):
-            m = lm.model
-            if m is None:
-                continue
-            same = m is keep_patcher
-            if not same and hasattr(m, "is_clone"):
-                try:
-                    same = m.is_clone(keep_patcher)
-                except Exception:
-                    same = False
-            if same:
-                keep.append(lm)
-        names = [type(getattr(lm.model, "model", lm.model)).__name__
-                 for lm in model_management.current_loaded_models if lm not in keep]
-        print(f"[AssembledRecipes] 已加载: {[type(getattr(lm.model,'model',lm.model)).__name__ for lm in model_management.current_loaded_models]} | 保留 {len(keep)} 个", flush=True)
-        try:
-            model_management.free_memory(1e30, model_management.get_torch_device(), keep_loaded=keep)
-        except Exception as e:
-            print(f"[AssembledRecipes] free_memory 失败，退回卸载全部: {e}", flush=True)
-            model_management.unload_all_models()
-        model_management.soft_empty_cache()
-        after = model_management.get_free_memory()
-        report = (f"卸回内存: {', '.join(names) if names else '无'} | "
-                  f"空闲 {before / 2**20:.0f}MB -> {after / 2**20:.0f}MB")
-        print(f"[AssembledRecipes] {report}", flush=True)
+        with _timed("FreeVram"):
+            keep_patcher = model
+            before = model_management.get_free_memory()
+            keep = []
+            for lm in list(model_management.current_loaded_models):
+                m = lm.model
+                if m is None:
+                    continue
+                same = m is keep_patcher
+                if not same and hasattr(m, "is_clone"):
+                    try:
+                        same = m.is_clone(keep_patcher)
+                    except Exception:
+                        same = False
+                if same:
+                    keep.append(lm)
+            names = [type(getattr(lm.model, "model", lm.model)).__name__
+                     for lm in model_management.current_loaded_models if lm not in keep]
+            try:
+                model_management.free_memory(1e30, model_management.get_torch_device(), keep_loaded=keep)
+            except Exception as e:
+                print(f"[AssembledRecipes] free_memory 失败，退回卸载全部: {e}", flush=True)
+                model_management.unload_all_models()
+            model_management.soft_empty_cache()
+            after = model_management.get_free_memory()
+            report = (f"卸回内存: {', '.join(names) if names else '无'} | "
+                      f"空闲 {before / 2**20:.0f}MB -> {after / 2**20:.0f}MB")
+            print(f"[AssembledRecipes] {report}", flush=True)
         return (model, report, image_pass)
 
 
@@ -591,25 +617,26 @@ class VramModeFix:
     DESCRIPTION = "运行时纠正 --highvram 造成的全驻留策略（不改启动参数）。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
     def fix(self, model=None):
-        mm = model_management
-        changes = []
-        try:
-            if mm.vram_state == mm.VRAMState.HIGH_VRAM:
-                mm.vram_state = mm.VRAMState.NORMAL_VRAM
-                changes.append("HIGH_VRAM → NORMAL_VRAM")
-        except Exception as e:
-            print(f"[AssembledRecipes] 切换 vram_state 失败: {e}", flush=True)
-        try:
-            if mm.DISABLE_SMART_MEMORY:
-                mm.DISABLE_SMART_MEMORY = False
-                changes.append("智能内存: 关 → 开")
-        except Exception:
-            pass
-        mm.soft_empty_cache()
-        free = mm.get_free_memory() / 2**20
-        report = ("显存策略: " + ("; ".join(changes) if changes else "本来就是动态模式，无需纠正")
-                  + f" | 空闲 {free:.0f}MB")
-        print(f"[AssembledRecipes] {report}", flush=True)
+        with _timed("VramModeFix"):
+            mm = model_management
+            changes = []
+            try:
+                if mm.vram_state == mm.VRAMState.HIGH_VRAM:
+                    mm.vram_state = mm.VRAMState.NORMAL_VRAM
+                    changes.append("HIGH_VRAM → NORMAL_VRAM")
+            except Exception as e:
+                print(f"[AssembledRecipes] 切换 vram_state 失败: {e}", flush=True)
+            try:
+                if mm.DISABLE_SMART_MEMORY:
+                    mm.DISABLE_SMART_MEMORY = False
+                    changes.append("智能内存: 关 → 开")
+            except Exception:
+                pass
+            mm.soft_empty_cache()
+            free = mm.get_free_memory() / 2**20
+            report = ("显存策略: " + ("; ".join(changes) if changes else "本来就是动态模式，无需纠正")
+                      + f" | 空闲 {free:.0f}MB")
+            print(f"[AssembledRecipes] {report}", flush=True)
         return (model, report)
 
 
@@ -1158,59 +1185,6 @@ class ReverseLayoutCaption:
 
 
 
-class ModelDetox:
-    """清除 vbar 常驻权重缓存，防止切换/关闭 LoRA 后残留生效（鬼图）。
-
-    上游 comfy-aimdo 的模块层缓存机制：LoRA 单跑完后，共享模块上的
-    _v_weight/_v_bias 存着「补丁+重量化」后的权重，后续单 vbar 签名命中
-    即直接复用 → 关掉 LoRA 依然生效、同种子出鬼图；/free 也洗不掉（挂
-    在模块对象上，不随卸载满理）。本节点在模型链上每单强制作废这些
-    缓存，让采样时从干净源重新 cast。
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {"model": ("MODEL",)}}
-
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "detox"
-    CATEGORY = "AssembledRecipes"
-    DESCRIPTION = "清除 vbar 常驻权重缓存，防止切换/关闭 LoRA 后残留生效（上游 comfy-aimdo bug 的图内补丁）。—— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
-
-    def detox(self, model):
-        cleared_cache = 0
-        cleared_sigs = 0
-        cleared_prefetch = 0
-        diag = {"modules": 0, "has_v": 0, "has_vsig": 0, "has_vweight": 0, "has_prefetch": 0, "has_pins": 0, "has_lowvram_fn": 0}
-        try:
-            root = model.model
-            diag["root_type"] = type(root).__name__
-            for m in root.modules():
-                diag["modules"] += 1
-                if hasattr(m, "_v"): diag["has_v"] += 1
-                if hasattr(m, "_v_signature"): diag["has_vsig"] += 1
-                if hasattr(m, "_v_weight"): diag["has_vweight"] += 1
-                if hasattr(m, "_prefetch"): diag["has_prefetch"] += 1
-                if m.__dict__.get("_pins"): diag["has_pins"] += 1
-                if getattr(m, "weight_lowvram_function", None) is not None: diag["has_lowvram_fn"] += 1
-                if hasattr(m, "_v_signature"):
-                    m._v_signature = None
-                    cleared_sigs += 1
-                for k in ("_v_weight", "_v_bias"):
-                    if hasattr(m, k):
-                        delattr(m, k)
-                        cleared_cache += 1
-                if hasattr(m, "_prefetch"):
-                    delattr(m, "_prefetch")
-                    cleared_prefetch += 1
-        except Exception as e:
-            print(f"[AssembledRecipes] ModelDetox 异常: {e}", flush=True)
-        print(f"[AssembledRecipes] ModelDetox 诊断: {diag}", flush=True)
-        print(f"[AssembledRecipes] ModelDetox: 作废签名 {cleared_sigs} | 清 resident 缓存 {cleared_cache} | 清 prefetch {cleared_prefetch}", flush=True)
-        return (model,)
-
-
 class BlankToNone:
     """空字符串 → None（让下游「Any Switch」等真正回落到备用输入）。
 
@@ -1254,7 +1228,6 @@ NODE_CLASS_MAPPINGS = {
     "ReverseJsonSanitize (AssembledRecipes)": ReverseJsonSanitize,
     "ReverseLayoutCaption (AssembledRecipes)": ReverseLayoutCaption,
     "BlankToNone (AssembledRecipes)": BlankToNone,
-    "ModelDetox (AssembledRecipes)": ModelDetox,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RecipeSave (AssembledRecipes)": "配方保存",
@@ -1267,5 +1240,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ReverseJsonSanitize (AssembledRecipes)": "配方·反推JSON清洗",
     "ReverseLayoutCaption (AssembledRecipes)": "配方·布局反推",
     "BlankToNone (AssembledRecipes)": "配方·空串转无",
-    "ModelDetox (AssembledRecipes)": "配方·清 LoRA 残留缓存（防鬼图）",
 }
