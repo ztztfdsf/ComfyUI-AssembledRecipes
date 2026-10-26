@@ -1145,50 +1145,90 @@ class ReverseLayoutCaption:
             processor, model = cached
             first = "内存命中"
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        t1 = time.time()
-        model.to(device)
-        up_s = time.time() - t1
 
-        pil = self._image_to_pil(image)
-        if image.shape[0] > 1:
-            print(f"[AssembledRecipes] 布局反推: 批量 {image.shape[0]} 张，只取第一张", flush=True)
-        up = self._trim_user_prompt(user_prompt)
-        user_content = (
-            (up + "\n\n" if up else "")
-            + "Analyze the image and output ONLY the JSON array as instructed."
-        )
-        messages = [
-            {"role": "system", "content": rule},
-            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_content}]},
-        ]
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(text=[text], images=[pil], return_tensors="pt").to(device)
-
-        t2 = time.time()
-        with torch.inference_mode():
-            out_ids = model.generate(
-                **inputs,
-                max_new_tokens=int(max_new_tokens),
-                do_sample=False,
-            )
-        gen_s = time.time() - t2
-        n_new = out_ids.shape[1] - inputs["input_ids"].shape[1]
-        n_prompt = inputs["input_ids"].shape[1]
-        text_out = processor.batch_decode(out_ids[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
-        free0 = torch.cuda.mem_get_info()[0] / 2**20 if torch.cuda.is_available() else -1
-
-        t3 = time.time()
-        if offload_after:
-            model.to("cpu")
+        def _oom():
             try:
                 torch.cuda.empty_cache()
             except Exception:
                 pass
-        off_s = time.time() - t3
-        free1 = torch.cuda.mem_get_info()[0] / 2**20 if torch.cuda.is_available() else -1
+
+        def _is_oom(e):
+            return isinstance(e, torch.OutOfMemoryError) or "out of memory" in str(e).lower()
+
+        def _prepare(max_side, tokens):
+            pil = self._image_to_pil(image, max_side=max_side)
+            up = self._trim_user_prompt(user_prompt)
+            user_content = (
+                (up + "\n\n" if up else "")
+                + "Analyze the image and output ONLY the JSON array as instructed."
+            )
+            messages = [
+                {"role": "system", "content": rule},
+                {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_content}]},
+            ]
+            chat = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inp = processor(text=[chat], images=[pil], return_tensors="pt").to(device)
+            return pil, inp, int(tokens)
+
+        t1 = time.time()
+        up_s = 0.0
+        gen_s = off_s = 0.0
+        n_prompt = n_new = 0
+        pil = None
+        text_out = ""
+        free0 = free1 = -1
+        retry_note = ""
+        try:
+            model.to(device)
+            up_s = time.time() - t1
+
+            if image.shape[0] > 1:
+                print(f"[AssembledRecipes] 布局反推: 批量 {image.shape[0]} 张，只取第一张", flush=True)
+
+            # OOM 降级链：原尺寸 → 448 → 320（图越小视觉 token 越少，显存峰值越低）
+            attempts = [(640, max_new_tokens), (448, min(int(max_new_tokens), 2048)),
+                        (320, min(int(max_new_tokens), 1024))]
+            out_ids = None
+            for i, (side, toks) in enumerate(attempts):
+                pil, inputs, toks = _prepare(side, toks)
+                try:
+                    t2 = time.time()
+                    with torch.inference_mode():
+                        out_ids = model.generate(**inputs, max_new_tokens=toks, do_sample=False)
+                    gen_s = time.time() - t2
+                    max_new_tokens = toks
+                    if i:
+                        retry_note = f" | ⚠ 显存不足已降档重试（长边 {side}，上限 {toks} tok）"
+                    break
+                except Exception as e:
+                    if not _is_oom(e) or i == len(attempts) - 1:
+                        raise
+                    print(f"[AssembledRecipes] 反推显存不足（长边 {side}），降档重试…", flush=True)
+                    del inputs
+                    _oom()
+
+            n_new = out_ids.shape[1] - inputs["input_ids"].shape[1]
+            n_prompt = inputs["input_ids"].shape[1]
+            text_out = processor.batch_decode(out_ids[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+            free0 = torch.cuda.mem_get_info()[0] / 2**20 if torch.cuda.is_available() else -1
+            del inputs, out_ids
+        finally:
+            # 无论成功、OOM 还是被中断，VLM 必须退卡——否则 8GB 会永久死在显存里，
+            # 而且它不归 ComfyUI 的 model_management 管，/free 洗不掉（实测踩过）。
+            if offload_after:
+                t3 = time.time()
+                try:
+                    model.to("cpu")
+                except Exception as e:
+                    print(f"[AssembledRecipes] 反推模型退卡失败: {e}", flush=True)
+                _oom()
+                off_s = time.time() - t3
+                free1 = torch.cuda.mem_get_info()[0] / 2**20 if torch.cuda.is_available() else -1
+
         trunc = " | ⚠ 触顶截断，尾部交给清洗节点兜底" if n_new >= int(max_new_tokens) else ""
-        print(f"[AssembledRecipes] 布局反推: {first} | 图 {pil.width}x{pil.height} | 提示 {n_prompt} tok + 输出 {n_new} tok ({n_new / max(gen_s, 0.1):.1f} tok/s) | 上卡 {up_s:.1f}s | 推理 {gen_s:.1f}s "
-              f"| 退卡 {off_s:.1f}s | 空闲 {free0:.0f}→{free1:.0f}MB | 文本 {len(text_out)} 字符{trunc}", flush=True)
+        img_size = f"{pil.width}x{pil.height}" if pil is not None else "?"
+        print(f"[AssembledRecipes] 布局反推: {first} | 图 {img_size} | 提示 {n_prompt} tok + 输出 {n_new} tok ({n_new / max(gen_s, 0.1):.1f} tok/s) | 上卡 {up_s:.1f}s | 推理 {gen_s:.1f}s "
+              f"| 退卡 {off_s:.1f}s | 空闲 {free0:.0f}→{free1:.0f}MB | 文本 {len(text_out)} 字符{trunc}{retry_note}", flush=True)
         return (text_out,)
 
 
