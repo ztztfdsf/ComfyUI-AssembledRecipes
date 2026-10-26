@@ -31,6 +31,47 @@ os.makedirs(RECIPES_DIR, exist_ok=True)
 STREAM_RESIDENT_BYTES = 0.1  # 驻留预算≈0 → 全流水
 
 
+MAX_NEW_TOKENS_CAP = 6144  # 反推输出硬顶：规则要求最多 10 框×220 词≈3000 token，再高纯浪费
+GEN_TIMEOUT_S = 300       # 单次推理超时（到点带上已有输出返回，尾部交清洗节点兜底）
+
+
+def _gen_stopper(deadline_s):
+    """generate 的停止条件：超时 / 用户点了取消 / 每 256 token 报进度。
+
+    以前 generate 是一次性阻塞调用：主人设 16384 token 上限时模型万一不吐 EOS，
+    就要白算 20 分钟，而且 ComfyUI 的“取消”按钮完全叫不停它（实测）。
+    """
+    try:
+        from transformers import StoppingCriteria
+    except Exception:
+        return None
+    import time as _t
+
+    class _Stop(StoppingCriteria):
+        def __init__(self):
+            self.t0 = _t.time()
+            self.n = 0
+            self.reason = None
+
+        def __call__(self, input_ids, scores, **kwargs):
+            self.n += 1
+            if self.n % 256 == 0:
+                print(f"[AssembledRecipes] 反推生成中: {self.n} tok / {_t.time() - self.t0:.0f}s", flush=True)
+            if _t.time() - self.t0 > deadline_s:
+                self.reason = f"超时 {deadline_s}s"
+                return True
+            try:
+                from comfy import model_management as _mm
+                if _mm.processing_interrupted():
+                    self.reason = "用户取消"
+                    return True
+            except Exception:
+                pass
+            return False
+
+    return _Stop()
+
+
 def _trim_cuda_pool():
     """把 cudaMallocAsync 的池强制 trim 回 0（还给驱动）。
 
@@ -1066,7 +1107,7 @@ class ReverseLayoutCaption:
                 "rule": ("STRING", {"multiline": True, "default": _LAYOUT_RULE_DEFAULT, "tooltip": "反推规则（system 提示词）"}),
                 "user_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "画廊提示词等角色参考资料，遇到不认识的角色用它补全"}),
                 "model_name": ("STRING", {"default": "Huihui-Qwen3-VL-4B-Instruct-abliterated", "tooltip": "ComfyUI/models/LLM/ 下的模型目录（HF transformers 布局）"}),
-                "max_new_tokens": ("INT", {"default": 4096, "min": 128, "max": 16384, "tooltip": "输出 token 上限（desc 详细版建议 >=2048）"}),
+                "max_new_tokens": ("INT", {"default": 4096, "min": 128, "max": 16384, "tooltip": "输出 token 上限（desc 详细版建议 >=2048）。实际硬顶 6144：规则最多 10 框×220 词≈3000 tok，再高只会让模型不吐 EOS 时白算很久"}),
                 "pre_clear": ("BOOLEAN", {"default": True, "tooltip": "反推前把 ComfyUI 全部模型卸回内存，显存同一时间只住一个模型"}),
                 "offload_after": ("BOOLEAN", {"default": True, "tooltip": "反推完本模型退卡回内存（内存常驻，下次上卡免盘读）"}),
             }
@@ -1233,19 +1274,31 @@ class ReverseLayoutCaption:
                 print(f"[AssembledRecipes] 布局反推: 批量 {image.shape[0]} 张，只取第一张", flush=True)
 
             # OOM 降级链：原尺寸 → 448 → 320（图越小视觉 token 越少，显存峰值越低）
-            attempts = [(640, max_new_tokens), (448, min(int(max_new_tokens), 2048)),
-                        (320, min(int(max_new_tokens), 1024))]
+            # token 上限先夹到硬顶：主人拉到 16384 只是保险丝，不该真的算到 16384
+            want_tokens = min(int(max_new_tokens), MAX_NEW_TOKENS_CAP)
+            attempts = [(640, want_tokens), (448, min(want_tokens, 2048)),
+                        (320, min(want_tokens, 1024))]
             out_ids = None
             for i, (side, toks) in enumerate(attempts):
                 pil, inputs, toks = _prepare(side, toks)
                 try:
                     t2 = time.time()
+                    stopper = _gen_stopper(GEN_TIMEOUT_S)
+                    gen_kwargs = {"max_new_tokens": toks, "do_sample": False}
+                    if stopper is not None:
+                        gen_kwargs["stopping_criteria"] = [stopper]
                     with torch.inference_mode():
-                        out_ids = model.generate(**inputs, max_new_tokens=toks, do_sample=False)
+                        out_ids = model.generate(**inputs, **gen_kwargs)
                     gen_s = time.time() - t2
                     max_new_tokens = toks
+                    if stopper is not None and stopper.reason:
+                        retry_note = f" | ⚠ 生成提前结束（{stopper.reason}，{stopper.n} tok）"
+                        if "取消" in stopper.reason:
+                            retry_note += "：输出不完整，本单作废重跑即可"
+                        elif "超时" in stopper.reason:
+                            retry_note += "：输出不完整，尾部交清洗节点兜底"
                     if i:
-                        retry_note = f" | ⚠ 显存不足已降档重试（长边 {side}，上限 {toks} tok）"
+                        retry_note += f" | ⚠ 显存不足已降档重试（长边 {side}）"
                     break
                 except Exception as e:
                     if not _is_oom(e) or i == len(attempts) - 1:
