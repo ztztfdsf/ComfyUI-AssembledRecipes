@@ -986,6 +986,7 @@ _LAYOUT_RULE_DEFAULT = (
     '  · 服装的层数、材质、剪裁、颜色、配饰，要具体（例如 layered white ceremonial robes with wide draping sleeves）；\n'
     '  · 姿势：手在哪、身体朝向哪边、头转向哪里、视线看向哪里、重心落在哪只脚；\n'
     '  · 表情、与镜头的距离和景别（close-up / upper body / half body / full body）；\n'
+    '  · 拍摄视角与主体朝向：判断画面是俯拍（high-angle / bird\'s-eye）、仰拍（low-angle / worm\'s-eye）还是平视（eye-level）；主体相对镜头是正面（front view）、四分之三侧面（three-quarter view）、正侧面（side profile）还是背面（view from behind）；画面整体倾斜时写荷兰角（dutch angle）；有明显广角畸变或长焦压缩也写出来。这些镜头语言直接决定重绘的视角，必须准。\n'
     '  · 该区域的光线与明暗、天气或氛围（如果有）。\n'
     '- 知道角色是谁就写名字和出处，例如 shu (arknights)；不确定就只描述外观，不要编造名字。\n'
     '- 空间关系写具体：在画面哪一侧、比谁更远、被谁遮挡了一部分。\n'
