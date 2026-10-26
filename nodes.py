@@ -31,6 +31,33 @@ os.makedirs(RECIPES_DIR, exist_ok=True)
 STREAM_RESIDENT_BYTES = 0.1  # 驻留预算≈0 → 全流水
 
 
+def _trim_cuda_pool():
+    """把 cudaMallocAsync 的池强制 trim 回 0（还给驱动）。
+
+    `--cuda-malloc` 模式下 torch 的 empty_cache 不一定把空闲块全还回去，
+    池会自己留着 → 工作流里 nobody trim 的话，多单之后显存“看着不够用”，
+    反推上卡时只能吃碎片池，推理速度直接腰斩（实测 24.9s → 51.8s）。
+    这里直接调运行时 API cudaMemPoolTrimTo(pool, 0)。
+    """
+    try:
+        import ctypes
+        import glob
+        import os
+        import torch
+        libdir = os.path.join(os.path.dirname(torch.__file__), "lib")
+        cands = sorted(glob.glob(os.path.join(libdir, "cudart64_*.dll"))) \
+            + sorted(glob.glob(os.path.join(libdir, "libcudart*.so*")))
+        if not cands:
+            return False
+        lib = ctypes.CDLL(cands[-1])
+        pool = ctypes.c_void_p()
+        if lib.cudaDeviceGetDefaultMemPool(ctypes.byref(pool), ctypes.c_int(0)) != 0:
+            return False
+        return lib.cudaMemPoolTrimTo(pool, ctypes.c_size_t(0)) == 0
+    except Exception:
+        return False
+
+
 def _timed(tag):
     """计时上下文：with _timed("DeepClean"): ... → 打印 [AR⏱] DeepClean 123ms"""
     class _T:
@@ -527,6 +554,7 @@ class DeepClean:
             pass
         n_v, freed_v, note_v = self._evict_staged(keep_mods)
         print(f"[AssembledRecipes] {note_v}", flush=True)
+        _trim_cuda_pool()
         after = free_mb()
         report = f"free {before:.0f}MB -> {after:.0f}MB (freed {after - before:.0f}MB)"
         if dropped:
@@ -633,9 +661,18 @@ class VramModeFix:
             except Exception:
                 pass
             mm.soft_empty_cache()
+            # 每单开局彻底把 cudaMallocAsync 池还给驱动（上一单的合并临时块/碎片）
+            try:
+                import torch as _t
+                _t.cuda.synchronize()
+                _t.cuda.empty_cache()
+                _t.cuda.ipc_collect()
+            except Exception:
+                pass
+            trimmed = _trim_cuda_pool()
             free = mm.get_free_memory() / 2**20
             report = ("显存策略: " + ("; ".join(changes) if changes else "本来就是动态模式，无需纠正")
-                      + f" | 空闲 {free:.0f}MB")
+                      + f" | 空闲 {free:.0f}MB" + (" | 池trim OK" if trimmed else ""))
             print(f"[AssembledRecipes] {report}", flush=True)
         return (model, report)
 
@@ -1118,8 +1155,18 @@ class ReverseLayoutCaption:
             mm.soft_empty_cache()
         except Exception:
             pass
+        # cudaMallocAsync 池 trim：把池里的空闲块还给驱动，反推上卡才有连续大块显存
+        try:
+            import torch as _t
+            _t.cuda.synchronize()
+            _t.cuda.empty_cache()
+            _t.cuda.ipc_collect()
+        except Exception:
+            pass
+        trimmed = _trim_cuda_pool()
         after = mm.get_free_memory() / 2**20
-        print(f"[AssembledRecipes] 反推前清场: 等待 {wait_s:.0f}s | 卸载 {names or '无'} | 空闲 {before:.0f}→{after:.0f}MB", flush=True)
+        print(f"[AssembledRecipes] 反推前清场: 等待 {wait_s:.0f}s | 卸载 {names or '无'} | "
+              f"空闲 {before:.0f}→{after:.0f}MB | 池trim {'OK' if trimmed else '跳过'}", flush=True)
 
     def caption(self, image, rule, user_prompt, model_name, max_new_tokens, pre_clear, offload_after):
         import torch
