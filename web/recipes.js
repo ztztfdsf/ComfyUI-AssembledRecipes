@@ -13,7 +13,6 @@ function diag(stage, extra) {
     });
   } catch (e) { /* ignore */ }
 }
-diag("module-loaded", { hasApp: !!app, hasApi: !!api, hasExtMgr: !!app?.extensionManager });
 window.addEventListener("error", (e) => diag("window-error", { msg: String(e.message || e.error), src: e.filename, line: e.lineno }));
 window.addEventListener("unhandledrejection", (e) => diag("promise-error", { msg: String(e.reason) }));
 
@@ -155,7 +154,6 @@ function mountGalleryDOM(node) {
       if (!widget.options) widget.options = {};
       Object.assign(widget.options, { serialize: false, surfaces, getValue: () => "", setValue: () => {} });
     }
-    diag("gallery-dom-mounted", { widgetType: type, hasWidget: !!widget });
   } catch (e) {
     diag("gallery-dom-error", { msg: String(e) });
   }
@@ -167,7 +165,6 @@ app.registerExtension({
   name: "AssembledRecipes.Gallery",
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (nodeData?.name !== "RecipeGallery (AssembledRecipes)") return;
-    diag("gallery-hook", {});
     const proto = nodeType.prototype;
     const origCreated = proto.onNodeCreated;
     proto.onNodeCreated = function () {

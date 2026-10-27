@@ -1383,67 +1383,19 @@ class ReverseLayoutCaption:
                 vbar_note += f" | 搬 CPU 失败 {e}"
 
         after = mm.get_free_memory() / 2**20
+        # 残留量改成并入主日志（曾用来排查 moss 编码器卡 5.2GB：残留不为 0 就该看
+        # _settle_and_evict 里的「强制搬回 CPU」是不是被跳过了）
+        residual = -1
         try:
             import torch as _t
-            alloc = _t.cuda.memory_allocated() / 2**20
-            resv = _t.cuda.memory_reserved() / 2**20
-            info_free = _t.cuda.mem_get_info()[0] / 2**20
-            print(f"[DIAG] 清场后 torch allocated={alloc:.0f}MB reserved={resv:.0f}MB mem_get_info_free={info_free:.0f}MB", flush=True)
-            # 5GB 小块分散占用不明身份时，查一下是不是 aimdo 的 vbar 驻留页
-            try:
-                import gc as _gc
-                import comfy_aimdo.model_vbar as mv
-                vbs = [o for o in _gc.get_objects() if isinstance(o, mv.ModelVBAR)]
-                print(f"[DIAG] vbars_analyze={mv.vbars_analyze()} ModelVBAR实例={len(vbs)}", flush=True)
-                for o in vbs[:4]:
-                    try:
-                        res = o.get_residency()
-                        print(f"[DIAG]   pages={o.get_nr_pages()} 驻留={sum(1 for r in res if r & 1)} watermark={o.get_watermark()}", flush=True)
-                    except Exception:
-                        pass
-            except Exception as e:
-                print(f"[DIAG] vbar 查询失败 {type(e).__name__} {e}", flush=True)
-            if alloc > 800:  # 还有东西卡在显存里，把最大块的分配栈打出来定位
-                try:
-                    import gc as _g2
-                    tens = [o for o in _g2.get_objects()
-                            if isinstance(o, _t.Tensor) and o.device.type == "cuda"]
-                    tens.sort(key=lambda t: -(t.numel() * t.element_size()))
-                    print(f"[DIAG] GPU tensor 对象 {len(tens)} 个", flush=True)
-                    for t in tens[:3]:
-                        sz = t.numel() * t.element_size()
-                        refs = []
-                        for r in _g2.get_referrers(t)[:6]:
-                            nm = type(r).__name__
-                            if nm == "dict":
-                                for kk, vv in list(r.items())[:200]:
-                                    if vv is t:
-                                        nm = f"dict[{kk}]"
-                                        break
-                            refs.append(nm)
-                        print(f"[DIAG]   {sz / 2**20:.0f}MB {tuple(t.shape)} {t.dtype} ← {refs}", flush=True)
-                    del tens
-                except Exception as _e2:
-                    print(f"[DIAG] tensor 扫描失败 {_e2}", flush=True)
-                snap = _t.cuda.memory_snapshot()
-                blocks = []
-                for seg in snap:
-                    for b in seg.get("blocks", []):
-                        if b.get("state") == "active_allocated":
-                            frames = b.get("frames") or []
-                            tag = " <- ".join(
-                                f"{str(fr.get('filename','?')).replace(chr(92),'/').split('/')[-1]}:{fr.get('line','?')}"
-                                for fr in frames[:4])
-                            blocks.append((b.get("size", 0), tag))
-                blocks.sort(key=lambda x: -x[0])
-                for sz, tag in blocks[:4]:
-                    print(f"[DIAG]   占 {sz / 2**20:.0f}MB ← {tag}", flush=True)
+            residual = _t.cuda.memory_allocated() / 2**20
         except Exception:
             pass
         warn = "" if after >= need_mb else f" ⚠ 仍不足（目标 {need_mb}MB）"
         print(f"[AssembledRecipes] 反推前清场: 等待 {wait_s:.0f}s | 卸载 {names or '无'}"
               f"{f' +强制{forced}个' if forced else ''} | "
-              f"空闲 {before:.0f}→{after:.0f}MB | 池trim {'OK' if _trim_cuda_pool() else '跳过'}{vbar_note}{warn}", flush=True)
+              f"空闲 {before:.0f}→{after:.0f}MB | 池trim {'OK' if _trim_cuda_pool() else '跳过'}"
+              f"{f' | 残留 {residual:.0f}MB' if residual > 100 else ''}{vbar_note}{warn}", flush=True)
 
     def caption(self, image, rule, user_prompt, model_name, max_new_tokens, pre_clear, offload_after, quant="4bit (NF4，显存最省)", tag_mode="全部（推荐 12B 级大模型）"):
         import torch
