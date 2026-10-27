@@ -1106,11 +1106,15 @@ class ReverseLayoutCaption:
                 "image": ("IMAGE", {"tooltip": "要反推的图"}),
                 "rule": ("STRING", {"multiline": True, "default": _LAYOUT_RULE_DEFAULT, "tooltip": "反推规则（system 提示词）"}),
                 "user_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "画廊提示词等角色参考资料，遇到不认识的角色用它补全"}),
-                "model_name": ("STRING", {"default": "Huihui-Qwen3-VL-4B-Instruct-abliterated", "tooltip": "ComfyUI/models/LLM/ 下的模型目录（HF transformers 布局）"}),
+                "model_name": ("STRING", {"default": "Qwen3-VL-4b-Heretic", "tooltip": "ComfyUI/models/LLM/ 下的模型目录（HF transformers 布局）"}),
                 "max_new_tokens": ("INT", {"default": 4096, "min": 128, "max": 16384, "tooltip": "输出 token 上限（desc 详细版建议 >=2048）。实际硬顶 6144：规则最多 10 框×220 词≈3000 tok，再高只会让模型不吐 EOS 时白算很久"}),
                 "pre_clear": ("BOOLEAN", {"default": True, "tooltip": "反推前把 ComfyUI 全部模型卸回内存，显存同一时间只住一个模型"}),
                 "offload_after": ("BOOLEAN", {"default": True, "tooltip": "反推完本模型退卡回内存（内存常驻，下次上卡免盘读）"}),
-            }
+            },
+            "optional": {
+                # 放在最后：旧工作流 widgets_values 前 6 位保持对齐，不会错位；缺省=4bit
+                "quant": (["4bit (NF4，显存最省)", "8bit", "none (bf16，原精度)"], {"default": "4bit (NF4，显存最省)", "tooltip": "量化方式：4bit 只需 ~2.7GB 显存（bf16 需 8GB），质量几乎无损；偶尔量化报错就换 8bit 或 none"}),
+            },
         }
 
     RETURN_TYPES = ("STRING",)
@@ -1209,26 +1213,50 @@ class ReverseLayoutCaption:
         print(f"[AssembledRecipes] 反推前清场: 等待 {wait_s:.0f}s | 卸载 {names or '无'} | "
               f"空闲 {before:.0f}→{after:.0f}MB | 池trim {'OK' if trimmed else '跳过'}", flush=True)
 
-    def caption(self, image, rule, user_prompt, model_name, max_new_tokens, pre_clear, offload_after):
+    def caption(self, image, rule, user_prompt, model_name, max_new_tokens, pre_clear, offload_after, quant="4bit (NF4，显存最省)"):
         import torch
         if pre_clear:
             self._settle_and_evict()
 
         path = os.path.join(folder_paths.models_dir, "LLM", model_name)
         if not os.path.isdir(path):
+            avail = []
+            try:
+                llm_root = os.path.join(folder_paths.models_dir, "LLM")
+                avail = sorted(d for d in os.listdir(llm_root)
+                               if os.path.isdir(os.path.join(llm_root, d)))
+            except Exception:
+                pass
             raise RuntimeError(
-                f"找不到反推模型目录: {path}——把 "
-                f"https://huggingface.co/huihui-ai/Huihui-Qwen3-VL-4B-Instruct-abliterated "
-                f"整个仓库放到 ComfyUI/models/LLM/{model_name}/")
+                f"找不到反推模型目录: {path}\n"
+                f"LLM 目录下现有: {avail or '（空）'}\n"
+                f"把 HF transformers 格式的模型整个放进去，或在节点里把 model_name 改成上面某个名字。")
 
         t0 = time.time()
-        cached = _VLM_CACHE.get(path)
+        cache_key = (path, quant)
+        cached = _VLM_CACHE.get(cache_key)
         if cached is None:
             from transformers import AutoProcessor, AutoModelForImageTextToText
             processor = AutoProcessor.from_pretrained(path)
-            model = AutoModelForImageTextToText.from_pretrained(path, torch_dtype=torch.bfloat16)
-            _VLM_CACHE[path] = (processor, model)
-            first = f"首次加载 {time.time() - t0:.1f}s（内存常驻，以后免盘读）"
+            kw = {}
+            if quant.startswith("4bit"):
+                from transformers import BitsAndBytesConfig
+                kw["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
+                kw["device_map"] = {"": "cuda:0" if torch.cuda.is_available() else "cpu"}
+                kw["dtype"] = torch.bfloat16
+            elif quant.startswith("8bit"):
+                from transformers import BitsAndBytesConfig
+                kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+                kw["device_map"] = {"": "cuda:0" if torch.cuda.is_available() else "cpu"}
+                kw["dtype"] = torch.bfloat16
+            else:
+                kw["dtype"] = torch.bfloat16
+            model = AutoModelForImageTextToText.from_pretrained(path, **kw)
+            _VLM_CACHE[cache_key] = (processor, model)
+            qtag = {"4": "4bit", "8": "8bit"}.get(quant[0], "bf16")
+            first = f"首次加载[{qtag}] {time.time() - t0:.1f}s（内存常驻，以后免盘读）"
         else:
             processor, model = cached
             first = "内存命中"
