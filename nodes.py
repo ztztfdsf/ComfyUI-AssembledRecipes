@@ -1241,11 +1241,24 @@ class ReverseLayoutCaption:
             kw = {}
             if quant.startswith("4bit"):
                 from transformers import BitsAndBytesConfig
-                kw["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
-                kw["device_map"] = {"": "cuda:0" if torch.cuda.is_available() else "cpu"}
-                kw["dtype"] = torch.bfloat16
+                # Gemma4 系在 bf16 compute 下推理时会报
+                # "expected scalar type Float but found BFloat16"（加载不报、生成时才炸），
+                # 所以按模型类型选 compute dtype：gemma4 用 fp32，其余保持 bf16。
+                mt = ""
+                try:
+                    with open(os.path.join(path, "config.json"), encoding="utf-8") as _f:
+                        mt = (json.load(_f).get("model_type") or "").lower()
+                except Exception:
+                    pass
+                ct = torch.float32 if "gemma4" in mt else torch.bfloat16
+                kw = {"quantization_config": BitsAndBytesConfig(
+                          load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                          bnb_4bit_compute_dtype=ct, bnb_4bit_use_double_quant=True),
+                      "device_map": {"": "cuda:0" if torch.cuda.is_available() else "cpu"},
+                      "dtype": ct}
+                model = AutoModelForImageTextToText.from_pretrained(path, **kw)
+                if ct is torch.float32:
+                    print("[AssembledRecipes] 反推: gemma4 系 → 4bit 用 fp32 compute", flush=True)
             elif quant.startswith("8bit"):
                 from transformers import BitsAndBytesConfig
                 kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
@@ -1253,7 +1266,7 @@ class ReverseLayoutCaption:
                 kw["dtype"] = torch.bfloat16
             else:
                 kw["dtype"] = torch.bfloat16
-            model = AutoModelForImageTextToText.from_pretrained(path, **kw)
+                model = AutoModelForImageTextToText.from_pretrained(path, **kw)
             _VLM_CACHE[cache_key] = (processor, model)
             qtag = {"4": "4bit", "8": "8bit"}.get(quant[0], "bf16")
             first = f"首次加载[{qtag}] {time.time() - t0:.1f}s（内存常驻，以后免盘读）"
