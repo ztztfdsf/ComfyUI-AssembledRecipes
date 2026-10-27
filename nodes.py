@@ -72,6 +72,85 @@ def _gen_stopper(deadline_s):
     return _Stop()
 
 
+def _model_type_of(path):
+    """读 config.json 的 model_type（小写）；读不到返回空串。"""
+    try:
+        with open(os.path.join(path, "config.json"), encoding="utf-8") as f:
+            return (json.load(f).get("model_type") or "").lower()
+    except Exception:
+        return ""
+
+
+def _list_llm_models():
+    root = os.path.join(folder_paths.models_dir, "LLM")
+    try:
+        names = [d for d in sorted(os.listdir(root))
+                 if not d.startswith(".")
+                 and os.path.isdir(os.path.join(root, d))
+                 and os.path.isfile(os.path.join(root, d, "config.json"))]
+        return names if names else ["（LLM 目录里没有可用模型）"]
+    except Exception:
+        return ["（models/LLM 目录不存在）"]
+
+
+def _gc_instances(cls):
+    """返回当前存活的某类实例（ComfyUI 的执行缓存对象取不到句柄时用）。"""
+    import gc
+    out = []
+    for o in gc.get_objects():
+        try:
+            if isinstance(o, cls):
+                out.append(o)
+        except Exception:
+            pass
+    return out
+
+
+def _load_vlm_model(path, quant):
+    """按量化方式从磁盘构建反推模型（device_map 分块上卡，显存峰值比 .to() 低得多）。"""
+    import torch
+    from transformers import AutoProcessor, AutoModelForImageTextToText
+
+    processor = AutoProcessor.from_pretrained(path)
+    kw = {}
+    if quant.startswith("4bit"):
+        from transformers import BitsAndBytesConfig
+        # Gemma4 系在 bf16 compute 下推理时会报
+        # "expected scalar type Float but found BFloat16"（加载不报、生成时才炸），
+        # 所以按模型类型选 compute dtype：gemma4 用 fp32，其余保持 bf16。
+        mt = ""
+        try:
+            with open(os.path.join(path, "config.json"), encoding="utf-8") as f:
+                mt = (json.load(f).get("model_type") or "").lower()
+        except Exception:
+            pass
+        ct = torch.float32 if "gemma4" in mt else torch.bfloat16
+        bnb_kw = {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4",
+                  "bnb_4bit_compute_dtype": ct, "bnb_4bit_use_double_quant": True}
+        if "gemma4" in mt:
+            # Gemma4 的 lm_head 与 embed 共享权重（tie_word_embeddings），
+            # 4bit 下每次 generate 都要把 262144×3840 的词表反量化回 fp32，
+            # 一次性要吃 7.2GB，16GB 卡直接爆。跳过 lm_head 量化后
+            # 峰值从 13.5GB 降到 9.5GB（实测），质量无影响。
+            bnb_kw["llm_int8_skip_modules"] = ["lm_head"]
+        kw = {"quantization_config": BitsAndBytesConfig(**bnb_kw),
+              "device_map": {"": "cuda:0" if torch.cuda.is_available() else "cpu"},
+              "dtype": ct}
+        model = AutoModelForImageTextToText.from_pretrained(path, **kw)
+        if ct is torch.float32:
+            print("[AssembledRecipes] 反推: gemma4 系 → 4bit 用 fp32 compute（跳过 lm_head 量化省 4GB）", flush=True)
+    elif quant.startswith("8bit"):
+        from transformers import BitsAndBytesConfig
+        kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        kw["device_map"] = {"": "cuda:0" if torch.cuda.is_available() else "cpu"}
+        kw["dtype"] = torch.bfloat16
+        model = AutoModelForImageTextToText.from_pretrained(path, **kw)
+    else:
+        kw["dtype"] = torch.bfloat16
+        model = AutoModelForImageTextToText.from_pretrained(path, **kw)
+    return processor, model
+
+
 def _trim_cuda_pool():
     """把 cudaMallocAsync 的池强制 trim 回 0（还给驱动）。
 
@@ -1106,7 +1185,7 @@ class ReverseLayoutCaption:
                 "image": ("IMAGE", {"tooltip": "要反推的图"}),
                 "rule": ("STRING", {"multiline": True, "default": _LAYOUT_RULE_DEFAULT, "tooltip": "反推规则（system 提示词）"}),
                 "user_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "画廊提示词等角色参考资料，遇到不认识的角色用它补全"}),
-                "model_name": ("STRING", {"default": "Qwen3-VL-4b-Heretic", "tooltip": "ComfyUI/models/LLM/ 下的模型目录（HF transformers 布局）"}),
+                "model_name": (_list_llm_models(), {"tooltip": "ComfyUI/models/LLM/ 下现成的模型（下拉选；新放进去的模型需重启 ComfyUI 才会出现在列表里）"}),
                 "max_new_tokens": ("INT", {"default": 4096, "min": 128, "max": 16384, "tooltip": "输出 token 上限（desc 详细版建议 >=2048）。实际硬顶 6144：规则最多 10 框×220 词≈3000 tok，再高只会让模型不吐 EOS 时白算很久"}),
                 "pre_clear": ("BOOLEAN", {"default": True, "tooltip": "反推前把 ComfyUI 全部模型卸回内存，显存同一时间只住一个模型"}),
                 "offload_after": ("BOOLEAN", {"default": True, "tooltip": "反推完本模型退卡回内存（内存常驻，下次上卡免盘读）"}),
@@ -1165,11 +1244,15 @@ class ReverseLayoutCaption:
         return im
 
     @staticmethod
-    def _settle_and_evict(settle_seconds=20):
+    def _settle_and_evict(settle_seconds=20, need_mb=14000):
         """模型管理：等加载平息 → 全部卸回内存 → 只留反推模型上卡。
 
         串行铁律：显存同一时间只住一个模型。反推前把 ComfyUI 侧的模型
         （上张图的 DiT 热机房、预取器抢跑的编码器等）全部 free_memory 卸回内存。
+
+        坑（实测）：free_memory 有时只卸掉一部分（ComfyUI 认为某些模型
+        "还在用"，或 vbar 的 staged weights 占着），清场后只剩 9789MB，
+        12B 反推（峰值 12.6GB）直接 OOM。所以清完要验收，不够就逐个强制卸。
         """
         from comfy import model_management as mm
         t0 = time.time()
@@ -1208,16 +1291,159 @@ class ReverseLayoutCaption:
             _t.cuda.ipc_collect()
         except Exception:
             pass
-        trimmed = _trim_cuda_pool()
+        _trim_cuda_pool()
+
+        # 验收：不够就逐个强制卸（ComfyUI 有时会把模型当成“还在用”而跳过）
+        forced = 0
+        for _round in range(3):
+            mid = mm.get_free_memory() / 2**20
+            if mid >= need_mb:
+                break
+            left = list(mm.current_loaded_models)
+            if not left:
+                break
+            for lm in left:
+                try:
+                    lm.model_unload()
+                    forced += 1
+                except Exception:
+                    pass
+            try:
+                import torch as _t
+                _t.cuda.empty_cache()
+            except Exception:
+                pass
+            _trim_cuda_pool()
+            time.sleep(1)
+
+        # aimdo 的 vbar GPU 驻留页不归 ComfyUI 的 model_management 管，
+        # 必须单独驱逐，否则反推大模型时白白被吃掉几 GB（实测就是这样卡的）。
+        vbar_note = ""
+        try:
+            n_v, freed_v, note_v = DeepClean._evict_staged()
+            if n_v:
+                vbar_note = f" | vbar 驱逐 {n_v} 个/{freed_v // 2**20}MB"
+        except Exception as e:
+            vbar_note = f" | vbar 驱逐失败 {e}"
+
+        # ComfyUI 的节点输出缓存会抱着上一单的模型对象（实测 DiT 5.2GB 卸不掉），
+        # 导致再清也腾不出显存。这里直接清掉执行缓存（代价：下一单少一点缓存加速）。
+        try:
+            import comfy_execution.caching as _cc
+            cleared = []
+            for cls_name in ("CacheSet", "HierarchicalCache", "LRUCache", "RAMPressureCache", "NullCache"):
+                cls = getattr(_cc, cls_name, None)
+                if cls is None:
+                    continue
+                for inst in list(_gc_instances(cls)):
+                    for m_name in ("clean_unused", "ram_release", "clear", "reset"):
+                        fn = getattr(inst, m_name, None)
+                        if not callable(fn):
+                            continue
+                        try:
+                            fn()
+                            cleared.append(f"{cls_name}.{m_name}")
+                        except Exception:
+                            pass
+                        break
+            if cleared:
+                vbar_note += f" | 清缓存 {'/'.join(cleared)}"
+        except Exception:
+            pass
+
+        # 最后一手：moss-image 的 Qwen 编码器走 aimdo 的 vbar 分页，ComfyUI 的
+        # unload/detach/清缓存都不会把 GPU 页退回去（实测恒定残留 5.2GB）。
+        # 这里直接扫所有 nn.Module，把还扚在 GPU 上的手动搬回 CPU。
+        # 代价：下一单出图要重载编码器（+~60s），所以只在显存不够时才做。
+        moved = 0
+        if mm.get_free_memory() / 2**20 < need_mb:
+            try:
+                import gc as _g3
+                import torch as _t3
+                for obj in _g3.get_objects():
+                    if not isinstance(obj, _t3.nn.Module):
+                        continue
+                    try:
+                        ps = list(obj.parameters(recurse=False))
+                        if not ps:
+                            continue
+                        if any(p.device.type == "cuda" for p in ps):
+                            obj.to("cpu")
+                            moved += 1
+                    except Exception:
+                        pass
+                if moved:
+                    _t3.cuda.empty_cache()
+                    _trim_cuda_pool()
+                    vbar_note += f" | 强制搬回 CPU {moved} 个模块"
+            except Exception as e:
+                vbar_note += f" | 搬 CPU 失败 {e}"
+
         after = mm.get_free_memory() / 2**20
-        print(f"[AssembledRecipes] 反推前清场: 等待 {wait_s:.0f}s | 卸载 {names or '无'} | "
-              f"空闲 {before:.0f}→{after:.0f}MB | 池trim {'OK' if trimmed else '跳过'}", flush=True)
+        try:
+            import torch as _t
+            alloc = _t.cuda.memory_allocated() / 2**20
+            resv = _t.cuda.memory_reserved() / 2**20
+            info_free = _t.cuda.mem_get_info()[0] / 2**20
+            print(f"[DIAG] 清场后 torch allocated={alloc:.0f}MB reserved={resv:.0f}MB mem_get_info_free={info_free:.0f}MB", flush=True)
+            # 5GB 小块分散占用不明身份时，查一下是不是 aimdo 的 vbar 驻留页
+            try:
+                import gc as _gc
+                import comfy_aimdo.model_vbar as mv
+                vbs = [o for o in _gc.get_objects() if isinstance(o, mv.ModelVBAR)]
+                print(f"[DIAG] vbars_analyze={mv.vbars_analyze()} ModelVBAR实例={len(vbs)}", flush=True)
+                for o in vbs[:4]:
+                    try:
+                        res = o.get_residency()
+                        print(f"[DIAG]   pages={o.get_nr_pages()} 驻留={sum(1 for r in res if r & 1)} watermark={o.get_watermark()}", flush=True)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[DIAG] vbar 查询失败 {type(e).__name__} {e}", flush=True)
+            if alloc > 800:  # 还有东西卡在显存里，把最大块的分配栈打出来定位
+                try:
+                    import gc as _g2
+                    tens = [o for o in _g2.get_objects()
+                            if isinstance(o, _t.Tensor) and o.device.type == "cuda"]
+                    tens.sort(key=lambda t: -(t.numel() * t.element_size()))
+                    print(f"[DIAG] GPU tensor 对象 {len(tens)} 个", flush=True)
+                    for t in tens[:3]:
+                        sz = t.numel() * t.element_size()
+                        refs = []
+                        for r in _g2.get_referrers(t)[:6]:
+                            nm = type(r).__name__
+                            if nm == "dict":
+                                for kk, vv in list(r.items())[:200]:
+                                    if vv is t:
+                                        nm = f"dict[{kk}]"
+                                        break
+                            refs.append(nm)
+                        print(f"[DIAG]   {sz / 2**20:.0f}MB {tuple(t.shape)} {t.dtype} ← {refs}", flush=True)
+                    del tens
+                except Exception as _e2:
+                    print(f"[DIAG] tensor 扫描失败 {_e2}", flush=True)
+                snap = _t.cuda.memory_snapshot()
+                blocks = []
+                for seg in snap:
+                    for b in seg.get("blocks", []):
+                        if b.get("state") == "active_allocated":
+                            frames = b.get("frames") or []
+                            tag = " <- ".join(
+                                f"{str(fr.get('filename','?')).replace(chr(92),'/').split('/')[-1]}:{fr.get('line','?')}"
+                                for fr in frames[:4])
+                            blocks.append((b.get("size", 0), tag))
+                blocks.sort(key=lambda x: -x[0])
+                for sz, tag in blocks[:4]:
+                    print(f"[DIAG]   占 {sz / 2**20:.0f}MB ← {tag}", flush=True)
+        except Exception:
+            pass
+        warn = "" if after >= need_mb else f" ⚠ 仍不足（目标 {need_mb}MB）"
+        print(f"[AssembledRecipes] 反推前清场: 等待 {wait_s:.0f}s | 卸载 {names or '无'}"
+              f"{f' +强制{forced}个' if forced else ''} | "
+              f"空闲 {before:.0f}→{after:.0f}MB | 池trim {'OK' if _trim_cuda_pool() else '跳过'}{vbar_note}{warn}", flush=True)
 
     def caption(self, image, rule, user_prompt, model_name, max_new_tokens, pre_clear, offload_after, quant="4bit (NF4，显存最省)"):
         import torch
-        if pre_clear:
-            self._settle_and_evict()
-
         path = os.path.join(folder_paths.models_dir, "LLM", model_name)
         if not os.path.isdir(path):
             avail = []
@@ -1232,41 +1458,17 @@ class ReverseLayoutCaption:
                 f"LLM 目录下现有: {avail or '（空）'}\n"
                 f"把 HF transformers 格式的模型整个放进去，或在节点里把 model_name 改成上面某个名字。")
 
+        if pre_clear:
+            # 按模型实际需求定清场目标：12B 在 16GB 卡上要 14GB，4B 类只需 8GB
+            # （目标越低越不容易触发“强制搬 CPU”，小模型就不必每单重载编码器）。
+            need = 14000 if "gemma4" in _model_type_of(path) else 8000
+            self._settle_and_evict(need_mb=need)
+
         t0 = time.time()
         cache_key = (path, quant)
         cached = _VLM_CACHE.get(cache_key)
         if cached is None:
-            from transformers import AutoProcessor, AutoModelForImageTextToText
-            processor = AutoProcessor.from_pretrained(path)
-            kw = {}
-            if quant.startswith("4bit"):
-                from transformers import BitsAndBytesConfig
-                # Gemma4 系在 bf16 compute 下推理时会报
-                # "expected scalar type Float but found BFloat16"（加载不报、生成时才炸），
-                # 所以按模型类型选 compute dtype：gemma4 用 fp32，其余保持 bf16。
-                mt = ""
-                try:
-                    with open(os.path.join(path, "config.json"), encoding="utf-8") as _f:
-                        mt = (json.load(_f).get("model_type") or "").lower()
-                except Exception:
-                    pass
-                ct = torch.float32 if "gemma4" in mt else torch.bfloat16
-                kw = {"quantization_config": BitsAndBytesConfig(
-                          load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                          bnb_4bit_compute_dtype=ct, bnb_4bit_use_double_quant=True),
-                      "device_map": {"": "cuda:0" if torch.cuda.is_available() else "cpu"},
-                      "dtype": ct}
-                model = AutoModelForImageTextToText.from_pretrained(path, **kw)
-                if ct is torch.float32:
-                    print("[AssembledRecipes] 反推: gemma4 系 → 4bit 用 fp32 compute", flush=True)
-            elif quant.startswith("8bit"):
-                from transformers import BitsAndBytesConfig
-                kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-                kw["device_map"] = {"": "cuda:0" if torch.cuda.is_available() else "cpu"}
-                kw["dtype"] = torch.bfloat16
-            else:
-                kw["dtype"] = torch.bfloat16
-                model = AutoModelForImageTextToText.from_pretrained(path, **kw)
+            processor, model = _load_vlm_model(path, quant)
             _VLM_CACHE[cache_key] = (processor, model)
             qtag = {"4": "4bit", "8": "8bit"}.get(quant[0], "bf16")
             first = f"首次加载[{qtag}] {time.time() - t0:.1f}s（内存常驻，以后免盘读）"
@@ -1282,7 +1484,13 @@ class ReverseLayoutCaption:
                 pass
 
         def _is_oom(e):
-            return isinstance(e, torch.OutOfMemoryError) or "out of memory" in str(e).lower()
+            # torch/ComfyUI 的 OOM 文案多种多样："Allocation on device"、
+            # "CUDA out of memory"、torch.OutOfMemoryError…都要认，
+            # 否则降级链根本不触发（实测杬在这里）。
+            s = f"{type(e).__name__} {e}".lower()
+            return (isinstance(e, torch.OutOfMemoryError)
+                    or "out of memory" in s
+                    or "allocation on device" in s)
 
         def _prepare(max_side, tokens):
             pil = self._image_to_pil(image, max_side=max_side)
@@ -1308,7 +1516,40 @@ class ReverseLayoutCaption:
         free0 = free1 = -1
         retry_note = ""
         try:
-            model.to(device)
+            # 上卡前再验收一次：不够就重跑清场（上卡阶段的 OOM 没有降级链兜底）
+            from comfy import model_management as _mm
+            free_mb = _mm.get_free_memory() / 2**20
+            if free_mb < 13000:
+                print(f"[AssembledRecipes] 反推上卡前显存仅 {free_mb:.0f}MB，再清一次", flush=True)
+                self._settle_and_evict(settle_seconds=4)
+                up_s = 0.0
+            t1 = time.time()
+            try:
+                model.to(device)
+            except Exception as e:
+                if "out of memory" not in str(e).lower():
+                    raise
+                print(f"[AssembledRecipes] 反推上卡 OOM，强制清场后重试", flush=True)
+                self._settle_and_evict(settle_seconds=2, need_mb=14000)
+                try:
+                    model.to(device)
+                except Exception as e2:
+                    if "out of memory" not in str(e2).lower():
+                        raise
+                    # .to('cuda') 要一次性搬整个 CPU 副本，峰值比 from_pretrained 的
+                    # device_map 分块上卡高得多。大模型在 16GB 卡上只能走重建路径。
+                    print("[AssembledRecipes] 二次 OOM，销毁 CPU 副本改走分块加载（较慢但稳）", flush=True)
+                    _VLM_CACHE.pop(cache_key, None)
+                    try:
+                        del model
+                    except Exception:
+                        pass
+                    import gc as _gc
+                    _gc.collect()
+                    self._settle_and_evict(settle_seconds=2, need_mb=14000)
+                    model = _load_vlm_model(path, quant)[1]
+                    _VLM_CACHE[cache_key] = (processor, model)
+                    first += "（重建）"
             up_s = time.time() - t1
 
             if image.shape[0] > 1:
@@ -1317,7 +1558,11 @@ class ReverseLayoutCaption:
             # OOM 降级链：原尺寸 → 448 → 320（图越小视觉 token 越少，显存峰值越低）
             # token 上限先夹到硬顶：主人拉到 16384 只是保险丝，不该真的算到 16384
             want_tokens = min(int(max_new_tokens), MAX_NEW_TOKENS_CAP)
-            attempts = [(640, want_tokens), (448, min(want_tokens, 2048)),
+            # Gemma4-12B 在 16GB 卡上很挤（工作流里编码器常驻 5.2GB 卸不掉，
+            # 12B 峰值 9.5GB 就顶线）。给它降一档长边，峰值降 ~0.4GB。
+            big_model = "gemma4" in _model_type_of(path)
+            first_side = 512 if big_model else 640
+            attempts = [(first_side, want_tokens), (448, min(want_tokens, 2048)),
                         (320, min(want_tokens, 1024))]
             out_ids = None
             for i, (side, toks) in enumerate(attempts):
@@ -1358,11 +1603,36 @@ class ReverseLayoutCaption:
             # 而且它不归 ComfyUI 的 model_management 管，/free 洗不掉（实测踩过）。
             if offload_after:
                 t3 = time.time()
+                residual = 0
                 try:
                     model.to("cpu")
                 except Exception as e:
                     print(f"[AssembledRecipes] 反推模型退卡失败: {e}", flush=True)
                 _oom()
+                _trim_cuda_pool()
+                # bnb 量化 + device_map 加载的模型，.to('cpu') 经常只搬一部分，
+                # 残留几 GB 卡在显存里（实测 Gemma4-12B 残留 5.1GB，
+                # 下一单反推直接 OOM）。残了就整只销毁，下次重建（+30s）。
+                try:
+                    residual = torch.cuda.memory_allocated()
+                except Exception:
+                    residual = 0
+                if residual > 800 * 2**20:
+                    _VLM_CACHE.pop(cache_key, None)
+                    try:
+                        del model
+                    except Exception:
+                        pass
+                    import gc as _gc
+                    _gc.collect()
+                    _oom()
+                    _trim_cuda_pool()
+                    try:
+                        residual = torch.cuda.memory_allocated()
+                    except Exception:
+                        residual = 0
+                    print(f"[AssembledRecipes] 退卡不彻底（残留 {residual / 2**20:.0f}MB），"
+                          f"已销毁缓存，下次重建", flush=True)
                 off_s = time.time() - t3
                 free1 = torch.cuda.mem_get_info()[0] / 2**20 if torch.cuda.is_available() else -1
 
