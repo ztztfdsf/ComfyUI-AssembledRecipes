@@ -1193,6 +1193,9 @@ class ReverseLayoutCaption:
             "optional": {
                 # 放在最后：旧工作流 widgets_values 前 6 位保持对齐，不会错位；缺省=4bit
                 "quant": (["4bit (NF4，显存最省)", "8bit", "none (bf16，原精度)"], {"default": "4bit (NF4，显存最省)", "tooltip": "量化方式：4bit 只需 ~2.7GB 显存（bf16 需 8GB），质量几乎无损；偶尔量化报错就换 8bit 或 none"}),
+                # 大模型（如 Gemma4-12B）有能力自己从一堆 tag 里筛出画面真实内容，
+                # 小模型容易看到多少 tag 就框多少个，所以做成开关。
+                "tag_mode": (["全部（推荐 12B 级大模型）", "精简（只给前几个 tag）"], {"default": "全部（推荐 12B 级大模型）", "tooltip": "画廊 tag 喂多少给模型。全部=画质/装束细节更准，但小模型容易“看到多少 tag 就框多少个”；精简=只给开头的作品/角色名，防暴框"}),
             },
         }
 
@@ -1442,7 +1445,7 @@ class ReverseLayoutCaption:
               f"{f' +强制{forced}个' if forced else ''} | "
               f"空闲 {before:.0f}→{after:.0f}MB | 池trim {'OK' if _trim_cuda_pool() else '跳过'}{vbar_note}{warn}", flush=True)
 
-    def caption(self, image, rule, user_prompt, model_name, max_new_tokens, pre_clear, offload_after, quant="4bit (NF4，显存最省)"):
+    def caption(self, image, rule, user_prompt, model_name, max_new_tokens, pre_clear, offload_after, quant="4bit (NF4，显存最省)", tag_mode="全部（推荐 12B 级大模型）"):
         import torch
         path = os.path.join(folder_paths.models_dir, "LLM", model_name)
         if not os.path.isdir(path):
@@ -1492,11 +1495,16 @@ class ReverseLayoutCaption:
                     or "out of memory" in s
                     or "allocation on device" in s)
 
+        # tag 处理只做一次（降级链里每档都算一遍会把日志刷满）
+        all_mode = str(tag_mode).startswith("全部")
+        up = self._trim_user_prompt(user_prompt, max_chars=100000 if all_mode else 100)
+
         def _prepare(max_side, tokens):
             pil = self._image_to_pil(image, max_side=max_side)
-            up = self._trim_user_prompt(user_prompt)
             user_content = (
-                (up + "\n\n" if up else "")
+                ("Gallery tags (auto-generated; may list features NOT visible in this image — "
+                 "use them only to confirm character/work identity, never as a placement checklist):\n"
+                 + up + "\n\n" if up else "")
                 + "Analyze the image and output ONLY the JSON array as instructed."
             )
             messages = [
