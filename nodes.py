@@ -191,7 +191,11 @@ def _lfm3_prompt():
         "background scenery, whole character, upper clothing, lower clothing, "
         "head details (hat/hair/face).\n"
         "box coordinates 0-1000, each box tight around that element only. "
-        "Each desc: 60-120 English words describing only what is inside that box. JSON only:\n"
+        "Each desc: 60-120 English words describing only what is inside that box.\n"
+        # 这一句是全部提理的钥匙：不加它模型会在 thinking 里反复横跳争辨，
+        # 同一张图同一个问额：96.7s / 4096tok（顶满被截断，零结果）
+        #                     → 39.7s / 1741tok（完整 5 框）。快 2.4 倍。
+        "Do not deliberate: decide each box in one sentence of reasoning, then write. JSON only:\n"
         '[{"type":"obj","bbox":[x1,y1,x2,y2],"desc":"..."}, ...]'
     )
 
