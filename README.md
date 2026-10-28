@@ -72,6 +72,10 @@
 - 反推依赖（按模型分档）：
   - `transformers>=4.57` —— Qwen3-VL / Gemma4 系
   - `transformers>=5.19` —— LFM3-VL 系（模型仓库自带建模代码，节点会以 `trust_remote_code=True` 执行模型目录内的 `.py`，请只使用可信来源）
+  - LFM3-VL 载入后会自动把它的 RMSNorm 换成 torch 的 fused 实现（实测快 2.3~2.7 倍）；
+    这个替换在 fp32 下与原版 bit 等价、bf16 下 logits 差 <1% 且 top1/top5 相同（更接近 fp64 参考），
+    但**输出序列不会与未加速时逐字一致**（bf16 的 1 ulp 差异会被多步 argmax 放大）。
+    需要严格复现某次结果时，请固定模型与参数并接受当次输出。
   - `bitsandbytes` + `accelerate` —— 4bit / 8bit 量化档
   - 模型走进程内直载，无外部服务、无黑框；首次反推时从盘加载入内存（~30s），之后常驻内存免盘读。
   - 反推模型若是新架构（自带 `auto_map`），加载时会在日志里明确提示"将以 trust_remote_code 执行该目录内的 .py"。
