@@ -18,7 +18,7 @@
 | **配方·深度清理** | 最彻底的清理：卸载全部模型 + `gc` + `synchronize` + `empty_cache ×3` + `ipc_collect`。用于真挤 / 跑前清残渣；可选丢弃 LoRA 合并留下的原权重备份（腾出≈模型体积，前提是下次从干净基座重打补丁） |
 | **配方·踢编码器回内存** | 放在**编码之后、采样之前**：吃 model + 正负条件（保证时序），把除主模型外的已加载模型（文本编码器等 5G+）offload 回内存并清缓存。走官方 `free_memory(keep_loaded=…)`，安全 |
 | **配方·显存策略纠正** | 运行时把 `--highvram` 纠回 NORMAL_VRAM + 重开 smart memory（等价摘掉启动参数，启动器零改动） |
-| **配方·布局反推** | **进程内直载** Qwen3-VL（transformers，零外部进程零黑框）反推出 MOSS 布局 JSON。显存串行铁律：反推前自动清场（全部卸回内存）→ 模型上卡独占 → 推理完退卡回内存（常驻缓存）。**框数硬上限 10 个**（多主体强制分开建框，只框人物/大型物体/文字块，不给发丝衣褶建框），desc 强制英文 120~220 词连贯段落；水印/署名/AI声明/版权商用一律不建框（规则禁令 + 清洗节点确定性拦截双保险）；画廊标签自动裁剪到 100 字符（防几百个 tag 被逐条变框）。输出详细 desc 但可控 |
+| **配方·布局反推** | **进程内直载 LFM3-VL-2B**（transformers，零外部进程零黑框）反推出 MOSS 布局 JSON，**默认跑 CUDA Graph 加速（实测 2.1 倍：55.6s → 26.2s，31.3 → 87.8 tok/s）**。显存串行铁律：反推前自动清场（全部卸回内存）→ 模型上卡独占 → 推理完退卡回内存（常驻缓存）。**框数硬上限 10 个**（多主体强制分开建框，只框人物/大型物体/文字块，不给发丝衣褶建框），desc 强制英文 120~220 词连贯段落；水印/署名/AI声明/版权商用一律不建框（规则禁令 + 清洗节点确定性拦截双保险）；画廊标签自动裁剪到 100 字符（防几百个 tag 被逐条变框）。输出详细 desc 但可控 |
 | **配方·反推JSON清洗** | 反推输出坏 JSON 的兜底（裸换行/字符串bbox/截断/纯废话都接得住），并把坐标从模型原生的 xyxy 确定性转成 CreateBoundingBoxes 要的 yxyx；水印/署名/声明类框在这里硬拦（关键词黑名单 + 角落人名启发 + 署名簇连坐），接 `CreateBoundingBoxes` 前垫一道 |
 | **配方·空串转无** | 空/纯空白文本 → `None`。修「画廊空选择吃掉提示词」的坑：rgthree Any Switch 只跳过 `None` 不跳过 `""`，而画廊类节点没选内容时正好吐空字符串，会抢走开关优先位把下游提示词框整个吃掉。接在画廊输出与开关之间即可正确回落 |
 
@@ -64,17 +64,30 @@
 | DiT·Base 量化版 int8_convrot（5.4G） | `models/diffusion_models/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/diffusion_models/moss_image_base_int8_convrot.safetensors) |
 | 文本编码器 qwen3.5_9b_w4a8_gptq（7.3G） | `models/text_encoders/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/text_encoders/qwen3.5_9b_w4a8_gptq.safetensors) |
 | VAE flux2-vae（336M） | `models/vae/` | [下载](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/vae/flux2-vae.safetensors) |
-| 反推模型 Qwen3-VL-4B 去审查版（8.9G，HF transformers 布局整个目录）：`Qwen3-VL-4b-Heretic`（推荐，新法去审查）或 `Huihui-Qwen3-VL-4B-Instruct-abliterated` | `models/LLM/<模型目录>/` | [Heretic](https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic) · [Huihui](https://huggingface.co/huihui-ai/Huihui-Qwen3-VL-4B-Instruct-abliterated) |
+| 反推模型 **LFM3-VL-2B**（3.6G，HF transformers 布局整个目录）：定位能力在 2B~4B 档最强（RefCOCO-avg 90.5），bf16 全精度只占 3.6GB，是唯一支持 CUDA Graph 加速的档位 | `models/LLM/<模型目录>/` | [LiquidAI/LFM3-VL-2B](https://huggingface.co/LiquidAI/LFM3-VL-2B) |
 
 - **下载即用，无需拆分**：2026-10-16 起 ComfyUI（≥ v0.42）原生支持 MOSS，直接用核心简易节点 `UNETLoader` / `CLIPLoader(type=moss_image)` 加载官方融合版文件。低于 v0.42 的旧版本没有原生 MOSS 支持。
 - 社区 LoRA 多按融合 qkv 训练：原生融合链路下注意力权重可 **100%** 打进（旧拆分方案只能打进约六成）。
 - 本插件配方直读优先走 `comfy.sd.load_diffusion_model`（融合/原生格式），旧拆分格式配方自动回退 moss-image 插件加载器。
-- 反推依赖（按模型分档）：
-  - `transformers>=4.57` —— Qwen3-VL / Gemma4 系
-  - `transformers>=5.19` —— LFM3-VL 系（模型仓库自带建模代码，节点会以 `trust_remote_code=True` 执行模型目录内的 `.py`，请只使用可信来源）
-  - LFM3-VL 载入后会自动把它的 RMSNorm 换成 torch 的 fused 实现（实测快 2.3~2.7 倍）；
-    这个替换在 fp32 下与原版 bit 等价、bf16 下 logits 差 <1% 且 top1/top5 相同（更接近 fp64 参考），
-    但**输出序列不会与未加速时逐字一致**（bf16 的 1 ulp 差异会被多步 argmax 放大）。
+- 反推依赖：
+  - `transformers>=5.19` —— LFM3-VL（模型仓库自带建模代码，节点会以 `trust_remote_code=True`
+    执行模型目录内的 `.py`，请只使用可信来源）。注意 4.x 会直接 ImportError：模型代码用了
+    v5 才有的 `PreTrainedConfig`
+  - 模型目录整个放进 `ComfyUI/models/LLM/<任意名字>/`，节点下拉自动列出（**LFM3 排最前**，因为它是首选档位）；
+    新放的模型需重启 ComfyUI 才出现在列表里
+  - **LFM3 加速分两层，都是自动的、失败自动回退**：
+    1. **fused RMSNorm**（载入即生效）：把 160 个手写 RMSNorm 换成 torch 的 fused 实现，
+       纯生成 34 → 53-60 tok/s。fp32 下与原版 bit 等价；bf16 下 logits 差 <1%、top1/top5 相同，
+       且 160/160 个模块都更接近 fp64 参考（原版多一次 bf16 舍入）。
+    2. **CUDA Graph**（默认启用，先跑子进程探针）：把整步 decode 抓成一张图，
+       完整反推 55.6s → 26.2s（31.3 → 87.8 tok/s）。探针会真实 capture 一次并 replay 8 步，
+       通过才启用；不通过（显卡/驱动/CUDA 版本组合不支持）自动回退 `model.generate`，
+       不会让节点报错。
+  - **重要：两种加速都会改变输出的具体文字**。bf16 模型下 1 ulp 的数值差会被多步 argmax
+    放大成完全不同的 token 序列（实测同图同 prompt：原版 3079 tok / 85-90s，
+    加速后 1991 tok / 33s，5 个框都在、desc 长度 851 vs 839、bbox 偏差 <2%）。
+    这不是 bug，是 LLM 自回归的本质；需要严格复现某次结果时，请固定模型与参数并接受当次输出。
+  - 日志里会打 `⚙ CUDA Graph(maxlen 3072, 步进 N)` 或 `⚙ generate`，可据此判断这单走了哪条路。
     需要严格复现某次结果时，请固定模型与参数并接受当次输出。
   - `bitsandbytes` + `accelerate` —— 4bit / 8bit 量化档
   - 模型走进程内直载，无外部服务、无黑框；首次反推时从盘加载入内存（~30s），之后常驻内存免盘读。

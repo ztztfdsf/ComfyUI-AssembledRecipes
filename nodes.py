@@ -109,13 +109,21 @@ def _estimate_need_gb(path, quant):
 
 
 def _list_llm_models():
+    """扫描 models/LLM 下的 transformers 模型，LFM3 排最前（它是本节点的首选，见 README）。
+
+    首选理由：2B~4B 档里 LFM3-VL 的定位最强（RefCOCO-avg 90.5），且只有它能上
+    CUDA Graph（实测 87.8 tok/s vs 生成 31.3）；bf16 全精度只占 3.6GB。
+    """
     root = os.path.join(folder_paths.models_dir, "LLM")
     try:
         names = [d for d in sorted(os.listdir(root))
                  if not d.startswith(".")
                  and os.path.isdir(os.path.join(root, d))
                  and os.path.isfile(os.path.join(root, d, "config.json"))]
-        return names if names else ["（LLM 目录里没有可用模型）"]
+        if not names:
+            return ["（LLM 目录里没有可用模型）"]
+        # LFM3 提到最前，其余保持字母序
+        return sorted(names, key=lambda n: (0 if "lfm3" in n.lower() else 1, n))
     except Exception:
         return ["（models/LLM 目录不存在）"]
 
@@ -257,6 +265,237 @@ def _lfm3_prompt():
         "Do not deliberate: decide each box in one sentence of reasoning, then write. JSON only:\n"
         '[{"type":"obj","bbox":[x1,y1,x2,y2],"desc":"..."}, ...]'
     )
+
+
+# ============ LFM3 CUDA Graph 加速 ============
+# 为什么值得：LFM3 decode 每 token 要发 ~950 个 kernel，profiler 实测 CPU 437ms / CUDA 61ms
+# —— 88% 时间在等 Python 派发。把整步抓成一张 CUDA Graph 后实测 2.1x
+# （同图同 prompt：生产 55.6s / 31.3 tok/s → graph 26.2s / 87.8 tok/s，5 框、eos 正常）。
+#
+# 集成前必须踩过三个坑（都有实测依据）：
+# ① StaticCache 把 sliding_attention 映射成 StaticSlidingWindowLayer，KV 宽只有 256；
+#    写满后走 roll 分支，里面有 torch.tensor([-1], device='cuda') —— capture 期做 pageable H2D，
+#    非法。→ 强制映射成 StaticLayer（全长 cache），滑动窗口改由静态 mask 内容实现，模型行为不变。
+# ② cudaMallocAsync（ComfyUI 的 --cuda-malloc）下 capture 私有池地址在首次 replay 前是
+#    "已保留未映射"，Triton launcher 的 cuPointerGetAttribute 返回 INVALID_VALUE →
+#    ValueError: Pointer argument cannot be accessed from Triton。
+#    → 把 LFM3 的 Triton decode 卷积改成"裸 int 指针直通 CompiledKernel.run"（PyLong 不查指针）。
+#    ⚠ 注意：必须 patch 到 modeling_lfm3 真正持有的那个函数对象。modeling_lfm3 用的是
+#      `from .lfm3_conv import lfm3_causal_conv1d_update`，绑定的是引用，
+#      改 lfm3_conv 模块属性或另用 spec_from_file_location 载入副本都无效（会静默继续走 Triton）。
+# ③ 一次中途失败的 capture 会让进程在释放池显存时 terminate()，try/except 兜不住。
+#    所以先起子进程探针；探针不通就整体不启用 graph，回退 model.generate。
+_LFM3_GRAPH_VERDICT = {}  # model_path -> (bool 可用, str 说明)
+_LFM3_GRAPH_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_lfm3_graph_probe.py")
+
+
+def _lfm3_install_raw_conv(model):
+    """把 LFM3 的 Triton decode 卷积换成裸 int 指针直通（幂等）。
+
+    返回 True 表示替换成功、False 表示找不到真实模块（此时不该启用 graph）。
+    """
+    import importlib.util as _ilu
+    mod = sys.modules.get(type(model.model.language_model).__module__)
+    if mod is None:
+        return False
+    reals = [v for k, v in sys.modules.items()
+             if k.endswith("lfm3_conv") and hasattr(v, "can_use_lfm3_conv")
+             and hasattr(v, "lfm3_causal_conv1d_update")]
+    if not reals:
+        return False
+    real = reals[0]
+    if getattr(real, "_ar_raw_conv", False):
+        return True
+    orig = real.lfm3_causal_conv1d_update
+    known = {}
+
+    def raw_update(hidden_states, conv_state, weight, bias=None):
+        key = (tuple(hidden_states.shape), hidden_states.stride(),
+               tuple(conv_state.shape), conv_state.stride(), bias is not None)
+        ck = known.get(key)
+        if ck is None:
+            dev = torch.cuda.current_device()
+            cache = real._decode.device_caches[dev][0]
+            before = set(cache.keys())
+            out = orig(hidden_states, conv_state, weight, bias)  # 正常张量路径：触发编译
+            new = [k for k in cache.keys() if k not in before]
+            if len(new) == 1:
+                known[key] = cache[new[0]]
+            elif len(cache) == 1:
+                known[key] = next(iter(cache.values()))
+            else:
+                return out  # 形状歧义：退回张量路径（capture 外不会走到这里）
+            return out
+        import triton
+        batch, channels, length = hidden_states.shape
+        if length != 1:
+            return orig(hidden_states, conv_state, weight, bias)
+        output = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
+        # grid=(batch, cdiv(channels,32), 1)；args 末尾必须带 HAS_BIAS 与 BLOCK_D，
+        # 漏了或 grid 顺序反了会非法访问显存直接 abort（实测 exit=127）
+        d_block = triton.cdiv(channels, 32)
+        args = [hidden_states.data_ptr(), weight.contiguous().data_ptr(),
+                bias.contiguous().data_ptr() if bias is not None else 0,
+                conv_state.data_ptr(), output.data_ptr(), channels, conv_state.shape[-1],
+                *hidden_states.stride()[:2], *conv_state.stride(), bias is not None, 32]
+        with torch.cuda.device(hidden_states.device):
+            stream = torch.cuda.current_stream().cuda_stream
+            ck.run(batch, d_block, 1, stream, ck.function, ck.packed_metadata,
+                   None, None, None, *args)
+        return output
+
+    real.lfm3_causal_conv1d_update = raw_update
+    mod.lfm3_causal_conv1d_update = raw_update
+    real._ar_raw_conv = True
+    return True
+
+
+def _lfm3_probe_graph(model_path, timeout_s=240):
+    """子进程探针：真实模型 + 真实形状跑一次 capture + 少量 replay。
+
+    必须子进程：capture 中途失败会给进程留下必须 abort 的垃圾（实测 exit=127 /
+    STATUS_STACK_BUFFER_OVERRUN），主进程兜不住。只在首次反推跑一次，结果按模型路径缓存。
+    """
+    cached = _LFM3_GRAPH_VERDICT.get(model_path)
+    if cached is not None:
+        return cached
+    import subprocess
+    if not os.path.isfile(_LFM3_GRAPH_PY):
+        _LFM3_GRAPH_VERDICT[model_path] = (False, "探针脚本缺失")
+        return _LFM3_GRAPH_VERDICT[model_path]
+    try:
+        r = subprocess.run([sys.executable, _LFM3_GRAPH_PY, model_path],
+                           capture_output=True, text=True, timeout=timeout_s)
+        tail = (r.stdout or "").strip().splitlines()[-1:] + (r.stderr or "").strip().splitlines()[-1:]
+        msg = " | ".join(x for x in tail if x)[:200]
+        ok = r.returncode == 0 and "GRAPH_OK" in (r.stdout or "")
+    except subprocess.TimeoutExpired:
+        ok, msg = False, f"探针超时 {timeout_s}s"
+    except Exception as e:
+        ok, msg = False, f"探针异常 {type(e).__name__}: {e}"[:200]
+    _LFM3_GRAPH_VERDICT[model_path] = (ok, msg)
+    print(f"[AssembledRecipes] LFM3 CUDA Graph 探针: {'可用' if ok else '不可用 → 回退 generate'}"
+          f"（{msg}）", flush=True)
+    return _LFM3_GRAPH_VERDICT[model_path]
+
+
+def _lfm3_graph_generate(model, processor, inputs, max_new_tokens, stopper=None):
+    """LFM3 的 CUDA Graph 生成。返回 (out_ids, 说明字符串)。
+
+    cache 容量是唯一的成本开关：StaticCache 的 full attention 层每步要对整个容量算一遍，
+    所以容量越大越慢。实测（同 prompt 401 tok）：8192→35.6 tok/s、4096→~70、3072→87.8、
+    2560→83.8 但会撞上限出不来答案。这里按 prompt+输出 自适应，向上取整到 512 的倍数。
+    """
+    from transformers.cache_utils import StaticCache, StaticLayer, STATIC_LAYER_TYPE_MAPPING
+    tc = model.config.text_config
+    device = inputs["input_ids"].device
+    PL = int(inputs["input_ids"].shape[1])
+    need = PL + int(max_new_tokens) + 64
+    # 容量上限压到 3072：StaticCache 的 full attention 层每步要对整个容量算一遍，
+    # 容量就是唯一的成本开关（实测同 prompt：8192→35.6、4608→55.8、3072→87.8、2560→83.8）。
+    # 实测真实输出 1021~2305 tok，PL+2305≈2706，3072 够用；真超了由 max_new_tokens 硬顶截断兜底。
+    maxlen = max(2048, min(3072, ((need + 511) // 512) * 512))
+    neg, win = float("-inf"), int(getattr(tc, "sliding_window", 256) or 256)
+
+    STATIC_LAYER_TYPE_MAPPING["sliding_attention"] = StaticLayer
+    mod = sys.modules.get(type(model.model.language_model).__module__)
+    if mod is None:
+        raise RuntimeError("拿不到 modeling 模块")
+    buf = {}
+
+    def _mk(q, kind):
+        k = (kind, q)
+        if k not in buf:
+            buf[k] = torch.zeros(1, 1, q, maxlen, device=device, dtype=torch.bfloat16)
+        return buf[k]
+
+    def masks_by_type(config, inputs_embeds=None, attention_mask=None,
+                      past_key_values=None, position_ids=None, **kw):
+        q = inputs_embeds.shape[1] if inputs_embeds is not None else 1
+        return {"full_attention": _mk(q, "full"), "sliding_attention": _mk(q, "win"), "conv": None}
+
+    mod.create_masks_by_layer_type = masks_by_type
+
+    def set_mask(q, pos_end):
+        ar = torch.arange(maxlen, device=device)
+        bf, bw = buf[("full", q)], buf[("win", q)]
+        if q == 1:
+            bf[0, 0, 0, :] = torch.where(ar <= pos_end, 0.0, neg)
+            bw[0, 0, 0, :] = torch.where((ar <= pos_end) & (ar > pos_end - win), 0.0, neg)
+        else:
+            i = torch.arange(q, device=device).view(q, 1)
+            bf[0, 0, :, :] = torch.where(ar.view(1, -1) <= i, 0.0, neg)
+            bw[0, 0, :, :] = torch.where((ar.view(1, -1) <= i) & (ar.view(1, -1) > i - win), 0.0, neg)
+
+    _mk(PL, "full"); _mk(PL, "win"); _mk(1, "full"); _mk(1, "win")
+    cache = StaticCache(config=tc, max_batch_size=1, max_cache_len=maxlen,
+                        device=device, dtype=torch.bfloat16)
+    set_mask(PL, PL - 1)
+    with torch.inference_mode():
+        o = model(**inputs, past_key_values=cache,
+                  cache_position=torch.arange(PL, device=device), use_cache=True)
+    s_ids = o.logits[:, -1:].argmax(-1)
+    s_pos = torch.tensor([PL], device=device)
+    set_mask(1, PL)
+
+    # warmup 必须用一次性 cache，否则真 cache 的累计长度被污染（capture 后语义就错了）
+    st = torch.cuda.Stream(); st.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st):
+        for _ in range(3):
+            cw = StaticCache(config=tc, max_batch_size=1, max_cache_len=maxlen,
+                             device=device, dtype=torch.bfloat16)
+            with torch.inference_mode():
+                model(input_ids=torch.zeros(1, PL, dtype=torch.long, device=device),
+                      past_key_values=cw, cache_position=torch.arange(PL, device=device), use_cache=True)
+                model(input_ids=s_ids, past_key_values=cw, cache_position=s_pos.clone(), use_cache=True)
+            set_mask(1, PL)
+    torch.cuda.current_stream().wait_stream(st)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.inference_mode():
+        with torch.cuda.graph(g):
+            o = model(input_ids=s_ids, past_key_values=cache,
+                      cache_position=s_pos, use_cache=True)
+
+    rp = float(getattr(model.generation_config, "repetition_penalty", 1.0) or 1.0)
+    seen = torch.zeros(int(getattr(tc, "vocab_size", 128000)), dtype=torch.bool, device=device)
+
+    def apply_rp(lg):
+        if rp == 1.0:
+            return lg
+        sc = lg.clone()
+        v = sc[0, 0].masked_select(seen)
+        sc[0, 0].masked_scatter_(seen, torch.where(v < 0, v * rp, v / rp))
+        return sc
+
+    eos = int(getattr(model.generation_config, "eos_token_id", 124900) or 124900)
+    toks = [s_ids.item()]
+    seen[s_ids.item()] = True
+    last = toks[0]
+    limit = min(int(max_new_tokens), maxlen - PL - 2)
+    for i in range(1, limit):
+        if stopper is not None:
+            try:
+                stopper(s_ids, None)  # 只推进计时/取消检查（签名要求两个位置参数）
+            except Exception:
+                pass
+            if getattr(stopper, "reason", None):
+                break
+        set_mask(1, PL + i)
+        s_pos.fill_(PL + i)
+        g.replay()
+        nxt = apply_rp(o.logits[:, -1:]).argmax(-1)
+        last = int(nxt.item())
+        if last == eos:
+            toks.append(last)
+            break
+        toks.append(last)
+        seen[last] = True
+        s_ids.copy_(nxt)
+
+    out_ids = torch.tensor([toks], dtype=torch.long, device=device)
+    note = f"CUDA Graph(maxlen {maxlen}, 步进 {len(toks) - 1})"
+    return out_ids, note
 
 
 def _parse_json_array(txt):
@@ -1691,19 +1930,42 @@ class ReverseLayoutCaption:
             first_side = 512 if big_model else 640
             attempts = [(first_side, want_tokens), (448, min(want_tokens, 2048)),
                         (320, min(want_tokens, 1024))]
+            # LFM3 走 CUDA Graph（探针通过才用；失败一律回退 generate）
+            graph_ok, graph_why = (False, "")
+            if is_lfm3:
+                graph_ok, graph_why = _lfm3_probe_graph(path)
+                if graph_ok and not _lfm3_install_raw_conv(model):
+                    graph_ok, graph_why = False, "拿不到真实 lfm3_conv 模块"
+
             out_ids = None
             for i, (side, toks) in enumerate(attempts):
                 pil, inputs, toks = _prepare(side, toks)
                 try:
                     t2 = time.time()
                     stopper = _gen_stopper(GEN_TIMEOUT_S)
-                    gen_kwargs = {"max_new_tokens": toks, "do_sample": False}
-                    if stopper is not None:
-                        gen_kwargs["stopping_criteria"] = [stopper]
-                    with torch.inference_mode():
-                        out_ids = model.generate(**inputs, **gen_kwargs)
+                    graph_note = ""
+                    if graph_ok:
+                        try:
+                            out_ids, graph_note = _lfm3_graph_generate(
+                                model, processor, inputs, toks, stopper)
+                        except Exception as ge:
+                            # 注意：capture 失败会直接杀进程（探针就是为了提前排掉这种），
+                            # 能到这里的是 replay 阶段的普通异常，回退 generate 是安全的。
+                            print(f"[AssembledRecipes] CUDA Graph 生成失败，本单回退 generate: "
+                                  f"{type(ge).__name__}: {str(ge)[:150]}", flush=True)
+                            graph_ok = False
+                            out_ids = None
+                    if out_ids is None:
+                        gen_kwargs = {"max_new_tokens": toks, "do_sample": False}
+                        if stopper is not None:
+                            gen_kwargs["stopping_criteria"] = [stopper]
+                        with torch.inference_mode():
+                            out_ids = model.generate(**inputs, **gen_kwargs)
+                        graph_note = "generate"
                     gen_s = time.time() - t2
                     max_new_tokens = toks
+                    if graph_note and graph_note != "generate":
+                        retry_note += f" | ⚙ {graph_note}"
                     if stopper is not None and stopper.reason:
                         retry_note = f" | ⚠ 生成提前结束（{stopper.reason}，{stopper.n} tok）"
                         if "取消" in stopper.reason:
