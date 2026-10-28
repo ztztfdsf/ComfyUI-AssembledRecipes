@@ -5,6 +5,10 @@ version = "1.0.0"
 license = {text = "Apache-2.0"}
 dependencies = ["safetensors"]
 
+[project.optional-dependencies]
+# ComfyUI 整合包一般已带；反推节点按需
+llm = ["transformers>=4.57", "accelerate", "bitsandbytes"]
+
 [project.urls]
 Repository = "https://github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 

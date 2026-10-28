@@ -25,7 +25,6 @@ import comfy.sd
 from comfy import model_management
 
 RECIPES_DIR = os.path.join(folder_paths.models_dir, "assembled_recipes")
-TRASH_DIR = None  # 删除已改为硬删除，不再使用回收目录
 os.makedirs(RECIPES_DIR, exist_ok=True)
 
 STREAM_RESIDENT_BYTES = 0.1  # 驻留预算≈0 → 全流水
@@ -103,6 +102,9 @@ def _estimate_need_gb(path, quant):
         return size / 4.0 * 1.10 + 3.0
     if quant.startswith("8bit"):
         return size / 2.0 * 1.05 + 3.0
+    # 小模型（LFM3 1.9B）激活与 KV 开销小，3.0GB 余量会把它自己的清场目标（6GB）反超
+    if size < 5.0:
+        return size * 1.02 + 1.0
     return size * 1.02 + 3.0
 
 
@@ -169,31 +171,46 @@ def _load_vlm_model(path, quant):
         from transformers import BitsAndBytesConfig
         kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
         kw["device_map"] = {"": "cuda:0" if torch.cuda.is_available() else "cpu"}
-        kw["dtype"] = torch.bfloat16
+        kw["dtype"] = kw["torch_dtype"] = torch.bfloat16
         model = AutoModelForImageTextToText.from_pretrained(path, trust_remote_code=True, **kw)
     else:
-        kw["dtype"] = torch.bfloat16
+        kw["dtype"] = kw["torch_dtype"] = torch.bfloat16
         model = AutoModelForImageTextToText.from_pretrained(path, trust_remote_code=True, **kw)
     if "lfm3" in str(getattr(getattr(model, "config", None), "model_type", "")):
         patched = _patch_lfm3_fused_norm(model)
         if patched:
-            print(f"[AssembledRecipes] LFM3 已换用 fused rms_norm（{patched} 个，实测 1.8x）", flush=True)
+            print(f"[AssembledRecipes] LFM3 已换用 fused rms_norm（{patched} 个）", flush=True)
+    if _has_remote_code(path):
+        print(f"[AssembledRecipes] 反推模型自带建模代码（auto_map），将以 trust_remote_code 执行 {path} 内的 .py，"
+              f"请确认模型来源可信", flush=True)
     return processor, model
 
 
+def _has_remote_code(path):
+    """模型目录是否自带 auto_map（= 会被 trust_remote_code 执行其中的 .py）。"""
+    try:
+        with open(os.path.join(path, "config.json"), encoding="utf-8") as f:
+            return bool(json.load(f).get("auto_map"))
+    except Exception:
+        return False
+
+
 def _patch_lfm3_fused_norm(model):
-    """把 LFM3 的 RMSNorm 换成 torch 的 fused 实现（原地 monkey-patch）。
+    """把 LFM3 的 RMSNorm 切成 torch 的 fused 实现（原地 monkey-patch）。
 
     LFM3 原版 RMSNorm 是 6 个逐元素 op（to fp32 → pow → mean → mul → rsqrt → to），
-    而它开了 use_sandwich_norm：每层 4 个 norm，24 层 → 每 token 119 次 norm。
-    decode 阶段每 token 只有 1 个位置、矩阵乘很小，Python dispatch 开销直接压
-    过 GPU 计算量（实测原版：每 token CPU 1.9s / GPU 0.36s，GPU 只占 19%）。
+    而它开了 use_sandwich_norm：每层 4 个 norm × 24 层 + 11 个 attention 层的 q/k norm
+    + embedding_norm = 文本塔每 token 119 次 norm（另有视觉塔 41 个 norm，只在 prefill 跑）。
+    decode 阶段每 token 只有 1 个位置、矩阵乘很小，Python dispatch 开销直接压过 GPU 计算量。
 
-    换成 torch>=2.4 的 fused rms_norm 后（内部仍是 fp32 归约，结果等价）：
-      37~41 tok/s → 66~75 tok/s（同机实测 3 次）
-      完整反推（长边 640）96.7s / 39.7s → 31.3s，框位置与描述质量无变化
+    换成 torch>=2.4 的 fused rms_norm 后：
+      · fp32 输入：与原版 bit 等价
+      · bf16 输入：差异 ≤1 ulp（原版把 normalized 先舍入到 bf16 再乘 weight，fused 版只降一次精度），
+        实测 fused 版更接近 fp64 参考；末位 logits top1/top5 不变
+      · 16GB 卡单机样本：纯生成 37~41 tok/s → 66~75 tok/s
     """
     if not hasattr(torch.nn.functional, "rms_norm"):
+        print("[AssembledRecipes] torch 无 fused rms_norm（需 >=2.4），LFM3 不加速", flush=True)
         return 0
 
     def _fused_forward(self, hidden_states):
@@ -208,13 +225,15 @@ def _patch_lfm3_fused_norm(model):
 
     n = 0
     for mod in model.modules():
-        # 只改 LFM3 自己的 norm（类名带 Lfm3 且属性形状对得上），不误仿其他模块
-        if type(mod).__name__.startswith("Lfm3") and hasattr(mod, "variance_epsilon") \
-                and hasattr(mod, "weight") and getattr(mod.weight, "ndim", 0) == 1:
-            mod._lfm3_orig_forward = None
+        # 精确类名，不用前缀鸭子判据：LFM3 将来加个带 variance_epsilon 的 LayerNorm 变体也不会被误当成 RMSNorm
+        if type(mod).__name__ in _LFM3_NORM_CLASSES \
+                and hasattr(mod, "variance_epsilon") and getattr(getattr(mod, "weight", None), "ndim", 0) == 1:
             mod.forward = types.MethodType(_fused_forward, mod)
             n += 1
     return n
+
+
+_LFM3_NORM_CLASSES = ("Lfm3RMSNorm", "Lfm3VlRMSNorm")
 
 
 def _lfm3_prompt():
@@ -241,17 +260,28 @@ def _lfm3_prompt():
 
 
 def _parse_json_array(txt):
-    """从模型输出里取 JSON 数组。thinking 里也会出现 [..]，所以从后往前找能解析的。"""
-    starts = [m.start() for m in re.finditer(r"\[\s*\{", txt)]
+    """从模型输出里取 JSON 数组。
+
+    LFM3 的思考段以字面 </think> 收尾（chat_template.jinja / tokenizer_config 的 reasoning_content
+    是文本模式，batch_decode 不会吃掉它），所以只在 </think> 之后的正式答案里找——否则答案被
+    截断时（max_new_tokens 顶满 / 300s 超时）会静默回退到 thinking 里那个“先框个整图试试”的草稿，
+    交出一个 1 框的退化布局。
+    条目校验收紧到 bbox 是 4 个数字 + desc 是字符串，脏东西不当成果返回。
+    """
+    seg = txt.rsplit("</think>", 1)[1] if "</think>" in txt else txt
+    starts = [m.start() for m in re.finditer(r"\[\s*\{", seg)]
     for s in reversed(starts):
-        for e in range(len(txt), s + 1, -1):
-            if txt[e - 1] != "]":
+        for e in range(len(seg), s + 1, -1):
+            if seg[e - 1] != "]":
                 continue
             try:
-                v = json.loads(txt[s:e])
+                v = json.loads(seg[s:e])
             except Exception:
                 continue
-            if isinstance(v, list) and v and all(isinstance(x, dict) and "bbox" in x for x in v):
+            if isinstance(v, list) and v and all(
+                    isinstance(x, dict) and isinstance(x.get("desc"), str)
+                    and isinstance(x.get("bbox"), list) and len(x["bbox"]) == 4
+                    and all(isinstance(n, (int, float)) for n in x["bbox"]) for x in v):
                 return v, s
     return None, -1
 
@@ -1520,12 +1550,14 @@ class ReverseLayoutCaption:
 
         is_lfm3 = "lfm3" in _model_type_of(path)
 
+        # 清场目标算一次、全程复用：12B 在 16GB 卡上要 14GB，4B 类 8GB，LFM3 6GB
+        # （1.9B bf16 权重 3.6GB + prefill 激活，实测峰值 4.3~4.6GB）。
+        # 这个数必须贯穿 clear / 上卡前复查 / OOM 重试三处，否则分级等于没做：
+        # 之前写死 13000 的复查在小卡上恒成立，每单把 5.2GB 文本编码器搬回 CPU（+60s）。
+        _mt = _model_type_of(path)
+        need_mb = 14000 if "gemma4" in _mt else (6000 if is_lfm3 else 8000)
         if pre_clear:
-            # 按模型实际需求定清场目标：12B 在 16GB 卡上要 14GB，4B 类 8GB，
-            # LFM3 只要 4GB（1.9B 全精度 3.6GB）——目标越低越不会触发“强制搬 CPU”，
-            # 小模型就不用每单重载那个 5.2GB 文本编码器。
-            need = 14000 if "gemma4" in _model_type_of(path) else (4000 if is_lfm3 else 8000)
-            self._settle_and_evict(need_mb=need)
+            self._settle_and_evict(need_mb=need_mb)
 
         # LFM3 强制全精度：它才 1.9B，bf16 只占 3.6GB，没必要量化；
         # 实测 4bit 量化会把它“先想再答”的能力搞坏（思考停不下来、JSON 崩），
@@ -1541,7 +1573,7 @@ class ReverseLayoutCaption:
             from comfy import model_management as _mm2
             avail_gb = _mm2.get_free_memory() / 2**30
             if need_gb > avail_gb:
-                hint = "，这模型请改用 4bit" if not quant.startswith("4bit") else ""
+                hint = "" if (is_lfm3 or quant.startswith("4bit")) else "，这模型请改用 4bit"
                 raise RuntimeError(
                     f"显存不够：{quant} 估算需 {need_gb:.1f}GB，当前只有 {avail_gb:.1f}GB{hint}。\n"
                     f"（模型目录 {_model_size_gb(path):.1f}GB；清场开销太大时先关掉其他占显存的程序，或换更小的模型）")
@@ -1613,9 +1645,9 @@ class ReverseLayoutCaption:
             # 上卡前再验收一次：不够就重跑清场（上卡阶段的 OOM 没有降级链兜底）
             from comfy import model_management as _mm
             free_mb = _mm.get_free_memory() / 2**20
-            if free_mb < 13000:
-                print(f"[AssembledRecipes] 反推上卡前显存仅 {free_mb:.0f}MB，再清一次", flush=True)
-                self._settle_and_evict(settle_seconds=4)
+            if free_mb < need_mb:
+                print(f"[AssembledRecipes] 反推上卡前显存仅 {free_mb:.0f}MB（目标 {need_mb}），再清一次", flush=True)
+                self._settle_and_evict(settle_seconds=4, need_mb=need_mb)
                 up_s = 0.0
             t1 = time.time()
             try:
@@ -1624,7 +1656,7 @@ class ReverseLayoutCaption:
                 if "out of memory" not in str(e).lower():
                     raise
                 print(f"[AssembledRecipes] 反推上卡 OOM，强制清场后重试", flush=True)
-                self._settle_and_evict(settle_seconds=2, need_mb=14000)
+                self._settle_and_evict(settle_seconds=2, need_mb=need_mb)
                 try:
                     model.to(device)
                 except Exception as e2:
@@ -1640,7 +1672,7 @@ class ReverseLayoutCaption:
                         pass
                     import gc as _gc
                     _gc.collect()
-                    self._settle_and_evict(settle_seconds=2, need_mb=14000)
+                    self._settle_and_evict(settle_seconds=2, need_mb=need_mb)
                     model = _load_vlm_model(path, quant)[1]
                     _VLM_CACHE[cache_key] = (processor, model)
                     first += "（重建）"

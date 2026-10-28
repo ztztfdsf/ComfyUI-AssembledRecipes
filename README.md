@@ -69,7 +69,12 @@
 - **下载即用，无需拆分**：2026-10-16 起 ComfyUI（≥ v0.42）原生支持 MOSS，直接用核心简易节点 `UNETLoader` / `CLIPLoader(type=moss_image)` 加载官方融合版文件。低于 v0.42 的旧版本没有原生 MOSS 支持。
 - 社区 LoRA 多按融合 qkv 训练：原生融合链路下注意力权重可 **100%** 打进（旧拆分方案只能打进约六成）。
 - 本插件配方直读优先走 `comfy.sd.load_diffusion_model`（融合/原生格式），旧拆分格式配方自动回退 moss-image 插件加载器。
-- 反推依赖 `transformers>=4.57`（ComfyUI 整合包一般已带，缺了 `pip install transformers`）。模型走进程内直载，无外部服务、无黑框；首次反推时从盘加载入内存（~30s），之后常驻内存免盘读。
+- 反推依赖（按模型分档）：
+  - `transformers>=4.57` —— Qwen3-VL / Gemma4 系
+  - `transformers>=5.19` —— LFM3-VL 系（模型仓库自带建模代码，节点会以 `trust_remote_code=True` 执行模型目录内的 `.py`，请只使用可信来源）
+  - `bitsandbytes` + `accelerate` —— 4bit / 8bit 量化档
+  - 模型走进程内直载，无外部服务、无黑框；首次反推时从盘加载入内存（~30s），之后常驻内存免盘读。
+  - 反推模型若是新架构（自带 `auto_map`），加载时会在日志里明确提示"将以 trust_remote_code 执行该目录内的 .py"。
 
 ## 交流与反馈
 
