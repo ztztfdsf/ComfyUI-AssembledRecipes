@@ -81,6 +81,31 @@ def _model_type_of(path):
         return ""
 
 
+def _model_size_gb(path):
+    """模型目录里 safetensors 总占用（GB），用来估算各量化档位要多少显存。"""
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for f in files:
+                if f.endswith((".safetensors", ".bin", ".pt")):
+                    total += os.path.getsize(os.path.join(root, f))
+    except Exception:
+        return 0.0
+    return total / 2**30
+
+
+def _estimate_need_gb(path, quant):
+    """估算反推峰值显存需求（GB）。权重 / 量化倍数 + 激活与 KV 余量。"""
+    size = _model_size_gb(path)
+    if size <= 0:
+        return 0.0
+    if quant.startswith("4bit"):
+        return size / 4.0 * 1.10 + 3.0
+    if quant.startswith("8bit"):
+        return size / 2.0 * 1.05 + 3.0
+    return size * 1.02 + 3.0
+
+
 def _list_llm_models():
     root = os.path.join(folder_paths.models_dir, "LLM")
     try:
@@ -111,7 +136,8 @@ def _load_vlm_model(path, quant):
     import torch
     from transformers import AutoProcessor, AutoModelForImageTextToText
 
-    processor = AutoProcessor.from_pretrained(path)
+    # trust_remote_code：LFM3 这类新架构把建模代码随仓库分发（auto_map），不带这个加载不了
+    processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
     kw = {}
     if quant.startswith("4bit"):
         from transformers import BitsAndBytesConfig
@@ -136,7 +162,7 @@ def _load_vlm_model(path, quant):
         kw = {"quantization_config": BitsAndBytesConfig(**bnb_kw),
               "device_map": {"": "cuda:0" if torch.cuda.is_available() else "cpu"},
               "dtype": ct}
-        model = AutoModelForImageTextToText.from_pretrained(path, **kw)
+        model = AutoModelForImageTextToText.from_pretrained(path, trust_remote_code=True, **kw)
         if ct is torch.float32:
             print("[AssembledRecipes] 反推: gemma4 系 → 4bit 用 fp32 compute（跳过 lm_head 量化省 4GB）", flush=True)
     elif quant.startswith("8bit"):
@@ -144,11 +170,46 @@ def _load_vlm_model(path, quant):
         kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
         kw["device_map"] = {"": "cuda:0" if torch.cuda.is_available() else "cpu"}
         kw["dtype"] = torch.bfloat16
-        model = AutoModelForImageTextToText.from_pretrained(path, **kw)
+        model = AutoModelForImageTextToText.from_pretrained(path, trust_remote_code=True, **kw)
     else:
         kw["dtype"] = torch.bfloat16
-        model = AutoModelForImageTextToText.from_pretrained(path, **kw)
+        model = AutoModelForImageTextToText.from_pretrained(path, trust_remote_code=True, **kw)
     return processor, model
+
+
+def _lfm3_prompt():
+    """LFM3-VL 专用提示。
+
+    两个实测得到的硬结论（同一张图重复跑）：
+    · 关掉 thinking 直接答→框退化成全图；开 thinking 能把框收紫（头/帽单独框）。
+    · thinking 长度跟提示词的长短成正比：“逐元素详细推理”会烧到 3.4k tok / 100s，
+      改成直接给任务 + JSON 格式只要 1.7k tok / 45s，答案一字不差。
+    所以这里刻意写得极短：只列 5 个目标、坐标口径、长度要求，不让它磨叽。
+    """
+    return (
+        "Output a JSON array with exactly 5 entries, largest region first: "
+        "background scenery, whole character, upper clothing, lower clothing, "
+        "head details (hat/hair/face).\n"
+        "box coordinates 0-1000, each box tight around that element only. "
+        "Each desc: 60-120 English words describing only what is inside that box. JSON only:\n"
+        '[{"type":"obj","bbox":[x1,y1,x2,y2],"desc":"..."}, ...]'
+    )
+
+
+def _parse_json_array(txt):
+    """从模型输出里取 JSON 数组。thinking 里也会出现 [..]，所以从后往前找能解析的。"""
+    starts = [m.start() for m in re.finditer(r"\[\s*\{", txt)]
+    for s in reversed(starts):
+        for e in range(len(txt), s + 1, -1):
+            if txt[e - 1] != "]":
+                continue
+            try:
+                v = json.loads(txt[s:e])
+            except Exception:
+                continue
+            if isinstance(v, list) and v and all(isinstance(x, dict) and "bbox" in x for x in v):
+                return v, s
+    return None, -1
 
 
 def _trim_cuda_pool():
@@ -1192,7 +1253,7 @@ class ReverseLayoutCaption:
             },
             "optional": {
                 # 放在最后：旧工作流 widgets_values 前 6 位保持对齐，不会错位；缺省=4bit
-                "quant": (["4bit (NF4，显存最省)", "8bit", "none (bf16，原精度)"], {"default": "4bit (NF4，显存最省)", "tooltip": "量化方式：4bit 只需 ~2.7GB 显存（bf16 需 8GB），质量几乎无损；偶尔量化报错就换 8bit 或 none"}),
+                "quant": (["4bit (NF4，显存最省)", "8bit", "none (bf16，原精度)"], {"default": "4bit (NF4，显存最省)", "tooltip": "量化方式。4bit 显存最省（12B 在 16GB 卡上只有它能跑）；8bit / bf16 只有小模型或大显存卡才装得下，不够时节点会直接报错不等加载"}),
                 # 大模型（如 Gemma4-12B）有能力自己从一堆 tag 里筛出画面真实内容，
                 # 小模型容易看到多少 tag 就框多少个，所以做成开关。
                 "tag_mode": (["全部（推荐 12B 级大模型）", "精简（只给前几个 tag）"], {"default": "全部（推荐 12B 级大模型）", "tooltip": "画廊 tag 喂多少给模型。全部=画质/装束细节更准，但小模型容易“看到多少 tag 就框多少个”；精简=只给开头的作品/角色名，防暴框"}),
@@ -1413,11 +1474,33 @@ class ReverseLayoutCaption:
                 f"LLM 目录下现有: {avail or '（空）'}\n"
                 f"把 HF transformers 格式的模型整个放进去，或在节点里把 model_name 改成上面某个名字。")
 
+        is_lfm3 = "lfm3" in _model_type_of(path)
+
         if pre_clear:
-            # 按模型实际需求定清场目标：12B 在 16GB 卡上要 14GB，4B 类只需 8GB
-            # （目标越低越不容易触发“强制搬 CPU”，小模型就不必每单重载编码器）。
-            need = 14000 if "gemma4" in _model_type_of(path) else 8000
+            # 按模型实际需求定清场目标：12B 在 16GB 卡上要 14GB，4B 类 8GB，
+            # LFM3 只要 4GB（1.9B 全精度 3.6GB）——目标越低越不会触发“强制搬 CPU”，
+            # 小模型就不用每单重载那个 5.2GB 文本编码器。
+            need = 14000 if "gemma4" in _model_type_of(path) else (4000 if is_lfm3 else 8000)
             self._settle_and_evict(need_mb=need)
+
+        # LFM3 强制全精度：它才 1.9B，bf16 只占 3.6GB，没必要量化；
+        # 实测 4bit 量化会把它“先想再答”的能力搞坏（思考停不下来、JSON 崩），
+        # 而 bf16 全精度代价只有 3.6GB —— 省这点不值得。
+        if is_lfm3 and not quant.startswith("none"):
+            print(f"[AssembledRecipes] LFM3 强制全精度（忽略 quant={quant}），bf16 仅占 ~3.6GB", flush=True)
+            quant = "none (bf16，原精度)"
+
+        # 量化档位预检：8bit / bf16 的大模型在 16GB 卡上必然 OOM，
+        # 不预检就要白等一分钟加载才报错（实测 12B：8bit 63s、bf16 107s）。
+        need_gb = _estimate_need_gb(path, quant)
+        if need_gb > 0:
+            from comfy import model_management as _mm2
+            avail_gb = _mm2.get_free_memory() / 2**30
+            if need_gb > avail_gb:
+                hint = "，这模型请改用 4bit" if not quant.startswith("4bit") else ""
+                raise RuntimeError(
+                    f"显存不够：{quant} 估算需 {need_gb:.1f}GB，当前只有 {avail_gb:.1f}GB{hint}。\n"
+                    f"（模型目录 {_model_size_gb(path):.1f}GB；清场开销太大时先关掉其他占显存的程序，或换更小的模型）")
 
         t0 = time.time()
         cache_key = (path, quant)
@@ -1453,17 +1536,24 @@ class ReverseLayoutCaption:
 
         def _prepare(max_side, tokens):
             pil = self._image_to_pil(image, max_side=max_side)
-            user_content = (
-                ("Gallery tags (auto-generated; may list features NOT visible in this image — "
-                 "use them only to confirm character/work identity, never as a placement checklist):\n"
-                 + up + "\n\n" if up else "")
-                + "Analyze the image and output ONLY the JSON array as instructed."
-            )
-            messages = [
-                {"role": "system", "content": rule},
-                {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_content}]},
-            ]
-            chat = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            if is_lfm3:
+                # LFM3：内置精简提示（长规则它跟不上），开 thinking 走“从大到小逐元素推理”。
+                # 不拼画廊 tag：实测塞 tag 会让 2B 的思考量从 ~2.3k 涨到满 4k 还出不来答案；
+                # 它自己看图完全够（标签反而让它纠结）。
+                content = _lfm3_prompt()
+                messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": content}]}]
+                chat = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                                    enable_thinking=True)
+            else:
+                content = (("Gallery tags (auto-generated; may list features NOT visible in this image — "
+                            "use them only to confirm character/work identity, never as a placement checklist):\n"
+                            + up + "\n\n" if up else "")
+                           + "Analyze the image and output ONLY the JSON array as instructed.")
+                messages = [
+                    {"role": "system", "content": rule},
+                    {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": content}]},
+                ]
+                chat = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             inp = processor(text=[chat], images=[pil], return_tensors="pt").to(device)
             return pil, inp, int(tokens)
 
@@ -1556,6 +1646,15 @@ class ReverseLayoutCaption:
             n_new = out_ids.shape[1] - inputs["input_ids"].shape[1]
             n_prompt = inputs["input_ids"].shape[1]
             text_out = processor.batch_decode(out_ids[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+            if is_lfm3:
+                # LFM3 先在 thinking 里推理再出 JSON，取最后一个能解析的数组
+                arr, pos = _parse_json_array(text_out)
+                if arr:
+                    text_out = json.dumps(arr, ensure_ascii=False)
+                    n_items = len(arr)
+                    print(f"[AssembledRecipes] LFM3 顺序推理: 捕获 {n_items} 个元素", flush=True)
+                else:
+                    print("[AssembledRecipes] LFM3 输出里没找到可解析的 JSON 数组，原文交给清洗节点", flush=True)
             free0 = torch.cuda.mem_get_info()[0] / 2**20 if torch.cuda.is_available() else -1
             del inputs, out_ids
         finally:
