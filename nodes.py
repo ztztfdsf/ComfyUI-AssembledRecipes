@@ -286,6 +286,7 @@ def _parse_json_array(txt):
     return None, -1
 
 
+
 def _trim_cuda_pool():
     """把 cudaMallocAsync 的池强制 trim 回 0（还给驱动）。
 
