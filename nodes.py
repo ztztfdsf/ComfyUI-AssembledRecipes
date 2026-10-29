@@ -1614,6 +1614,7 @@ class ReverseLayoutCaption:
                 # 大模型（如 Gemma4-12B）有能力自己从一堆 tag 里筛出画面真实内容，
                 # 小模型容易看到多少 tag 就框多少个，所以做成开关。
                 "tag_mode": (["全部（推荐 12B 级大模型）", "精简（只给前几个 tag）"], {"default": "全部（推荐 12B 级大模型）", "tooltip": "画廊 tag 喂多少给模型。全部=画质/装束细节更准，但小模型容易“看到多少 tag 就框多少个”；精简=只给开头的作品/角色名，防暴框"}),
+                "batch_index": ("INT", {"default": 0, "min": 0, "max": 63, "tooltip": "上游一次送来多张图时（画廊多选）用第几张，0=第一张。日志会打印「收到 N 张，本次用第 X 张」和原图尺寸，可据此核对是不是你要的那张"}),
             },
         }
 
@@ -1653,15 +1654,31 @@ class ReverseLayoutCaption:
         return trimmed
 
     @staticmethod
-    def _image_to_pil(image, max_side=640):
+    def _image_to_pil(image, max_side=640, index=0):
+        """把 IMAGE(batch) 里第 index 张转成 PIL。
+
+        为什么必须显式说清楚：上游「画廊」多选时会输出 batch（BooruGalleryNode 的
+        `io.NodeOutput(images, ...)` 里 images 是 list），而 MOSS 布局是单图重绘语义，
+        这里只能取一张。以前是静默 `image[0]`，用户多选后看到的描述永远是第一张，
+        却以为是自己点的另一张 —— 所以现在把「batch 几张、用第几张、原尺寸多少」
+        全打进日志，配合 batch_index 参数可指定。
+        """
         from PIL import Image
-        t = image[0].clamp(0, 1).cpu().numpy()
+        n = int(image.shape[0]) if len(image.shape) == 4 else 1
+        idx = max(0, min(int(index), n - 1))
+        tw, th = int(image.shape[2]), int(image.shape[1])
+        if n > 1:
+            print(f"[AssembledRecipes] 反推收到 {n} 张图（batch），"
+                  f"本次用第 {idx + 1} 张（要换就用节点上的 batch_index 参数）", flush=True)
+        t = image[idx].clamp(0, 1).cpu().numpy()
         arr = (t * 255.0).round().astype("uint8")
         im = Image.fromarray(arr)
         # 视觉塔是慢路径（实测 ~43ms/视觉token），长边 640 → 反推 ~13s；改大仅当图里小物件多
         if max(im.size) > max_side:
             r = max_side / max(im.size)
             im = im.resize((max(1, round(im.width * r)), max(1, round(im.height * r))), Image.LANCZOS)
+        print(f"[AssembledRecipes] 反推输入图: 原 {tw}x{th} → 送模型 {im.width}x{im.height}"
+              f"（第 {idx + 1}/{n} 张）", flush=True)
         return im
 
     @staticmethod
@@ -1815,7 +1832,7 @@ class ReverseLayoutCaption:
               f"空闲 {before:.0f}→{after:.0f}MB | 池trim {'OK' if _trim_cuda_pool() else '跳过'}"
               f"{f' | 残留 {residual:.0f}MB' if residual > 100 else ''}{vbar_note}{warn}", flush=True)
 
-    def caption(self, image, rule, user_prompt, model_name, max_new_tokens, pre_clear, offload_after, quant="4bit (NF4，显存最省)", tag_mode="全部（推荐 12B 级大模型）"):
+    def caption(self, image, rule, user_prompt, model_name, max_new_tokens, pre_clear, offload_after, quant="4bit (NF4，显存最省)", tag_mode="全部（推荐 12B 级大模型）", batch_index=0):
         import torch
         path = os.path.join(folder_paths.models_dir, "LLM", model_name)
         if not os.path.isdir(path):
@@ -1894,7 +1911,7 @@ class ReverseLayoutCaption:
         up = self._trim_user_prompt(user_prompt, max_chars=100000 if all_mode else 100)
 
         def _prepare(max_side, tokens):
-            pil = self._image_to_pil(image, max_side=max_side)
+            pil = self._image_to_pil(image, max_side=max_side, index=batch_index)
             if is_lfm3:
                 # LFM3：内置精简提示（长规则它跟不上），开 thinking 走“从大到小逐元素推理”。
                 # 不拼画廊 tag：实测塞 tag 会让 2B 的思考量从 ~2.3k 涨到满 4k 还出不来答案；
@@ -1960,9 +1977,6 @@ class ReverseLayoutCaption:
                     _VLM_CACHE[cache_key] = (processor, model)
                     first += "（重建）"
             up_s = time.time() - t1
-
-            if image.shape[0] > 1:
-                print(f"[AssembledRecipes] 布局反推: 批量 {image.shape[0]} 张，只取第一张", flush=True)
 
             # OOM 降级链：原尺寸 → 448 → 320（图越小视觉 token 越少，显存峰值越低）
             # token 上限先夹到硬顶：主人拉到 16384 只是保险丝，不该真的算到 16384
