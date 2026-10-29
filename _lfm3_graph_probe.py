@@ -12,6 +12,17 @@ import sys
 
 def main():
     model_path = sys.argv[1]
+    # 子进程继承父进程环境，中文/GBK 变量同样会让 libtriton 的 C++ getenv 崩，先修
+    try:
+        import os as _os
+        import triton.knobs as _tk
+        _tk.getenv = lambda key, default=None: _os.environ.get(key, default)
+        _tk.getenv_bool = lambda key, default=False: (
+            default if key not in _os.environ
+            else str(_os.environ[key]).strip().lower() in ("1", "true", "yes", "on"))
+        _tk._ar_env_patched = True
+    except Exception:
+        pass
     try:
         import torch
         from transformers import AutoProcessor, AutoModelForImageTextToText

@@ -244,6 +244,49 @@ def _patch_lfm3_fused_norm(model):
 _LFM3_NORM_CLASSES = ("Lfm3RMSNorm", "Lfm3VlRMSNorm")
 
 
+def _patch_triton_env():
+    """把 libtriton 的 C++ getenv 换成 Python 版（否则中文路径直接炸）。
+
+    实测根因（2026-10-29）：triton 的 getenv/getenv_bool 是 `triton._C.libtriton` 的 C++
+    实现，解码进程环境块时用 UTF-8；而 Windows 上由绘世启动器 / PowerShell 设的环境变量
+    是系统编码（GBK）字节 → 第一次调用就抛
+        UnicodeDecodeError: 'utf-8' codec can't decode byte 0xa3 in position 17
+    本机实测有 4 个变量中招：PWD（='D:/ComfyUI-aki-v3（anima）'，全角括号在 position 17）、
+    PATH（含中文路径）、OLDPWD、CLOAKBROWSER_CACHE_DIR。逐 key 调 libtriton 的 getenv
+    全都会崩，说明它解码的是整个环境块，不只是目标 key。
+
+    Python 侧的 os.environ 已按系统编码正确解码过，所以直接把 knobs 模块里的这两个名字
+    换成 Python 实现即可。knobs.py 里所有 env_* 类都是 `getenv(self.key, ...)` 的模块级
+    名字查找，替换立刻生效（不需要改 triton 源码）。
+
+    不 patch 的后果：LFM3 的 prefill Triton 卷积起不来 → 反推直接报错，generate 也崩
+    （因为 conv 走 Triton 分支）。graph 探针同样会失败并回退，但回退到的 generate 一样崩。
+    """
+    try:
+        import triton.knobs as _tk
+        if getattr(_tk, "_ar_env_patched", False):
+            return True
+
+        def _getenv(key, default=None):
+            return os.environ.get(key, default)
+
+        def _getenv_bool(key, default=False):
+            if key not in os.environ:
+                return default
+            return str(os.environ[key]).strip().lower() in ("1", "true", "yes", "on")
+
+        _tk.getenv = _getenv
+        _tk.getenv_bool = _getenv_bool
+        _tk._ar_env_patched = True
+        return True
+    except Exception:
+        return False
+
+
+# 尽早执行：只要装了 triton（装了 LFM3 就一定有），任何 triton 调用前都要先修好这个
+_patch_triton_env()
+
+
 def _lfm3_prompt():
     """LFM3-VL 专用提示。
 
