@@ -287,50 +287,61 @@ def _patch_triton_env():
 _patch_triton_env()
 
 
-def _lfm3_prompt():
+NL = chr(10)
+def _lfm3_prompt(w=None, h=None):
     """LFM3-VL 专用提示。
 
     两个实测得到的硬结论（同一张图重复跑）：
     · 关掉 thinking 直接答→框退化成全图；开 thinking 能把框收紫（头/帽单独框）。
     · thinking 长度跟提示词的长短成正比：“逐元素详细推理”会烧到 3.4k tok / 100s，
       改成直接给任务 + JSON 格式只要 1.7k tok / 45s，答案一字不差。
-    所以这里刻意写得极短：只列 5 个目标、坐标口径、长度要求，不让它磨叽。
+    所以这里刻意写得短：只列目标、坐标口径、长度要求，不让它磨叽。
+
+    2026-10-29 两处加强（用户反馈）：
+    ① 元素覆盖：原来的 5 类（背景/全身/上装/下装/头部）会漏掉表情、手部姿势、
+       脚与鞋、配饰与手持道具 —— 这些在 MOSS 按框重绘时各自是独立区域，漏一个就重绘不到。
+       现在列 8 类并要求「只框实际存在的」，头部框强制写清表情。
+    ② 框的宽高比：bbox 的 x/y 是各自独立归一化到 0-1000 的，不是正方形网格。
+       模型常按 1:1 的直觉给框，在 9:16 竖图上就会横向拉太宽、纵向压太扁。
+       这里把真实像素尺寸和换算关系显式写进去，并加跨度上限（除背景层不超 90%）。
     """
-    return (
-        "Output a JSON array with exactly 5 entries, largest region first: "
-        "background scenery, whole character, upper clothing, lower clothing, "
-        "head details (hat/hair/face).\n"
-        "box coordinates 0-1000, each box tight around that element only. "
-        "Each desc: 60-120 English words describing only what is inside that box.\n"
-        # 这一句是全部提理的钥匙：不加它模型会在 thinking 里反复横跳争辨，
-        # 同一张图同一个问额：96.7s / 4096tok（顶满被截断，零结果）
-        #                     → 39.7s / 1741tok（完整 5 框）。快 2.4 倍。
-        "Do not deliberate: decide each box in one sentence of reasoning, then write. JSON only:\n"
-        '[{"type":"obj","bbox":[x1,y1,x2,y2],"desc":"..."}, ...]'
-    )
-
-
-# ============ LFM3 CUDA Graph 加速 ============
-# 为什么值得：LFM3 decode 每 token 要发 ~950 个 kernel，profiler 实测 CPU 437ms / CUDA 61ms
-# —— 88% 时间在等 Python 派发。把整步抓成一张 CUDA Graph 后实测 2.1x
-# （同图同 prompt：生产 55.6s / 31.3 tok/s → graph 26.2s / 87.8 tok/s，5 框、eos 正常）。
-#
-# 集成前必须踩过三个坑（都有实测依据）：
-# ① StaticCache 把 sliding_attention 映射成 StaticSlidingWindowLayer，KV 宽只有 256；
-#    写满后走 roll 分支，里面有 torch.tensor([-1], device='cuda') —— capture 期做 pageable H2D，
-#    非法。→ 强制映射成 StaticLayer（全长 cache），滑动窗口改由静态 mask 内容实现，模型行为不变。
-# ② cudaMallocAsync（ComfyUI 的 --cuda-malloc）下 capture 私有池地址在首次 replay 前是
-#    "已保留未映射"，Triton launcher 的 cuPointerGetAttribute 返回 INVALID_VALUE →
-#    ValueError: Pointer argument cannot be accessed from Triton。
-#    → 把 LFM3 的 Triton decode 卷积改成"裸 int 指针直通 CompiledKernel.run"（PyLong 不查指针）。
-#    ⚠ 注意：必须 patch 到 modeling_lfm3 真正持有的那个函数对象。modeling_lfm3 用的是
-#      `from .lfm3_conv import lfm3_causal_conv1d_update`，绑定的是引用，
-#      改 lfm3_conv 模块属性或另用 spec_from_file_location 载入副本都无效（会静默继续走 Triton）。
-# ③ 一次中途失败的 capture 会让进程在释放池显存时 terminate()，try/except 兜不住。
-#    所以先起子进程探针；探针不通就整体不启用 graph，回退 model.generate。
-_LFM3_GRAPH_VERDICT = {}  # model_path -> (bool 可用, str 说明)
-_LFM3_GRAPH_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_lfm3_graph_probe.py")
-
+    L = []
+    L.append("Output a JSON array, largest region first. Boxes are REGION-LEVEL only: one "
+              "box per subject or large region. NEVER create a separate box for an eye, "
+              "a hand, a foot, a hair strand or a single accessory \u2014 those belong to the "
+              "character or head box and must be described inside its desc.")
+    L.append("Region targets (skip the ones that are absent): "
+              "1 background scenery, 2 whole character (full body), "
+              "3 head region (hair + face), "
+              "4 upper clothing region, 5 lower clothing region.")
+    L.append("Inside the desc of each box, ALWAYS describe: facial expression (eyes, brows, "
+              "mouth, blush, tears, emotion word), hand pose and what the hands hold, "
+              "feet and footwear, accessories (hair ornaments, jewelry, belts) and held props.")
+    if w and h:
+        L.append(f"This image is {w}x{h} pixels, aspect {w}:{h}. bbox x and y are "
+                  f"normalized INDEPENDENTLY: x 0-1000 spans the full WIDTH ({w}px), "
+                  f"y 0-1000 spans the full HEIGHT ({h}px). So an element that is really "
+                  f"square gets a box whose x-span:y-span is about {h}:{w}, not 1:1 — do "
+                  f"that conversion for every box.")
+        L.append("Every box must stay inside 0-1000 and hug the real element; except the "
+                  "background layer, no box may exceed 90% of the width or 90% of the height.")
+    else:
+        L.append("bbox x and y are normalized INDEPENDENTLY to 0-1000 (x=width, y=height), "
+                  "so each box aspect must match how the element really looks on this "
+                  "canvas, not a square guess. Except the background layer, no box may "
+                  "exceed 90% of the width or 90% of the height.")
+    L.append("Each desc: 55-100 English words describing only what is inside that box; "
+              "on any box containing the face or the character, name the expression "
+              "explicitly (never leave it implicit).")
+    # 这一句是全部提速的钥匙：不加它模型会在 thinking 里反复横跳争辨，
+    # 同一张图同一个问题：96.7s / 4096tok（顶满被截断，零结果）
+    #                   → 39.7s / 1741tok（完整 5 框）。快 2.4 倍。
+    L.append("Do not deliberate: decide each box in one sentence of reasoning, then write. "
+              "JSON only:")
+    L.append(chr(91) + chr(123) + chr(34) + "type" + chr(34) + ":" + chr(34) + "obj" + chr(34)
+              + "," + chr(34) + "bbox" + chr(34) + ":[" "x1,y1,x2,y2" "]," + chr(34) + "desc" + chr(34)
+              + ":" + chr(34) + "..." + chr(34) + chr(125) + ", ..." + chr(93))
+    return NL.join(L)
 
 def _lfm3_install_raw_conv(model):
     """把 LFM3 的 Triton decode 卷积换成裸 int 指针直通（幂等）。
@@ -391,6 +402,14 @@ def _lfm3_install_raw_conv(model):
     mod.lfm3_causal_conv1d_update = raw_update
     real._ar_raw_conv = True
     return True
+
+
+# ============ LFM3 CUDA Graph 加速 ============
+# 为什么值得：LFM3 decode 每 token 要发 ~950 个 kernel，profiler 实测 CPU 437ms / CUDA 61ms
+# —— 88% 时间在等 Python 派发。把整步抓成一张 CUDA Graph 后实测 2.1x
+# （同图同 prompt：生产 55.6s / 31.3 tok/s → graph 26.2s / 87.8 tok/s，5 框、eos 正常）。
+_LFM3_GRAPH_VERDICT = {}  # model_path -> (bool 可用, str 说明)
+_LFM3_GRAPH_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_lfm3_graph_probe.py")
 
 
 def _lfm3_probe_graph(model_path, timeout_s=240):
@@ -1539,6 +1558,7 @@ _LAYOUT_RULE_DEFAULT = (
     '- 大物体：只框占据画面显著位置的（家具、大型道具、明显前景物）。\n'
     '- 对画面重要的整块背景环境（天空、街道、房间、荒野）可以给一个覆盖它的 obj 框，放最底层；但背景光斑、装饰星星、纹理不算。\n'
     '- 只框图里真实看得见的东西，不要编造图上不存在的元素。\n'
+    '- 除背景层外，单个框的最大跨度不要超过画面宽/高的 90%：超过就说明你在框背景而不是框元素。\n'
     '- 禁止建框：发丝、眼睛、单件饰品、衣褶、背景光斑、装饰星星、纹理、细小图案、logo 细节。\n'
     '- 禁止建框（任何情况下，包括 type=text）：水印、画师/作者署名、AI 生成声明（如 AI-generated、禁止AI使用）、版权与商用声明、网址链接、logo、签名等非画面内容文字——一律当作不存在：不建框、不输出、不描述。\n'
     '\n'
@@ -1546,6 +1566,10 @@ _LAYOUT_RULE_DEFAULT = (
     '- 归一化 0~1000 的整数，顺序是 [左, 上, 右, 下]，也就是 xmin, ymin, xmax, ymax。\n'
     '- 例：[0, 0, 1000, 1000] 是整张图；[0, 0, 1000, 500] 是画面上半部分整宽；[570, 266, 797, 500] 是画面中间偏右下的一块。\n'
     '- 必须 xmin < xmax 且 ymin < ymax；四个值都是纯数字，不加引号、不写成字符串。\n'
+    '- bbox 的 x 和 y 是**各自独立**归一化的：x 的 0~1000 对应整幅画面的宽，y 的 0~1000 对应整幅画面的高。\n'
+    '- 所以框的宽高比必须按画面真实比例换算，不能凭"正方形"直觉给：一张 9:16 的竖图里，画面中真正正方形的物体，它的框应该是横向窄、纵向宽（x 跨度远小于 y 跨度）。\n'
+    '- 具体做法：先估出元素占画面宽的百分之几、占画面高的百分之几，再各自换算成 0~1000 的整数；不要直接把"看起来的宽高比"同时填进两个方向。\n'
+    '- 除覆盖整块的背景层之外，任何框的宽跨度或高跨度都不要超过 900（画面的 90%），避免一个大框吞掉整幅画面、其他元素反而没被覆盖。\n'
     '\n'
     '# 输出（直接喂给「创建边界框」节点，字段必须严格照它的规则）\n'
     '只输出一个 JSON 数组。不要 markdown 代码块，不要解释，不要任何前后缀文字。\n'
@@ -1565,7 +1589,11 @@ _LAYOUT_RULE_DEFAULT = (
     '  · 主体身份与外观（物种/性别/年龄段）、发型发色的长度与质感、有无角/耳/尾等特征；\n'
     '  · 服装的层数、材质、剪裁、颜色、配饰，要具体（例如 layered white ceremonial robes with wide draping sleeves）；\n'
     '  · 姿势：手在哪、身体朝向哪边、头转向哪里、视线看向哪里、重心落在哪只脚；\n'
-    '  · 表情、与镜头的距离和景别（close-up / upper body / half body / full body）；\n'
+    '  · 表情必须写死：眼睛/眼睑/瞳孔反应、眉毛走向、嘴型（是否张开、有无牙齿舌头）、脸红、泪痕、汗滴、情绪词（smile / grin / smirk / pout / blush / tears / angry / surprised / sleepy / expressionless 等）——这一项漏写是最常见的重绘失败原因；\n'
+    '  · 手部：手指数量与姿态（张开/握拳/竖起/比心/扶帽檐/撩头发）、手臂弯曲方向、手里拿的东西；\n'
+    '  · 脚部：是否可见、鞋/袜/靴的款式与颜色、站姿或坐姿时脚的朝向；\n'
+    '  · 配饰与道具：发饰、耳饰、颈饰、腰带、链条、戒臂、武器、乐器、花束等，写明材质与颜色；\n'
+    '  · 与镜头的距离和景别（close-up / upper body / half body / full body）；\n'
     '  · 拍摄视角与主体朝向：判断画面是俯拍（high-angle / bird\'s-eye）、仰拍（low-angle / worm\'s-eye）还是平视（eye-level）；主体相对镜头是正面（front view）、四分之三侧面（three-quarter view）、正侧面（side profile）还是背面（view from behind）；画面整体倾斜时写荷兰角（dutch angle）；有明显广角畸变或长焦压缩也写出来。这些镜头语言直接决定重绘的视角，必须准。\n'
     '  · 该区域的光线与明暗、天气或氛围（如果有）。\n'
     '- 知道角色是谁就写名字和出处，例如 shu (arknights)；不确定就只描述外观，不要编造名字。\n'
@@ -1921,7 +1949,7 @@ class ReverseLayoutCaption:
                 # LFM3：内置精简提示（长规则它跟不上），开 thinking 走“从大到小逐元素推理”。
                 # 不拼画廊 tag：实测塞 tag 会让 2B 的思考量从 ~2.3k 涨到满 4k 还出不来答案；
                 # 它自己看图完全够（标签反而让它纠结）。
-                content = _lfm3_prompt()
+                content = _lfm3_prompt(pil.width, pil.height)
                 messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": content}]}]
                 chat = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
                                                     enable_thinking=True)
