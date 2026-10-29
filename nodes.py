@@ -434,10 +434,13 @@ def _lfm3_graph_generate(model, processor, inputs, max_new_tokens, stopper=None)
     device = inputs["input_ids"].device
     PL = int(inputs["input_ids"].shape[1])
     need = PL + int(max_new_tokens) + 64
-    # 容量上限压到 3072：StaticCache 的 full attention 层每步要对整个容量算一遍，
-    # 容量就是唯一的成本开关（实测同 prompt：8192→35.6、4608→55.8、3072→87.8、2560→83.8）。
-    # 实测真实输出 1021~2305 tok，PL+2305≈2706，3072 够用；真超了由 max_new_tokens 硬顶截断兜底。
-    maxlen = max(2048, min(3072, ((need + 511) // 512) * 512))
+    # 容量就是唯一的成本开关：StaticCache 的 full attention 层每步都要对整个容量算一遍
+    # （实测同 prompt：8192→35.6 tok/s、4608→55.8、3072→87.8、2560→83.8）。
+    # 默认 3072 换速度，但**不能压过用户给的输出预算**：LFM3 的 thinking 偶尔会飙到 2600+ tok
+    # （实测 1968x2952 那张图撞上限 → 整段输出全是思考、一个 JSON 都没有），
+    # 所以按 max_new_tokens 给足，只在显存/速度上封顶 4096。
+    # → 4096 时约慢 20%，但换来「不静默出废布局」。
+    maxlen = max(3072, min(4096, ((need + 511) // 512) * 512))
     neg, win = float("-inf"), int(getattr(tc, "sliding_window", 256) or 256)
 
     STATIC_LAYER_TYPE_MAPPING["sliding_attention"] = StaticLayer
@@ -537,8 +540,10 @@ def _lfm3_graph_generate(model, processor, inputs, max_new_tokens, stopper=None)
         s_ids.copy_(nxt)
 
     out_ids = torch.tensor([toks], dtype=torch.long, device=device)
-    note = f"CUDA Graph(maxlen {maxlen}, 步进 {len(toks) - 1})"
-    return out_ids, note
+    steps = len(toks) - 1
+    truncated = steps >= limit - 1 and last != eos
+    note = f"CUDA Graph(maxlen {maxlen}, 步进 {steps})"
+    return out_ids, note, truncated
 
 
 def _parse_json_array(txt):
@@ -2003,8 +2008,16 @@ class ReverseLayoutCaption:
                     graph_note = ""
                     if graph_ok:
                         try:
-                            out_ids, graph_note = _lfm3_graph_generate(
+                            out_ids, graph_note, g_trunc = _lfm3_graph_generate(
                                 model, processor, inputs, toks, stopper)
+                            # 撞容量上限 = 整段输出可能全是 thinking（实测有单输出 9375 字符、
+                            # 一个 JSON 都没有 → 下游拿到空布局）。这次用满 4096 再跑一遍。
+                            if g_trunc and toks < 4096:
+                                print(f"[AssembledRecipes] ⚠ 输出撞容量上限（{graph_note}），"
+                                      f"用 4096 预算重跑一次", flush=True)
+                                out_ids, graph_note, g_trunc = _lfm3_graph_generate(
+                                    model, processor, inputs, 4096, stopper)
+                                graph_note += " +扩容重试"
                         except Exception as ge:
                             # 注意：capture 失败会直接杀进程（探针就是为了提前排掉这种），
                             # 能到这里的是 replay 阶段的普通异常，回退 generate 是安全的。
