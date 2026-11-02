@@ -1248,7 +1248,9 @@ class ReverseJsonSanitize:
     2) 修复字符串字面量里的裸控制字符（换行/回车/制表转义）；
     3) 截断则回退到最后一个完整元素（字符串感知扫描）再闭合；
     4) 逐元素校验：bbox 统一转 4 个 0~1000 整数（字符串形式自动拆），非法元素丢弃；
-    5) 全军覆没时输出 []（退回普通文生图，不炸链路）。
+    5) 同坐标重复框去重：模型凑框数上限时会把同一背景框/同一主体局部框写两遍，
+       重复框会让下游布局提示词重复强调同一区域，同坐标只留 desc 最长的那条；
+    6) 全军覆没时输出 []（退回普通文生图，不炸链路）。
     """
 
     @classmethod
@@ -1513,7 +1515,24 @@ class ReverseJsonSanitize:
                 out.append(item)
         elif data is None:
             report.append("未解析出布局，输出空布局")
+        # 同坐标去重：模型常在 10 框上限边缘凑数（同一背景框写两遍、同一主体局部框写两遍），
+        # 重复框会让布局提示词里同一区域被强调多次，画面被拉向重复构图。同坐标只留 desc 最详细的那个。
+        msg_dup = 0
+        if out:
+            uniq, index = [], {}
+            for it in out:
+                key = (it["type"], tuple(it["bbox"]), it.get("text"))
+                pos = index.get(key)
+                if pos is None:
+                    index[key] = len(uniq)
+                    uniq.append(it)
+                elif len(it["desc"]) > len(uniq[pos]["desc"]):
+                    uniq[pos]["desc"] = it["desc"]
+            msg_dup = len(out) - len(uniq)
+            out = uniq
         msg = f"保留 {len(out)} 个框"
+        if msg_dup:
+            msg += f"，去重 {msg_dup} 个同坐标框"
         if dropped:
             msg += f"，丢弃 {dropped} 个坏元素"
         if meta_dropped:
