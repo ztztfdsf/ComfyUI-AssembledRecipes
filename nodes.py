@@ -827,7 +827,7 @@ class RecipeSaveAssembled:
     RETURN_NAMES = ("image",)
     FUNCTION = "snapshot"
     CATEGORY = "AssembledRecipes"
-    DESCRIPTION = "生成结束后把已拼装(含 LoRA)的权重存成配方。名字留空=按 LoRA 组合自动命名。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
+    DESCRIPTION = "生成结束后把已拼装(含 LoRA)的权重存成配方。名字留空=按 核心+LoRA 组合自动命名（核心编进名字，多核心不撞名）。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
     def snapshot(self, model, image, recipe_name, note="", lora_info=None):
         # 单/无 LoRA 没有融合成本，存 5.4G 配方纯浪费——直接跳过（lora_info 未接线时维持旧行为）
@@ -836,10 +836,30 @@ class RecipeSaveAssembled:
             if len(_active) < 2:
                 print(f"[AssembledRecipes] 激活 LoRA {len(_active)} 个（<2 无融合成本），不存配方")
                 return (image,)
+        # 源文件路径（loaders 会把来源记在 cached_patcher_init）——自动命名要编入核心名，先取
+        src_path = None
+        ci = getattr(model, "cached_patcher_init", None)
+        if ci and len(ci) > 1 and ci[1]:
+            cand = ci[1][0]
+            if isinstance(cand, str) and os.path.exists(cand):
+                src_path = cand
+
+        def _core_label():
+            # 多核心（base/heal/…）下只按 LoRA 组合命名会跨核心撞名 → 配方永远存不进，
+            # 核心名（去前后缀）编进自动命名，多核心各存各的
+            stem = os.path.splitext(os.path.basename(src_path or ""))[0]
+            for pre in ("moss_image_", "moss-image-", "mossImage_"):
+                if stem.startswith(pre):
+                    stem = stem[len(pre):]
+            for tail in ("_int8_convrot", "-int8-convrot", "_bf16", "_fp16"):
+                if stem.endswith(tail):
+                    stem = stem[:-len(tail)]
+            return _sanitize(stem or "core")
+
         if not (recipe_name or "").strip():
             entries = _parse_lora_info(lora_info or "")
             if entries:
-                recipe_name = "auto_" + "+".join(
+                recipe_name = "auto_" + _core_label() + "__" + "+".join(
                     _sanitize(n.split("/")[-1].replace(".safetensors", ""))
                     + ("@" + _fmt_strength(s) if s not in (None, "") else "")
                     for n, s in entries)
@@ -860,14 +880,6 @@ class RecipeSaveAssembled:
 
         import safetensors.torch
         from safetensors import safe_open
-
-        # 源文件路径（loaders 会把来源记在 cached_patcher_init）
-        src_path = None
-        ci = getattr(model, "cached_patcher_init", None)
-        if ci and len(ci) > 1 and ci[1]:
-            cand = ci[1][0]
-            if isinstance(cand, str) and os.path.exists(cand):
-                src_path = cand
 
         if src_path:
             # 全量镜像源文件（保留 comfy_quant / comfy_attention.config 等元数据张量），
