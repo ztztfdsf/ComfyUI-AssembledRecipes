@@ -1,14 +1,18 @@
-"""Assembled model recipe cache for ComfyUI.
+"""显存治理 + 布局反推 节点集 for ComfyUI.
 
-拼装一次，落盘成配方；下次直读配方，跳过 LoRA 拼装。
-- RecipeSave: 生成结束后把「已拼装权重」快照存盘（同名已存在则跳过）
-- RecipeGallery: 画布点选配方直读（不选=走兜底 LoRA 链）；配方删除=彻底硬删
 - StreamToggle: MODEL 直通，可选逐层流水（省显存、防换页）
 - DeepClean/FreeVram/VramModeFix: 显存治理（卸载/清池/策略纠正）
-- ReverseJsonSanitize/ReverseLayoutCaption/BlankToNone: 布局反推链容错
+- ReverseJsonSanitize/ReverseLayoutCaption: 布局反推链（VLM 反推 MOSS 布局 JSON + 容错清洗）
+- BlankToNone: 空串 → None，供 Any Switch 之类正确回落
 
-【防鬼图】aimdo 动态加载下 LoRA 会烤进常驻权重，还原靠 patcher.backup；
-DeepClean 的 drop_patch_backups 已强制禁用（丢备份=烤入永久化）。
+【已废弃】配方缓存（RecipeSave / RecipeGallery / /assembled-recipes 路由）
+  2026-11-14 实证：aimdo 动态加载下 LoRA 是每次 forward 现算的惰性补丁
+  （ModelPatcherDynamic.setup_param 挂 LowVramPatch），从不写进 module 参数，
+  所以 model.state_dict() 快照永远是裸基座（与基座整文件 SHA256 完全一致），
+  直读它等于把 LoRA 全部丢掉；而它想省的合并开销实测不到 1 秒（21.5s vs 20.85s，
+  落在噪声内），显存也零差别。属于解决不存在问题的方案，整体移除。
+  想把固定组合固化：UNETLoader → LoRA Loader ×N → ModelSave 直接烤成成品底模即可。
+
 所有节点带 [AR⏱] 计时插桩。
 """
 
@@ -23,9 +27,6 @@ import torch
 import folder_paths
 import comfy.sd
 from comfy import model_management
-
-RECIPES_DIR = os.path.join(folder_paths.models_dir, "assembled_recipes")
-os.makedirs(RECIPES_DIR, exist_ok=True)
 
 STREAM_RESIDENT_BYTES = 0.1  # 驻留预算≈0 → 全流水
 
@@ -629,42 +630,6 @@ def _timed(tag):
         def __exit__(self, *a):
             print(f"[AR⏱] {tag} {(time.perf_counter() - self.t0) * 1000:.0f}ms", flush=True)
     return _T()
-
-
-def recipe_files():
-    return sorted(
-        f for f in os.listdir(RECIPES_DIR)
-        if f.endswith(".safetensors") and os.path.isfile(os.path.join(RECIPES_DIR, f))
-    )
-
-
-def _sanitize(name: str) -> str:
-    name = (name or "").strip()
-    for ch in '\\/:*?"<>|':
-        name = name.replace(ch, "_")
-    return name or f"recipe_{int(time.time())}"
-
-
-def _load_any(path):
-    """优先原生加载；失败回退 moss-image 插件加载器（拆分 qkv 量化配方）。"""
-    try:
-        return comfy.sd.load_diffusion_model(path)
-    except Exception:
-        moss = os.path.join(folder_paths.base_path, "custom_nodes", "moss-image", "loaders.py")
-        if not os.path.exists(moss):
-            raise
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("moss_image_loaders", moss)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["moss_image_loaders"] = mod
-        spec.loader.exec_module(mod)
-        return mod.load_model(path, "default")
-
-
-def enable_streaming(patcher):
-    """实例级绑定：强制逐层流水（不动核心类，只包我们自己的实例）。"""
-    orig = patcher.partially_load
-
     def partially_load(self_or_none=None, device=None, extra_memory=None, force_patch_weights=False, **kw):
         # 兼容绑定/未绑定调用
         dev = device if device is not None else getattr(patcher, "load_device", None)
@@ -751,51 +716,6 @@ def _find_lora_preview(lora_name):
         if p:
             return p
     return None
-
-
-def _compose_lora_preview(lora_entries, height=300):
-    """把组合里每个 LoRA 的预览图横排合成一张，图上写 LoRA 名。"""
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-    except Exception:
-        return None
-    tiles = []
-    for name, strength in lora_entries:
-        p = _find_lora_preview(name)
-        if not p:
-            continue
-        try:
-            im = Image.open(p).convert("RGB")
-        except Exception:
-            continue
-        w = max(1, int(im.width * height / max(1, im.height)))
-        tiles.append((im.resize((w, height)), f"{os.path.basename(name)} :{strength}"))
-    if not tiles:
-        return None
-    total_w = min(sum(t[0].width for t in tiles), 2400)
-    canvas = Image.new("RGB", (max(total_w, 64), height + 26), (24, 24, 24))
-    draw = ImageDraw.Draw(canvas)
-    font = None
-    for fp in ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/arial.ttf"):
-        try:
-            font = ImageFont.truetype(fp, 18)
-            break
-        except Exception:
-            continue
-    if font is None:
-        font = ImageFont.load_default()
-    x = 0
-    for im, label in tiles:
-        if x + im.width > canvas.width:
-            im = im.crop((0, 0, max(1, canvas.width - x), im.height))
-        canvas.paste(im, (x, 0))
-        draw.text((x + 6, height + 3), label, fill=(255, 255, 255), font=font)
-        x += im.width
-        if x >= canvas.width:
-            break
-    return canvas
-
-
 def _save_thumb(img_obj, path, size=(320, 320)):
     try:
         im = img_obj.copy()
@@ -805,129 +725,6 @@ def _save_thumb(img_obj, path, size=(320, 320)):
     except Exception as e:
         print(f"[AssembledRecipes] 缩略图保存失败: {e}")
         return False
-
-class RecipeSaveAssembled:
-    """生成链尾部快照：把当前已拼装（含 LoRA 补丁）的权重存成配方。"""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "image": ("IMAGE",),
-                "recipe_name": ("STRING", {"default": "my_recipe", "multiline": False}),
-                "note": ("STRING", {"default": "", "multiline": True}),
-            },
-            "optional": {
-                "lora_info": ("STRING", {"forceInput": True}),
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
-    FUNCTION = "snapshot"
-    CATEGORY = "AssembledRecipes"
-    DESCRIPTION = "生成结束后把已拼装(含 LoRA)的权重存成配方。名字留空=按 核心+LoRA 组合自动命名（核心编进名字，多核心不撞名）。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
-
-    def snapshot(self, model, image, recipe_name, note="", lora_info=None):
-        # 单/无 LoRA 没有融合成本，存 5.4G 配方纯浪费——直接跳过（lora_info 未接线时维持旧行为）
-        if lora_info is not None:
-            _active = _parse_lora_info(lora_info or "")
-            if len(_active) < 2:
-                print(f"[AssembledRecipes] 激活 LoRA {len(_active)} 个（<2 无融合成本），不存配方")
-                return (image,)
-        # 源文件路径（loaders 会把来源记在 cached_patcher_init）——自动命名要编入核心名，先取
-        src_path = None
-        ci = getattr(model, "cached_patcher_init", None)
-        if ci and len(ci) > 1 and ci[1]:
-            cand = ci[1][0]
-            if isinstance(cand, str) and os.path.exists(cand):
-                src_path = cand
-
-        def _core_label():
-            # 多核心（base/heal/…）下只按 LoRA 组合命名会跨核心撞名 → 配方永远存不进，
-            # 核心名（去前后缀）编进自动命名，多核心各存各的
-            stem = os.path.splitext(os.path.basename(src_path or ""))[0]
-            for pre in ("moss_image_", "moss-image-", "mossImage_"):
-                if stem.startswith(pre):
-                    stem = stem[len(pre):]
-            for tail in ("_int8_convrot", "-int8-convrot", "_bf16", "_fp16"):
-                if stem.endswith(tail):
-                    stem = stem[:-len(tail)]
-            return _sanitize(stem or "core")
-
-        if not (recipe_name or "").strip():
-            entries = _parse_lora_info(lora_info or "")
-            if entries:
-                recipe_name = "auto_" + _core_label() + "__" + "+".join(
-                    _sanitize(n.split("/")[-1].replace(".safetensors", ""))
-                    + ("@" + _fmt_strength(s) if s not in (None, "") else "")
-                    for n, s in entries)
-                print(f"[AssembledRecipes] 自动命名: {recipe_name}")
-            else:
-                print("[AssembledRecipes] 名字为空且无 LoRA 信息，跳过快照")
-                return (image,)
-        name = _sanitize(recipe_name)
-        path = os.path.join(RECIPES_DIR, name + ".safetensors")
-        if os.path.exists(path):
-            print(f"[AssembledRecipes] 同名同配置已存过，跳过快照: {name}")
-            return (image,)
-
-        base = model.model if hasattr(model, "model") else model
-        with _timed("RecipeSave.state_dict→CPU"):
-            merged = {k.replace("diffusion_model.", "", 1): v.detach().to("cpu").contiguous()
-                      for k, v in base.state_dict().items()}
-
-        import safetensors.torch
-        from safetensors import safe_open
-
-        if src_path:
-            # 全量镜像源文件（保留 comfy_quant / comfy_attention.config 等元数据张量），
-            # 被 LoRA 改过的权重用合并值覆盖
-            with safe_open(src_path, framework="pt") as f:
-                out = {}
-                for k in f.keys():
-                    out[k] = merged[k] if k in merged else f.get_tensor(k)
-                with _timed("RecipeSave.写盘5.4GB"):
-                    safetensors.torch.save_file(out, path, metadata=f.metadata())
-            print(f"[AssembledRecipes] 配方(全量镜像)已保存: {name} "
-                  f"({os.path.getsize(path):,} B, 源={os.path.basename(src_path)})")
-        else:
-            safetensors.torch.save_file(merged, path)
-            print(f"[AssembledRecipes] 配方(纯权重,无源文件)已保存: {name} ({os.path.getsize(path):,} B)")
-
-        meta = {
-            "name": name,
-            "note": note or "",
-            "lora_info": lora_info or "",
-            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "tensors": len(merged),
-            "bytes": os.path.getsize(path),
-            "source": os.path.basename(src_path) if src_path else "",
-        }
-        with open(os.path.join(RECIPES_DIR, name + ".json"), "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=1)
-
-        # 封面：优先 LoRA 预览合成图（图上写 LoRA 名），否则退回生成图缩略
-        preview_path = os.path.join(RECIPES_DIR, name + ".preview.jpg")
-        entries = _parse_lora_info(lora_info or "")
-        composed = _compose_lora_preview(entries) if entries else None
-        if composed is not None:
-            _save_thumb(composed, preview_path, size=(720, 720))
-            print(f"[AssembledRecipes] 封面=LoRA 合成图 ({len(entries)} 个)")
-        else:
-            try:
-                from PIL import Image
-                import numpy as np
-                arr = image[0].detach().to("cpu").numpy()
-                arr = (np.clip(arr, 0, 1) * 255).astype("uint8")
-                _save_thumb(Image.fromarray(arr), preview_path)
-                print("[AssembledRecipes] 封面=生成图缩略")
-            except Exception as e:
-                print(f"[AssembledRecipes] 封面生成失败(不影响配方): {e}")
-        return (image,)
-
-
 class StreamToggle:
     """MODEL 直通 + 逐层流水开关（给正常 LoRA 链路用）。"""
 
@@ -951,60 +748,6 @@ class StreamToggle:
             if streaming:
                 model = enable_streaming(model)
         return (model,)
-
-
-
-
-
-class RecipeGallery:
-    """画廊点选配方；没选就走惰性兜底 model（不选=零额外开销）。"""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "selected_recipe": ("STRING", {"default": "", "tooltip": "画布上点卡片自动填；留空=走兜底 model(正常 LoRA 链路)"}),
-                "streaming": ("BOOLEAN", {"default": False}),
-            },
-            "optional": {
-                "model": ("MODEL", {"lazy": True, "tooltip": "兜底分支：只有没选配方时才会执行"}),
-            },
-        }
-
-    RETURN_TYPES = ("MODEL", "STRING")
-    RETURN_NAMES = ("model", "used_recipe")
-    FUNCTION = "load"
-    CATEGORY = "AssembledRecipes"
-    DESCRIPTION = "画布瀑布流点选配方直读(跳过拼装)；不选则走兜底 model 分支。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
-
-    @staticmethod
-    def _resolve(selected_recipe):
-        key = (selected_recipe or "").strip()
-        if not key:
-            return None
-        fname = key if key.endswith(".safetensors") else key + ".safetensors"
-        path = os.path.join(RECIPES_DIR, fname)
-        return path if os.path.exists(path) else None
-
-    def check_lazy_status(self, selected_recipe="", streaming=False, model=None):
-        return [] if self._resolve(selected_recipe) else ["model"]
-
-    def load(self, selected_recipe="", streaming=False, model=None):
-        with _timed("RecipeGallery"):
-            path = self._resolve(selected_recipe)
-            if path:
-                patcher = _load_any(path)
-                if streaming:
-                    patcher = enable_streaming(patcher)
-                print(f"[AssembledRecipes] 画廊直读配方（跳过拼装）: {os.path.basename(path)}")
-                return (patcher, os.path.basename(path))
-            if model is None:
-                raise ValueError("【AssembledRecipes】没选配方，且兜底 model 输入是空的——请把 LoRA 输出接到本节点的 model 输入")
-            print("[AssembledRecipes] 画廊未选配方 → 走兜底 model 分支")
-            return (model, "")
-
-
-
 class DeepClean:
     """深度清理：卸载模型权重到内存 + 强制把显存缓存池还给驱动。
 
@@ -2205,9 +1948,7 @@ class BlankToNone:
         return (None,)
 
 NODE_CLASS_MAPPINGS = {
-    "RecipeSave (AssembledRecipes)": RecipeSaveAssembled,
     "StreamToggle (AssembledRecipes)": StreamToggle,
-    "RecipeGallery (AssembledRecipes)": RecipeGallery,
     "DeepClean (AssembledRecipes)": DeepClean,
     "FreeVram (AssembledRecipes)": FreeVram,
     "VramModeFix (AssembledRecipes)": VramModeFix,
@@ -2216,14 +1957,11 @@ NODE_CLASS_MAPPINGS = {
     "BlankToNone (AssembledRecipes)": BlankToNone,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "RecipeSave (AssembledRecipes)": "配方保存",
-    "RecipeLoad (AssembledRecipes)": "配方·直读加载",
-    "RecipeGallery (AssembledRecipes)": "配方·画廊选择",
-    "StreamToggle (AssembledRecipes)": "配方·逐层流水开关",
-    "DeepClean (AssembledRecipes)": "配方·深度清理",
-    "FreeVram (AssembledRecipes)": "配方·踢编码器回内存",
-    "VramModeFix (AssembledRecipes)": "配方·显存策略纠正",
-    "ReverseJsonSanitize (AssembledRecipes)": "配方·反推JSON清洗",
-    "ReverseLayoutCaption (AssembledRecipes)": "配方·布局反推",
+    "StreamToggle (AssembledRecipes)": "逐层流水开关",
+    "DeepClean (AssembledRecipes)": "深度清理",
+    "FreeVram (AssembledRecipes)": "踢编码器回内存",
+    "VramModeFix (AssembledRecipes)": "显存策略纠正",
+    "ReverseJsonSanitize (AssembledRecipes)": "反推JSON清洗",
+    "ReverseLayoutCaption (AssembledRecipes)": "布局反推",
     "BlankToNone (AssembledRecipes)": "配方·空串转无",
 }
