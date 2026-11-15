@@ -5,11 +5,10 @@
  * 原生 widget 从 node.widgets 摘除（视觉完全接管），值仍通过
  * serialize 钩子按原顺序写回 widgets_values —— 工作流保存 / 队列执行不受影响。
  *
- * 面板结构（间距宽松，分区卡片）：
+ * 面板结构（分区卡片）：
  *   顶栏   provider 分段 + 状态灯
- *   输入区 用户提示词（多行）
  *   本地页 模型 / 量化 / rule / 生成长度 / batch_index / 清场开关 / 标签模式
- *   云端页 账号卡（绑定 / 测试）+ 结果框可视化
+ *   云端页 账号卡（绑定 / 测试）
  *   端点页 地址 / 密钥 / 模型 / 思考开关
  */
 import { app } from "../../scripts/app.js";
@@ -49,6 +48,10 @@ const CSS = `
 .ar-seg button:hover:not(.on) { background: rgba(255,255,255,.07); }
 
 /* 分区卡片 */
+details.ar-card>summary { list-style: none; }
+details.ar-card>summary::-webkit-details-marker { display: none; }
+details.ar-card[open]>summary { margin-bottom: 6px; }
+
 .ar-card { border: 1px solid rgba(255,255,255,.09); border-radius: 10px;
   background: rgba(255,255,255,.025); padding: 12px 14px; display: flex;
   flex-direction: column; gap: 10px; }
@@ -92,20 +95,6 @@ const CSS = `
 .ar-status { font-size: 11.5px; min-height: 16px; word-break: break-all; opacity: .9; }
 .ar-status.ok { color: #7bd88a; }
 .ar-status.err { color: #ff7373; }
-
-/* 结果预览 */
-.ar-prev { position: relative; border: 1px solid rgba(255,255,255,.1); border-radius: 10px;
-  overflow: hidden; background: #101014; min-height: 110px;
-  display: flex; align-items: center; justify-content: center; }
-.ar-prev img { width: 100%; max-height: 240px; object-fit: contain; display: block; }
-.ar-prev .empty { font-size: 11.5px; opacity: .4; padding: 26px 12px; text-align: center; }
-.ar-boxes { position: absolute; inset: 0; pointer-events: none; }
-.ar-box { position: absolute; border: 1.5px solid #4a9ff0; background: rgba(74,159,240,.09);
-  box-shadow: 0 0 0 1px rgba(0,0,0,.4); }
-.ar-box .n { position: absolute; top: -1px; left: -1px; background: #4a9ff0; color: #fff;
-  font: 9px system-ui; padding: 1px 5px; border-radius: 0 0 5px 0; }
-.ar-meta { display: flex; gap: 16px; font-size: 11px; opacity: .7; flex-wrap: wrap; }
-.ar-meta b { opacity: 1; color: var(--fg-color, #eee); }
 
 .ar-page { display: flex; flex-direction: column; gap: 12px; }
 .ar-page.hidden { display: none; }
@@ -357,76 +346,6 @@ function apiUrl(item) {
 	return "/view?" + p.toString();
 }
 
-function renderPreview(ui) {
-	const st = stateFor(ui.node);
-	const holder = ui.preview;
-	holder.innerHTML = "";
-	const result = st.lastResult;
-	if (!result || !Array.isArray(result.boxes) || !result.boxes.length) {
-		holder.append(el("div", "empty", "跑一次反推后，布局框会叠在缩略图上显示在这里"));
-	} else {
-		if (result.thumb) {
-			const img = el("img");
-			img.src = result.thumb;
-			holder.append(img);
-		}
-		const layer = el("div", "ar-boxes");
-		const boxes = result.boxes.slice(0, 24);
-		boxes.forEach((b, idx) => {
-			const [x0, y0, x1, y1] = b.bbox || [0, 0, 0, 0];
-			const d = el("div", "ar-box");
-			d.style.left = (x0 / 10) + "%";
-			d.style.top = (y0 / 10) + "%";
-			d.style.width = Math.max(1, (x1 - x0) / 10) + "%";
-			d.style.height = Math.max(1, (y1 - y0) / 10) + "%";
-			d.title = (b.desc || b.text || "").slice(0, 220);
-			d.append(el("span", "n", String(idx + 1)));
-			layer.append(d);
-		});
-		holder.append(layer);
-	}
-	const n = result && Array.isArray(result.boxes) ? result.boxes.length : 0;
-	ui.meta.innerHTML = "";
-	ui.meta.append(
-		el("span", "", "框数 "), el("b", "", String(n)),
-		el("span", "", "账号 "), el("b", "", st.account || localStorage.getItem(LS_ACCOUNT) || "未绑定"),
-	);
-	ui.resize();
-}
-
-function wireResultCapture(ui) {
-	const node = ui.node;
-	const orig = node.onExecuted;
-	node.onExecuted = function (msg) {
-		orig?.apply(this, arguments);
-		try {
-			const texts = msg?.text || (msg && Object.values(msg).find((v) => Array.isArray(v) && typeof v[0] === "string"));
-			const raw = Array.isArray(texts) ? texts[0] : texts;
-			if (typeof raw !== "string" || !raw.trim().startsWith("[")) return;
-			const boxes = JSON.parse(raw);
-			const st = stateFor(node);
-			st.lastResult = {
-				boxes: Array.isArray(boxes) ? boxes : [],
-				thumb: st.lastResult?.thumb || null,
-				ts: Date.now(),
-			};
-			saveState(node);
-			renderPreview(ui);
-		} catch { /* 非 JSON 输出忽略 */ }
-	};
-	// 输入图缩略图：LoadImage 的 image widget 带预览 img
-	const iv = setInterval(() => {
-		if (!document.contains(ui.root)) { clearInterval(iv); return; }
-		const st = stateFor(node);
-		if (!st.lastResult || st.lastResult.thumb) return;
-		const src = node.images?.[0] ? apiUrl(node.images[0]) : null;
-		if (src) {
-			st.lastResult.thumb = src;
-			renderPreview(ui);
-		}
-	}, 3000);
-}
-
 // ================= 面板 =================
 
 const ui_map = new WeakMap();
@@ -465,14 +384,6 @@ function buildPanel(node) {
 	}
 	root.append(seg);
 
-	// ---- 输入区 ----
-	const inCard = el("div", "ar-card");
-	inCard.append(el("div", "cap", "输入"));
-	inCard.append(ctlText(ui, "user_prompt", "用户提示词（画廊标签 / 手写补充）", {
-		multiline: true, placeholder: "留空 = 只用节点输入",
-	}));
-	root.append(inCard);
-
 	// ---- 本地页 ----
 	const pageLocal = el("div", "ar-page");
 	const c1 = el("div", "ar-card");
@@ -493,8 +404,10 @@ function buildPanel(node) {
 	g3.append(ctlSelect(ui, "tag_mode", "画廊标签模式"));
 	pageLocal.append(c2, g3);
 
-	const c3 = el("div", "ar-card");
-	c3.append(el("div", "cap", "规则提示词 rule"));
+	const c3 = el("details", "ar-card");
+	const sum = el("summary", "cap", "规则提示词 rule（点开编辑）");
+	sum.style.cursor = "pointer";
+	c3.append(sum);
 	c3.append(ctlText(ui, "rule", "布局规则（框选 / 前后关系 / 输出格式）", { multiline: true }));
 	pageLocal.append(c3);
 	root.append(pageLocal);
@@ -553,16 +466,6 @@ function buildPanel(node) {
 	pageCustom.append(cc);
 	root.append(pageCustom);
 
-	// ---- 结果预览 ----
-	const pc = el("div", "ar-card");
-	pc.append(el("div", "cap", "最近一次反推结果"));
-	ui.preview = el("div", "ar-prev");
-	ui.preview.append(el("div", "empty", "跑一次反推后，布局框会叠在缩略图上显示在这里"));
-	pc.append(ui.preview);
-	ui.meta = el("div", "ar-meta");
-	pc.append(ui.meta);
-	root.append(pc);
-
 	const PROVIDER_MAP = { local: "本地模型（transformers）", ds: "DeepSeek 云端（ds2api 本地网关）", custom: "自定义 OpenAI 兼容端点" };
 
 	function applyProvider() {
@@ -591,7 +494,6 @@ function buildPanel(node) {
 	ui.applyProvider = applyProvider;
 
 	applyProvider();
-	renderPreview(ui);
 	return ui;
 }
 
@@ -628,8 +530,7 @@ app.registerExtension({
 			// 二次清扫：Vue 前端可能在 createNode 后又填充一轮 widget
 			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); ui.resize(); }, 0);
 			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); ui.resize(); }, 300);
-			wireResultCapture(ui);
-			// 输入图 / 节点尺寸变化时重算高度
+					// 输入图 / 节点尺寸变化时重算高度
 			const ro = new ResizeObserver(() => ui.resize());
 			ro.observe(ui.root);
 			return r;
