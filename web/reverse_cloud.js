@@ -25,7 +25,9 @@ const CSS = `
 .arshell { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 12px;
   font: 12px/1.5 system-ui, sans-serif; color: var(--fg-color, #dcdcde);
   background: var(--comfy-input-bg, #2b2b30); box-sizing: border-box;
-  overflow: hidden; }
+  height: 540px; overflow-y: auto; overflow-x: hidden; }
+.arshell::-webkit-scrollbar { width: 8px; }
+.arshell::-webkit-scrollbar-thumb { background: #444a; border-radius: 4px; }
 .arshell::-webkit-scrollbar { width: 8px; }
 .arshell::-webkit-scrollbar-thumb { background: #444a; border-radius: 4px; }
 
@@ -484,10 +486,9 @@ function buildPanel(node) {
 		requestAnimationFrame(() => {
 			if (!document.contains(root)) return;
 			const w0 = 430;
-			const target = Math.min(Math.ceil(root.scrollHeight) + 8, 1400);
-			// node.size[1] 含标题栏等，面板目标高度与之差一次到位；比较阈值防抖
-			if (Math.abs((node.size[1] || 0) - target) > 12 || !(node.size[0] >= w0)) {
-				node.setSize([Math.max(node.size[0] || w0, w0), target]);
+			// 高度完全静态（CSS 540px），只保证最小宽度
+			if (!(node.size[0] >= w0) || !(node.size[1] >= 580)) {
+				node.setSize([Math.max(node.size[0] || w0, w0), Math.max(node.size[1] || 580, 580)]);
 			}
 			app.graph.setDirtyCanvas(true, true);
 		});
@@ -507,6 +508,17 @@ app.registerExtension({
 		if (nodeData?.name !== NODE_CLASS) return;
 
 		// 序列化（保存 / graphToPrompt）时把原生 widget 临时拼回，值按原顺序写出
+		// 工作流加载（configure 重建 widget）后清扫：重摘原生、面板复位
+		const origConfigure = nodeType.prototype.onConfigure;
+		nodeType.prototype.onConfigure = function () {
+			const r = origConfigure?.apply(this, arguments);
+			if (this[AR_ORIG]) {
+				detachWidgets(this);
+				this.widgetsChanged?.();
+			}
+			return r;
+		};
+
 		const origSerialize = nodeType.prototype.serialize;
 		nodeType.prototype.serialize = function () {
 			if (!this[AR_ORIG]) return origSerialize?.apply(this, arguments);
@@ -522,23 +534,13 @@ app.registerExtension({
 			detachWidgets(this);
 			const ui = buildPanel(this);
 			const widget = this.addDOMWidget("arcloud_panel", "custom", ui.root, { serialize: false });
-			let panelH = 560; // 缓存高度，由 ResizeObserver 更新，computeSize 只读缓存（防 resize 循环）
-			widget.computeSize = () => [0, Math.min(panelH, 1400)];
-			ui.measure = () => {
-				const h = Math.ceil(ui.root.scrollHeight) + 8;
-				if (Math.abs(h - panelH) > 4) {
-					panelH = h;
-					app.graph.setDirtyCanvas(true, true);
-				}
-			};
+			widget.computeSize = () => [0, 552]; // 静态：面板 CSS 锁 540px + 余量，永不测量
 			this.widgetsChanged?.();
 			ui.resize();
 			// 二次清扫：Vue 前端可能在 createNode 后又填充一轮 widget
 			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); ui.resize(); }, 0);
 			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); ui.resize(); }, 300);
-					// 内容尺寸变化 → 只更新 computeSize 缓存（measure），不直接 setSize，断开反馈循环
-			const ro = new ResizeObserver(() => { ui.measure?.(); });
-			ro.observe(ui.root);
+		
 			return r;
 		};
 	},
