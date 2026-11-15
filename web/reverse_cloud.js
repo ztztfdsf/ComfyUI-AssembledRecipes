@@ -143,86 +143,45 @@ async function jsonFetch(url, opts = {}) {
 	return data;
 }
 
-// ================= 原生 widget 接管 =================
+// ================= 原生 widget 隐藏（前端官方可见性机制）=================
 //
-// node.widgets 摘掉全部原生 widget，只在面板 widget 上渲染。
-// 序列化（保存工作流 / graphToPrompt 队列）时通过覆写 serializeValue 的集合行为还原。
-// 实现：把原 widgets 存到 node[AR_ORIG]，覆写 node.serialize 用「临时换回」策略。
+// 不摘 widget，只让它「不参与绘制与布局」：
+//   isWidgetRowVisible → occupiesCanvasRow(visibility) → false（不画、computeSize 不计行高）
+//   getLayoutWidgets → 排除（arrange 不再按行数把节点撞高，疯涨根因）
+// widget 仍在 node.widgets 里 → 保存工作流 / graphToPrompt 走原生链路，零钩子零风险。
+// 显式写 visibility 对象（前端优先读它，后续把 hidden 改回 false 也盖不掉）。
 
-const AR_ORIG = Symbol("ar-orig-widgets");
-const AR_ORDER = Symbol("ar-widget-order");
 const PANEL_NAME = "arcloud_panel";
 
-function sortOrig(node) {
-	const order = node[AR_ORDER];
-	if (!order) return;
-	node[AR_ORIG].sort((a, b) => {
-		const ia = order.indexOf(a.name); const ib = order.indexOf(b.name);
-		return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib);
-	});
+function hideWidget(w) {
+	if (!w || w.name === PANEL_NAME) return;
+	// visibility 是只读派生属性（由 hidden/options.hidden 推导），只能写 hidden：
+	// deriveWidgetVisibility → suppression.byExtension = true → 不绘制、不参与布局与 computeSize
+	w.hidden = true;
+	(w.options ||= {}).hidden = true;
 }
 
-function detachWidgets(node) {
-	// 幂等：无论被调多少次，widgets 里只剩面板；原生按名字收集（去重保序）
-	const names = new Set(node[AR_ORIG]?.map((w) => w.name) || []);
-	const natives = (node.widgets || []).filter((w) => w.name !== PANEL_NAME);
-	const kept = [];
-	for (const w of natives) {
-		if (!names.has(w.name)) { names.add(w.name); kept.push(w); }
-		else {
-			// 已有同名原件 → 保留值新的那个（后填的）
-			const idx = node[AR_ORIG] ? node[AR_ORIG].findIndex((x) => x.name === w.name) : -1;
-			if (idx >= 0 && node[AR_ORIG]) node[AR_ORIG][idx] = w;
-		}
-	}
-	if (!node[AR_ORDER]) node[AR_ORDER] = (node[AR_ORIG] || []).concat(kept).map((w) => w.name);
-	node[AR_ORIG] = (node[AR_ORIG] || []).concat(kept);
-	sortOrig(node);
-	node.widgets = (node.widgets || []).filter((w) => w.name === PANEL_NAME);
-	// 摘除的 widget 若有已挂载的 DOM（Vue/DOM widget 容器），直接卸载，防 label 残影
-	for (const w of node[AR_ORIG]) {
-		if (w.element?.parentNode) w.element.parentNode.removeChild(w.element);
-		if (w.inputEl?.parentNode) w.inputEl.parentNode.removeChild(w.inputEl);
-	}
+function hideNatives(node) {
+	for (const w of node.widgets || []) hideWidget(w);
 }
 
-// Classic 模式下前端会在 loadGraphData 后重建 widget（不靠定时清扫，直接在创建处收编）
-function installAddWidgetGuard(nodeType) {
+// loadGraphData 后前端会重建 widget：在创建处一出场就隐藏（不靠定时清扫）
+function installHideGuard(nodeType) {
 	const prev = nodeType.prototype.addWidget;
-	if (prev?.__arGuarded) return;
+	if (prev?.__arHideGuarded) return;
 	function addWidget(type, name, value, options) {
-		const w = prev ? prev.apply(this, arguments) : LiteGraph.LGraphNode.prototype.addWidget.call(this, type, name, value, options);
-		if (w && this[AR_ORIG] && w.name !== PANEL_NAME) {
-			const i = this[AR_ORIG].findIndex((x) => x.name === w.name);
-			if (i >= 0) this[AR_ORIG][i] = w;
-			else { this[AR_ORIG].push(w); this[AR_ORDER]?.push(w.name); }
-			sortOrig(this);
-			const k = (this.widgets || []).indexOf(w);
-			if (k >= 0) this.widgets.splice(k, 1);
-			if (w.element?.parentNode) w.element.parentNode.removeChild(w.element);
-		}
+		const w = prev.apply(this, arguments);
+		hideWidget(w);
 		return w;
 	}
-	addWidget.__arGuarded = true;
+	addWidget.__arHideGuarded = true;
 	nodeType.prototype.addWidget = addWidget;
-}
-
-function withOrigWidgets(node, fn) {
-	if (!node[AR_ORIG]) return fn();
-	const panel = node.widgets || [];
-	const own = node.widgets;
-	node.widgets = panel.concat(node[AR_ORIG]);
-	try {
-		return fn();
-	} finally {
-		node.widgets = own;
-	}
 }
 
 // ================= 面板控件（值写回原生 widget 对象） =================
 
 function widgetOf(node, name) {
-	return (node[AR_ORIG] || []).find((w) => w.name === name);
+	return (node.widgets || []).find((w) => w.name === name);
 }
 
 function ctlText(ui, name, labelText, { multiline = false, placeholder = "" } = {}) {
@@ -440,20 +399,7 @@ function takeOverSize(node) {
 	if (node._arSizeOwned) return;
 	node._arSizeOwned = true;
 	node._arDesiredSize = [Math.max(node.size[0], MIN_SIZE[0]), Math.max(node.size[1], MIN_SIZE[1])];
-	for (const method of ["arrange", "_arrangeWidgets"]) {
-		const prev = node[method];
-		if (typeof prev !== "function") continue;
-		node[method] = function (...args) {
-			if (node[AR_ORIG]) detachWidgets(node);
-			const want = node._arDesiredSize;
-			const r = prev.apply(node, args);
-			if (Math.abs(node.size[0] - want[0]) > 1 || Math.abs(node.size[1] - want[1]) > 1) {
-				node.setSize([want[0], want[1]]);
-			}
-			return r;
-		};
-	}
-	// 用户拖动是唯一能改尺寸的路径：记下来
+	// 用户拖动是唯一改尺寸的路径：记下来，任何内部重排都不能覆盖它
 	const prevResize = node.onResize;
 	node.onResize = function (size) {
 		clampSize(size);
@@ -613,38 +559,21 @@ app.registerExtension({
 	beforeRegisterNodeDef(nodeType, nodeData) {
 		if (nodeData?.name !== NODE_CLASS) return;
 
-		// Classic 模式：loadGraphData 后重建的 widget 在创建处直接收编（不等定时清扫）
-		installAddWidgetGuard(nodeType);
+		// loadGraphData 后前端会重建 widget：在创建处一出场就隐藏
+		installHideGuard(nodeType);
 
-		// 序列化（保存 / graphToPrompt）时把原生 widget 临时拼回，值按原顺序写出
-		// 工作流加载（configure 重建 widget）后清扫：重摘原生、面板复位
+		// 工作流加载：重隐（防重建的 widget 漏网）+ 旧尺寸收敛
 		const origConfigure = nodeType.prototype.onConfigure;
 		nodeType.prototype.onConfigure = function () {
 			const r = origConfigure?.apply(this, arguments);
-			if (this[AR_ORIG]) {
-				detachWidgets(this);
-				this.widgetsChanged?.();
-				// 旧工作流里存的尺寸是原生 widget 时代留下的（过高/过矮都不适用），收敛到可用区间；
-				// 区间内的尺寸尊重用户自己的拖动结果
-				if (this.size[1] < 500 || this.size[1] > DEFAULT_SIZE[1] + 240) {
-					this.setSize([Math.max(this.size[0], MIN_SIZE[0]), DEFAULT_SIZE[1]]);
-				}
-				this._arDesiredSize = [this.size[0], this.size[1]];
+			hideNatives(this);
+			// 旧工作流里存的尺寸是原生 widget 时代留下的（过高/过矮都不适用），收敛到可用区间；
+			// 区间内的尺寸尊重用户自己的拖动结果
+			if (this.size[1] < 500 || this.size[1] > DEFAULT_SIZE[1] + 240) {
+				this.setSize([Math.max(this.size[0], MIN_SIZE[0]), DEFAULT_SIZE[1]]);
 			}
+			this._arDesiredSize = [this.size[0], this.size[1]];
 			return r;
-		};
-
-		// Classic 的 expandToFitContent 只增不减（按 widget 行高撞开节点）——面板接管后必须封死
-		const origExpand = nodeType.prototype.expandToFitContent;
-		nodeType.prototype.expandToFitContent = function () {
-			// 面板接管后：尺寸完全由用户拖动决定，不按内容撞开（旧行为只增不减 = 疯涨根源）
-			if (!this[AR_ORIG]) return origExpand?.apply(this, arguments);
-		};
-
-		const origSerialize = nodeType.prototype.serialize;
-		nodeType.prototype.serialize = function () {
-			if (!this[AR_ORIG]) return origSerialize?.apply(this, arguments);
-			return withOrigWidgets(this, () => origSerialize.apply(this, arguments));
 		};
 
 		const origOn = nodeType.prototype.onNodeCreated;
@@ -652,11 +581,11 @@ app.registerExtension({
 			const r = origOn?.apply(this, arguments);
 			injectStyle();
 
-			// 先摘掉全部原生 widget（存 AR_ORIG），再建面板（控件从 AR_ORIG 取值），最后挂面板
-			detachWidgets(this);
+			// 原生 widget 全部隐入面板（仍在 node.widgets 里，序列化链路不变）
+			hideNatives(this);
 			const ui = buildPanel(this);
 
-			// —— 以下整套尺寸处理照搬画廊节点（ComfyUI-Aaalice-Nodes）的已验证配方 ——
+			// —— 以下尺寸处理照搬画廊节点（ComfyUI-Aaalice-Nodes）的已验证配方 ——
 			// ① widget type 加实例后缀：Nodes 2.0 按 node id + widget name + type 缓存渲染器，
 			//    撤销重建时稳定 key 会复用旧组件导致 element 挂不上
 			const widget = this.addDOMWidget("arcloud_panel", `custom__ar_instance_${++instanceSeq}`, ui.root, {
@@ -664,25 +593,18 @@ app.registerExtension({
 				getMinHeight: () => MIN_SIZE[1], getValue: () => "", setValue: () => {},
 			});
 			// ② 宽度绑定到节点：前端（#12443）会把陈旧的测量值回写 widget.width ——
-			//    回写成 0/小值时 DOM 容器塔成细条，高度测量无限增长（就是之前的“疯涨”）
+			//    回写成 0/小值时 DOM 容器塔成细条，高度测量无限增长
 			Object.defineProperty(widget, "width", {
 				configurable: true, enumerable: true,
 				get: () => this.width, set(_w) {},
 			});
 			// ③ 不定义 widget.computeSize：高度由 getMinHeight + 节点尺寸决定，面板 CSS 自己填满
-			this.widgetsChanged?.();
 
-			// ④ 拖拽命中透传：命中节点缩放手柄时交给画布，不让 widget 抢事件
+			// ④ 拖拽命中透传：命中节点缩放手柄时交给画布，不让面板抢事件
 			installResizePassthrough(this, ui.root);
+			// ⑤ 尺寸接管：用户拖动是唯一改尺寸的路径
 			takeOverSize(this);
-
-			// ⑤ node.computeSize 固定返回最小高（内容不得撑大节点）
-			const prevComputeSize = this.computeSize;
-			this.computeSize = function () {
-				const size = prevComputeSize?.apply(this, arguments) || [MIN_SIZE[0], MIN_SIZE[1]];
-				return [Math.max(MIN_SIZE[0], Number(size[0]) || 0), Math.max(MIN_SIZE[1], Number(size[1]) || 0)];
-			};
-			// ⑥ 初始尺寸只设一次（onResize 已在 takeOverSize 里接管，用户拖动是唯一改尺寸的路径）
+			// ⑥ 初始尺寸只设一次
 			if (!this._arSized) {
 				this._arSized = true;
 				const w = Math.max(this.size[0] || MIN_SIZE[0], MIN_SIZE[0]);
@@ -690,9 +612,9 @@ app.registerExtension({
 				this.setSize([w, h]);
 				this._arDesiredSize = [w, h];
 			}
-			// ⑧ 二次清扫：前端可能在 createNode 后又填一轮 widget
-			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); }, 0);
-			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); }, 300);
+			// ⑦ 补隐：前端可能在 createNode 之后才填完 widget
+			setTimeout(() => hideNatives(this), 0);
+			setTimeout(() => hideNatives(this), 300);
 
 			return r;
 		};
