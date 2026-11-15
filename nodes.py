@@ -1304,6 +1304,22 @@ _VLM_CACHE = {}  # 模型目录 -> (processor, model) 内存常驻缓存
 
 
 # 规则要点：限死框数（防过度分割）、禁止把画廊 tag 逐条变框、desc 120~220 词、坐标用模型原生的 xyxy（清洗节点统一转 yxyx）
+def _cloud_caption(kind, pil, rule, user_text, base="", key="", model=""):
+    """云端反推统一入口（延迟导入，不依赖网络库也能加载节点）。"""
+    try:
+        from .reverse_cloud import providers
+    except ImportError:
+        import importlib as _il, sys as _sys, os as _os
+        _pd = _os.path.dirname(_os.path.abspath(__file__))
+        if _pd not in _sys.path:
+            _sys.path.insert(0, _pd)
+        providers = _il.import_module("reverse_cloud.providers")
+    env_key = os.environ.get("ASSEMBLED_OPENAI_KEY", "")
+    return providers.run_caption("openai", pil, rule, user_text,
+                                 openai_base=base, openai_key=key or env_key,
+                                 openai_model=model)
+
+
 _LAYOUT_RULE_DEFAULT = (
     '# 角色\n'
     '你是图像版面解析引擎，把画面拆成「布局元素」，供文生图按区域重绘。\n'
@@ -1324,6 +1340,7 @@ _LAYOUT_RULE_DEFAULT = (
     '2. 同一主体的头发、眼睛、衣服、手、配饰全部属于它，只给它一个框，不拆。\n'
     '\n'
     '# 框选规则\n'
+    '- 框允许重叠：两个主体靠在一起、人物与前景道具交叉时，各框照实拉，不要为了不重叠而把框切小或把两个主体合并。\n'
     '- 多主体必须分开建框：画面里有几个人物/动物就建几个框，各自写各自的 desc，禁止把两个及以上的人合并进同一个框。只有画面确实只有一个主体时才允许整幅大框。\n'
     '- 框数上限 10 个，宁少勿多；超过 10 个说明你在把画面拆碎。\n'
     '- 框要紧贴该元素在图中真实可见的范围：人物包含头发、四肢、手持物和衣摆；不要把阴影、背景算进去。\n'
@@ -1336,6 +1353,11 @@ _LAYOUT_RULE_DEFAULT = (
     '- 禁止建框：发丝、眼睛、单件饰品、衣褶、背景光斑、装饰星星、纹理、细小图案、logo 细节。\n'
     '- 禁止建框（任何情况下，包括 type=text）：水印、画师/作者署名、AI 生成声明（如 AI-generated、禁止AI使用）、版权与商用声明、网址链接、logo、签名等非画面内容文字——一律当作不存在：不建框、不输出、不描述。\n'
     '\n'
+    '# 前后关系（重叠框必填，缺了下游就会把遮挡画错）\n'
+    '- 凡两个框有重叠，双方的 desc 都必须写清两者关系：谁在前谁在后、被遮住的是哪一侧/哪一部分（例如 her left arm is partially occluded by the wooden crate in the foreground）。\n'
+    '- 每个非背景框都必须含明确的深度词：background / midground / foreground 三选一，并写相对关系（in front of / behind / partially occluding / partially occluded by + 对象）。\n'
+    '- 重叠区域两侧的描述必须互相对得上：A 说被 B 遮住左臂，B 的 desc 就要写它在前景遮住了 A 的左臂；禁止两边说法矛盾。\n'
+    '- 不确定谁在前时，按遮挡边缘判断：边界清晰锐利的在前景，被压住轮廓的在背景。\n'
     '# 坐标\n'
     '- 归一化 0~1000 的整数，顺序是 [左, 上, 右, 下]，也就是 xmin, ymin, xmax, ymax。\n'
     '- 例：[0, 0, 1000, 1000] 是整张图；[0, 0, 1000, 500] 是画面上半部分整宽；[570, 266, 797, 500] 是画面中间偏右下的一块。\n'
@@ -1371,7 +1393,7 @@ _LAYOUT_RULE_DEFAULT = (
     '  · 拍摄视角与主体朝向：判断画面是俯拍（high-angle / bird\'s-eye）、仰拍（low-angle / worm\'s-eye）还是平视（eye-level）；主体相对镜头是正面（front view）、四分之三侧面（three-quarter view）、正侧面（side profile）还是背面（view from behind）；画面整体倾斜时写荷兰角（dutch angle）；有明显广角畸变或长焦压缩也写出来。这些镜头语言直接决定重绘的视角，必须准。\n'
     '  · 该区域的光线与明暗、天气或氛围（如果有）。\n'
     '- 知道角色是谁就写名字和出处，例如 shu (arknights)；不确定就只描述外观，不要编造名字。\n'
-    '- 空间关系写具体：在画面哪一侧、比谁更远、被谁遮挡了一部分。\n'
+    '- 空间关系写具体：在画面哪一侧、比谁更远、被谁遮挡了哪一部分；与相邻框的重叠区里两个元素各自露出什么、压住什么，一句一句写死。\n'
     '- 写成连贯的一整段叙述，像向画师口述这幅画；不要写成一串 "the X is ... the Y is ..." 的清单。\n'
     '- 每条 desc 只写本框内看得见的东西，不要把别的框的主体写进来（其他人物由他们自己的框描述）。\n'
     '- 用自然语言描述句，不要堆砌标签（不要出现 1girl、solo、masterpiece 这类词条）。\n'
@@ -1408,15 +1430,22 @@ class ReverseLayoutCaption:
         return {
             "required": {
                 "image": ("IMAGE", {"tooltip": "要反推的图"}),
+                "provider": (["本地模型（transformers）", "DeepSeek 云端（ds2api 本地网关）", "自定义 OpenAI 兼容端点"],
+                             {"default": "本地模型（transformers）",
+                              "tooltip": "本地=进程内跑 models/LLM 下的模型；DeepSeek 云端=走本机 ds2api 网关（http://127.0.0.1:5001，账密在它 config.json，免费、原生视觉）；自定义=任意 OpenAI 兼容视觉端点"}),
                 "rule": ("STRING", {"multiline": True, "default": _LAYOUT_RULE_DEFAULT, "tooltip": "反推规则（system 提示词）"}),
                 "user_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "画廊提示词等角色参考资料，遇到不认识的角色用它补全"}),
-                "model_name": (_list_llm_models(), {"tooltip": "ComfyUI/models/LLM/ 下现成的模型（下拉选；新放进去的模型需重启 ComfyUI 才会出现在列表里）"}),
+                "model_name": (_list_llm_models(), {"tooltip": "本地模式用的模型：ComfyUI/models/LLM/ 下的目录（新放进去的需重启 ComfyUI）；DeepSeek 网页版模式也用它先出粗稿"}),
                 "max_new_tokens": ("INT", {"default": 4096, "min": 128, "max": 16384, "tooltip": "输出 token 上限（desc 详细版建议 >=2048）。实际硬顶 6144：规则最多 10 框×220 词≈3000 tok，再高只会让模型不吐 EOS 时白算很久"}),
                 "pre_clear": ("BOOLEAN", {"default": True, "tooltip": "反推前把 ComfyUI 全部模型卸回内存，显存同一时间只住一个模型"}),
                 "offload_after": ("BOOLEAN", {"default": True, "tooltip": "反推完本模型退卡回内存（内存常驻，下次上卡免盘读）"}),
             },
             "optional": {
-                # 放在最后：旧工作流 widgets_values 前 6 位保持对齐，不会错位；缺省=4bit
+                "openai_base": ("STRING", {"default": "http://127.0.0.1:5001/v1", "tooltip": "自定义端点请求地址，如 https://api.deepseek.com 或 https://api.openai.com/v1（自动补全 /v1/chat/completions）"}),
+                "openai_key": ("STRING", {"default": "sk-ar-6a898a13c8bed2b59f506468841e5f1f", "tooltip": "端点密钥（Bearer）。默认已填本机 ds2api 网关的 key"}),
+                "openai_model": ("STRING", {"default": "deepseek-v4.1-flash", "tooltip": "模型名（ds2api 网关用 deepseek-v4.1-flash，原生支持视觉）"}),
+                "deepseek_thinking": ("BOOLEAN", {"default": True, "tooltip": "云端模式：开思考（关了模型名自动加 -nothinking，更快）"}),
+                # 放在后面：旧工作流 widgets_values 保持对齐；缺省=4bit
                 "quant": (["4bit (NF4，显存最省)", "8bit", "none (bf16，原精度)"], {"default": "4bit (NF4，显存最省)", "tooltip": "量化方式。4bit 显存最省（12B 在 16GB 卡上只有它能跑）；8bit / bf16 只有小模型或大显存卡才装得下，不够时节点会直接报错不等加载"}),
                 # 大模型（如 Gemma4-12B）有能力自己从一堆 tag 里筛出画面真实内容，
                 # 小模型容易看到多少 tag 就框多少个，所以做成开关。
@@ -1639,8 +1668,75 @@ class ReverseLayoutCaption:
               f"空闲 {before:.0f}→{after:.0f}MB | 池trim {'OK' if _trim_cuda_pool() else '跳过'}"
               f"{f' | 残留 {residual:.0f}MB' if residual > 100 else ''}{vbar_note}{warn}", flush=True)
 
-    def caption(self, image, rule, user_prompt, model_name, max_new_tokens, pre_clear, offload_after, quant="4bit (NF4，显存最省)", tag_mode="全部（推荐 12B 级大模型）", batch_index=0):
+    def _local_coarse(self, pil, rule, model_name, max_new_tokens, pre_clear, offload_after, quant, tag_mode, batch_index):
+        """云端精修模式用：本地模型先出一遍粗稿 JSON（复用本地推理路径）。
+
+        只输出文本；显存管理与主路径一致（pre_clear/offload_after 生效）。"""
         import torch
+        try:
+            from .reverse_cloud.providers import extract_json_array
+        except ImportError:
+            import importlib as _il, sys as _sys, os as _os
+            _pd = _os.path.dirname(_os.path.abspath(__file__))
+            if _pd not in _sys.path:
+                _sys.path.insert(0, _pd)
+            extract_json_array = _il.import_module("reverse_cloud.providers").extract_json_array
+        path = os.path.join(folder_paths.models_dir, "LLM", model_name)
+        if not os.path.isdir(path):
+            raise RuntimeError(f"DeepSeek 精修模式需要本地粗稿模型，但找不到 {path}")
+        # 复用 caption() 的本地全流程：直接递归调自己、provider=本地
+        text, = self.caption(
+            image=self._pil_to_image(pil), rule=rule, user_prompt="", provider="本地模型（transformers）",
+            model_name=model_name, max_new_tokens=max_new_tokens, pre_clear=pre_clear,
+            offload_after=offload_after, quant=quant, tag_mode=tag_mode, batch_index=batch_index)
+        return text
+
+    @staticmethod
+    def _pil_to_image(pil):
+        """PIL → ComfyUI IMAGE 张量（本地粗稿递归调用用）。"""
+        import numpy as np
+        arr = np.asarray(pil.convert("RGB")).astype("float32") / 255.0
+        return torch.from_numpy(arr)[None]
+
+    def caption(self, image, rule, user_prompt, provider="本地模型（transformers）", model_name=None,
+                max_new_tokens=4096, pre_clear=True, offload_after=True,
+                openai_base="", openai_key="", openai_model="deepseek-v4.1-flash", deepseek_thinking=True,
+                quant="4bit (NF4，显存最省)", tag_mode="全部（推荐 12B 级大模型）", batch_index=0):
+        import torch
+        provider_local = str(provider).startswith("本地")
+        provider_ds = "DeepSeek" in str(provider)
+        provider_openai = "OpenAI" in str(provider)
+
+        # ---------- 云端路径（不占本地显存清场那套；DeepSeek 网页版先用本地小模型出粗稿） ----------
+        if not provider_local:
+            t0 = time.time()
+            up_all = self._trim_user_prompt(user_prompt, max_chars=100000)
+            try:
+                # DeepSeek 云端(ds2api) 与自定义端点同路径：标准 OpenAI 兼容视觉补全
+                from PIL import Image as _PIL
+                pil = self._image_to_pil(image, max_side=1024, index=batch_index)
+                model_use = openai_model
+                if provider_ds and not deepseek_thinking and "-nothinking" not in model_use:
+                    model_use = model_use.replace("-search", "") + "-nothinking"
+                text_out = _cloud_caption("openai", pil, rule, up_all,
+                                          base=openai_base, key=openai_key, model=model_use)
+            except Exception as e:
+                raise RuntimeError(f"云端反推[{provider}] 失败: {e}") from e
+            try:
+                from .reverse_cloud.providers import extract_json_array
+            except ImportError:
+                import importlib as _il, sys as _sys, os as _os
+                _pd = _os.path.dirname(_os.path.abspath(__file__))
+                if _pd not in _sys.path:
+                    _sys.path.insert(0, _pd)
+                extract_json_array = _il.import_module("reverse_cloud.providers").extract_json_array
+            arr = extract_json_array(text_out)
+            if arr is not None:
+                text_out = json.dumps(arr, ensure_ascii=False)
+            print(f"[AssembledRecipes] 云端反推[{provider}]: {time.time() - t0:.1f}s | 输出 {len(text_out)} 字符", flush=True)
+            return (text_out,)
+
+        # ---------- 本地路径（原逻辑不动） ----------
         path = os.path.join(folder_paths.models_dir, "LLM", model_name)
         if not os.path.isdir(path):
             avail = []

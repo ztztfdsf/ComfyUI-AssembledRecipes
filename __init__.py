@@ -1,4 +1,4 @@
-"""ComfyUI-AssembledRecipes — 拼装一次，处处直读。"""
+"""ComfyUI-AssembledRecipes — 显存治理 + 布局反推（本地 / 云端）。"""
 
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
