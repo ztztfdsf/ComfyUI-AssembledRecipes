@@ -24,8 +24,8 @@ const CSS = `
 /* ===== 节点壳：本体只在标题栏 + 端口，body 全给面板 ===== */
 .arshell { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 12px;
   font: 12px/1.5 system-ui, sans-serif; color: var(--fg-color, #dcdcde);
-  background: var(--comfy-input-bg, #2b2b30); height: 100%; box-sizing: border-box;
-  overflow-y: auto; overflow-x: hidden; }
+  background: var(--comfy-input-bg, #2b2b30); box-sizing: border-box;
+  overflow: hidden; }
 .arshell::-webkit-scrollbar { width: 8px; }
 .arshell::-webkit-scrollbar-thumb { background: #444a; border-radius: 4px; }
 
@@ -483,10 +483,11 @@ function buildPanel(node) {
 	ui.resize = () => {
 		requestAnimationFrame(() => {
 			if (!document.contains(root)) return;
-			const h = Math.ceil(root.scrollHeight) + 12;
 			const w0 = 430;
-			if (Math.abs((node.size[1] || 0) - h) > 6 || !(node.size[0] >= w0)) {
-				node.setSize([Math.max(node.size[0] || w0, w0), h]);
+			const target = Math.min(Math.ceil(root.scrollHeight) + 8, 1400);
+			// node.size[1] 含标题栏等，面板目标高度与之差一次到位；比较阈值防抖
+			if (Math.abs((node.size[1] || 0) - target) > 12 || !(node.size[0] >= w0)) {
+				node.setSize([Math.max(node.size[0] || w0, w0), target]);
 			}
 			app.graph.setDirtyCanvas(true, true);
 		});
@@ -521,17 +522,22 @@ app.registerExtension({
 			detachWidgets(this);
 			const ui = buildPanel(this);
 			const widget = this.addDOMWidget("arcloud_panel", "custom", ui.root, { serialize: false });
-			widget.computeSize = () => {
-				const h = Math.ceil(ui.root.scrollHeight || 600) + 12;
-				return [0, h];
+			let panelH = 560; // 缓存高度，由 ResizeObserver 更新，computeSize 只读缓存（防 resize 循环）
+			widget.computeSize = () => [0, Math.min(panelH, 1400)];
+			ui.measure = () => {
+				const h = Math.ceil(ui.root.scrollHeight) + 8;
+				if (Math.abs(h - panelH) > 4) {
+					panelH = h;
+					app.graph.setDirtyCanvas(true, true);
+				}
 			};
 			this.widgetsChanged?.();
 			ui.resize();
 			// 二次清扫：Vue 前端可能在 createNode 后又填充一轮 widget
 			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); ui.resize(); }, 0);
 			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); ui.resize(); }, 300);
-					// 输入图 / 节点尺寸变化时重算高度
-			const ro = new ResizeObserver(() => ui.resize());
+					// 内容尺寸变化 → 只更新 computeSize 缓存（measure），不直接 setSize，断开反馈循环
+			const ro = new ResizeObserver(() => { ui.measure?.(); });
 			ro.observe(ui.root);
 			return r;
 		};
