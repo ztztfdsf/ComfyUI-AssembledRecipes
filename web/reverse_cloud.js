@@ -66,6 +66,21 @@ const CSS = `
   font:9px system-ui; padding:0 4px; border-radius:0 0 4px 0; }
 .arcloud-meta { display:flex; gap:10px; font-size:10.5px; opacity:.75; flex-wrap:wrap; }
 .arcloud-meta b { opacity:1; }
+.arcloud-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.arcloud-ctl { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.arcloud-ctl label { font-size:10px; opacity:.6; display:flex; justify-content:space-between; }
+.arcloud-ctl input[type=number], .arcloud-ctl select, .arcloud-ctl textarea {
+  background:var(--comfy-input-bg,#1e1e22); border:1px solid var(--border-color,#444);
+  border-radius:5px; padding:4px 8px; color:var(--fg-color,#ddd); font:11px system-ui; min-width:0; width:100%;
+  box-sizing:border-box; }
+.arcloud-ctl textarea { resize:vertical; min-height:64px; font-family:inherit; }
+.arcloud-switch { display:flex; align-items:center; justify-content:space-between; gap:6px; }
+.arcloud-switch .lab { font-size:11px; opacity:.8; }
+.arcloud-toggle { width:34px; height:18px; border-radius:9px; background:#555; position:relative; cursor:pointer; flex:none; transition:background .15s; }
+.arcloud-toggle.on { background:#3b63c4; }
+.arcloud-toggle::after { content:""; position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%;
+  background:#ddd; transition:left .15s; }
+.arcloud-toggle.on::after { left:18px; }
 `;
 
 function injectStyle() {
@@ -248,6 +263,99 @@ function updateMeta(ui, st) {
 	);
 }
 
+// ---------- 原生 widget 控制（真源是 widget.value，面板控件只是外壳） ----------
+
+function widgetOf(node, name) {
+	return (node.widgets || []).find((w) => w.name === name);
+}
+
+function hideAllWidgets(node) {
+	// 全部原生 widget 收进面板：本体不再露出那排杆
+	for (const w of node.widgets || []) {
+		if (w.name === "arcloud_panel" || w.name === "image") continue;
+		if (w.computeSize) w.computeSize = () => [0, -1];
+		w.hidden = true;
+		if (w.onRemove) { /* keep */ }
+	}
+}
+
+function ctlText(ui, node, name, labelText, { multiline = false, placeholder = "" } = {}) {
+	const w = widgetOf(node, name);
+	const c = el("div", "arcloud-ctl");
+	const lab = el("label", "", labelText);
+	c.append(lab);
+	let input;
+	if (multiline) {
+		input = el("textarea");
+		input.rows = 4;
+	} else {
+		input = el("input");
+		input.type = "text";
+	}
+	input.placeholder = placeholder;
+	input.value = w?.value ?? "";
+	input.addEventListener("change", () => {
+		if (w) { w.value = input.value; w.callback?.(input.value); saveState(node); }
+	});
+	c.append(input);
+	ui.widgets[name] = { input, w };
+	return c;
+}
+
+function ctlNum(ui, node, name, labelText, { min = 0, max = 999999 } = {}) {
+	const w = widgetOf(node, name);
+	const c = el("div", "arcloud-ctl");
+	c.append(el("label", "", labelText));
+	const input = el("input");
+	input.type = "number";
+	input.min = String(min);
+	input.max = String(max);
+	input.value = w?.value ?? 0;
+	input.addEventListener("change", () => {
+		let v = Number(input.value) || 0;
+		v = Math.min(max, Math.max(min, v));
+		input.value = String(v);
+		if (w) { w.value = v; w.callback?.(v); saveState(node); }
+	});
+	c.append(input);
+	ui.widgets[name] = { input, w };
+	return c;
+}
+
+function ctlSelect(ui, node, name, labelText) {
+	const w = widgetOf(node, name);
+	const c = el("div", "arcloud-ctl");
+	c.append(el("label", "", labelText));
+	const sel = el("select");
+	for (const opt of w?.options?.values || []) {
+		const o = el("option", "", opt);
+		o.value = opt;
+		sel.append(o);
+	}
+	sel.value = w?.value ?? "";
+	sel.addEventListener("change", () => {
+		if (w) { w.value = sel.value; w.callback?.(sel.value); saveState(node); }
+	});
+	c.append(sel);
+	ui.widgets[name] = { input: sel, w };
+	return c;
+}
+
+function ctlToggle(ui, node, name, labelText) {
+	const w = widgetOf(node, name);
+	const row = el("div", "arcloud-switch");
+	row.append(el("span", "lab", labelText));
+	const t = el("div", "arcloud-toggle" + (w?.value ? " on" : ""));
+	t.addEventListener("click", () => {
+		const v = !t.classList.contains("on");
+		t.classList.toggle("on", v);
+		if (w) { w.value = v; w.callback?.(v); saveState(node); }
+	});
+	row.append(t);
+	ui.widgets[name] = { input: t, w };
+	return row;
+}
+
 // ---------- 面板构建 ----------
 
 const ui_map = new WeakMap();
@@ -255,7 +363,7 @@ const ui_map = new WeakMap();
 function buildPanel(node) {
 	const st = stateFor(node);
 	const root = el("div", "arcloud");
-	const ui = { node, root };
+	const ui = { node, root, widgets: {} };
 	ui_map.set(node, ui);
 
 	// 头部
@@ -285,10 +393,28 @@ function buildPanel(node) {
 		seg.append(b);
 	}
 	root.append(seg);
+	root.append(ctlText(ui, node, "user_prompt", "用户提示词（画廊标签 / 手写补充）", { multiline: true, placeholder: "留空 = 只用节点输入" }));
 
 	// 页面：本地
 	const pageLocal = el("div", "arcloud-page");
-	pageLocal.append(el("div", "arcloud-status", "使用 ComfyUI/models/LLM 下的模型在显卡上反推，参数用节点本体的 widget。"));
+	const localGrid = el("div", "arcloud-grid");
+	localGrid.append(
+		ctlSelect(ui, node, "model_name", "模型（models/LLM 下）"),
+		ctlSelect(ui, node, "quant", "量化"),
+	);
+	pageLocal.append(localGrid);
+	pageLocal.append(ctlText(ui, node, "rule", "规则提示词（rule）", { multiline: true }));
+	const localGrid2 = el("div", "arcloud-grid");
+	localGrid2.append(
+		ctlNum(ui, node, "max_new_tokens", "最大生成长度", { min: 64, max: 65536 }),
+		ctlNum(ui, node, "batch_index", "batch_index", { min: 0, max: 64 }),
+	);
+	pageLocal.append(localGrid2);
+	const localToggles = el("div", "arcloud-grid");
+	localToggles.append(ctlToggle(ui, node, "pre_clear", "反推前清场"));
+	localToggles.append(ctlToggle(ui, node, "offload_after", "结束后卸载模型"));
+	pageLocal.append(localToggles);
+	pageLocal.append(ctlSelect(ui, node, "tag_mode", "画廊标签模式"));
 	root.append(pageLocal);
 
 	// 页面：云端
@@ -336,7 +462,10 @@ function buildPanel(node) {
 
 	// 页面：自定义端点
 	const pageCustom = el("div", "arcloud-page");
-	pageCustom.append(el("div", "arcloud-status", "地址 / 密钥 / 模型名直接用节点本体上的 openai_base / openai_key / openai_model 三个 widget。"));
+	pageCustom.append(ctlText(ui, node, "openai_base", "请求地址（base URL）", { placeholder: "https://api.deepseek.com" }));
+	pageCustom.append(ctlText(ui, node, "openai_key", "API 密钥", { placeholder: "sk-..." }));
+	pageCustom.append(ctlText(ui, node, "openai_model", "模型名", { placeholder: "deepseek-v4.1-flash" }));
+	pageCustom.append(ctlToggle(ui, node, "deepseek_thinking", "深度思考"));
 	root.append(pageCustom);
 
 	// 结果预览（特色）
@@ -360,12 +489,13 @@ function buildPanel(node) {
 			if (w.value !== map[st.provider]) { w.value = map[st.provider]; w.callback?.(); }
 		}
 		requestAnimationFrame(() => {
-			const h = 60 + (st.provider === "ds" ? 178 : 24) + 150;
-			node.setSize([node.size[0], Math.max(node.size[0] * 0.45, h)]);
+			const panel = ui.root.getBoundingClientRect().height || 500;
+			node.setSize([node.size[0], panel + 46]);
 			app.graph.setDirtyCanvas(true, true);
 		});
 	}
 	ui.applyProvider = applyProvider;
+	hideAllWidgets(node);
 	applyProvider();
 	renderPreview(ui, node);
 	updateMeta(ui, st);
