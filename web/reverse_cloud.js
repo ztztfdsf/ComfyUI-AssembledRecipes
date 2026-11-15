@@ -1,17 +1,16 @@
 /**
- * ReverseLayoutCaption 前端 — 节点内嵌云端面板。
+ * ReverseLayoutCaption 前端 — 完整接管节点 UI。
  *
- * 框架对齐画廊节点（BooruGalleryNode）的做法：
- *   - 状态持久化在 node.properties（随工作流保存）
- *   - addDOMWidget 挂实体面板，节点可拉高
- *   - 账号密码不进工作流（密码只存浏览器 localStorage）
+ * 节点本体只保留 image / text 两个端口；全部参数由内嵌面板承载。
+ * 原生 widget 从 node.widgets 摘除（视觉完全接管），值仍通过
+ * serialize 钩子按原顺序写回 widgets_values —— 工作流保存 / 队列执行不受影响。
  *
- * 面板结构：
- *   [provider 分段选择：本地 | DeepSeek 云端 | 自定义端点]
- *   [云端页]
- *     ├ 账号卡：邮箱 / 密码 / 绑定账号 + 测试 / 状态徽标
- *     └ 连接信息：网关地址（本机 ds2api）、模型、最近一次反推结果（框数/耗时）
- *   [结果页（特色）]：最近一次反推的框叠在缩略图上可视化
+ * 面板结构（间距宽松，分区卡片）：
+ *   顶栏   provider 分段 + 状态灯
+ *   输入区 用户提示词（多行）
+ *   本地页 模型 / 量化 / rule / 生成长度 / batch_index / 清场开关 / 标签模式
+ *   云端页 账号卡（绑定 / 测试）+ 结果框可视化
+ *   端点页 地址 / 密钥 / 模型 / 思考开关
  */
 import { app } from "../../scripts/app.js";
 
@@ -20,67 +19,96 @@ const PROP = "arReverseCloud";
 const LS_PASSWORD = "arReverseDeepseekPassword";
 const LS_ACCOUNT = "arReverseDeepseekAccount";
 const GATEWAY = "http://127.0.0.1:5001";
-const ADMIN_KEY_DEFAULT = ""; // 首次绑定时填一次，存 localStorage
 
 const STYLE_ID = "ar-reverse-cloud-css";
 const CSS = `
-.arcloud { display:flex; flex-direction:column; gap:8px; padding:10px 12px;
-  font:12px/1.45 system-ui,sans-serif; color:var(--fg-color,#ddd);
-  background:var(--comfy-input-bg,#2a2a2e); border-radius:8px; height:100%; box-sizing:border-box; }
-.arcloud-head { display:flex; align-items:center; gap:8px; }
-.arcloud-title { font-weight:600; font-size:12px; letter-spacing:.4px; opacity:.9; }
-.arcloud-dot { width:8px; height:8px; border-radius:50%; background:#777; flex:none; }
-.arcloud-dot.ok { background:#59c159; box-shadow:0 0 6px #59c15988; }
-.arcloud-dot.err { background:#e05555; }
-.arcloud-dot.busy { background:#e0b855; animation:arcloudPulse 1s infinite; }
-@keyframes arcloudPulse { 50% { opacity:.4; } }
-.arcloud-seg { display:flex; border:1px solid var(--border-color,#444); border-radius:6px; overflow:hidden; }
-.arcloud-seg button { flex:1; padding:5px 4px; background:transparent; border:none; color:var(--fg-color,#ccc);
-  font:11px system-ui; cursor:pointer; white-space:nowrap; }
-.arcloud-seg button.on { background:var(--comfy-input-bg-active,#4a6cd4); color:#fff; }
-.arcloud-page { display:flex; flex-direction:column; gap:8px; min-height:0; }
-.arcloud-page.hidden { display:none; }
-.arcloud-card { border:1px solid var(--border-color,#444); border-radius:8px; padding:8px 10px;
-  display:flex; flex-direction:column; gap:6px; background:rgba(255,255,255,.02); }
-.arcloud-card-title { font-size:11px; font-weight:600; opacity:.75; letter-spacing:.3px; }
-.arcloud-row { display:flex; gap:6px; align-items:center; }
-.arcloud-field { flex:1; display:flex; flex-direction:column; gap:2px; min-width:0; }
-.arcloud-field label { font-size:10px; opacity:.6; }
-.arcloud-field input { background:var(--comfy-input-bg,#1e1e22); border:1px solid var(--border-color,#444);
-  border-radius:5px; padding:4px 8px; color:var(--fg-color,#ddd); font:11px system-ui; min-width:0; }
-.arcloud-btn { padding:5px 12px; border:1px solid var(--border-color,#444); border-radius:6px;
-  background:var(--comfy-input-bg,#333); color:var(--fg-color,#ddd); font:11px system-ui; cursor:pointer; white-space:nowrap; }
-.arcloud-btn:hover { filter:brightness(1.15); }
-.arcloud-btn:disabled { opacity:.45; cursor:default; }
-.arcloud-btn.primary { background:#3b63c4; border-color:#4a77e0; color:#fff; }
-.arcloud-status { font-size:10.5px; opacity:.85; min-height:14px; word-break:break-all; }
-.arcloud-status.ok { color:#7dd87d; }
-.arcloud-status.err { color:#ff7070; }
-.arcloud-preview { position:relative; border:1px solid var(--border-color,#444); border-radius:8px;
-  overflow:hidden; background:#111; min-height:90px; display:flex; align-items:center; justify-content:center; }
-.arcloud-preview img { max-width:100%; max-height:220px; display:block; }
-.arcloud-preview .empty { font-size:11px; opacity:.5; padding:20px; }
-.arcloud-boxes { position:absolute; inset:0; pointer-events:none; }
-.arcloud-box { position:absolute; border:1.5px solid #4a9ff0; background:rgba(74,159,240,.08); }
-.arcloud-box .n { position:absolute; top:-1px; left:-1px; background:#4a9ff0; color:#fff;
-  font:9px system-ui; padding:0 4px; border-radius:0 0 4px 0; }
-.arcloud-meta { display:flex; gap:10px; font-size:10.5px; opacity:.75; flex-wrap:wrap; }
-.arcloud-meta b { opacity:1; }
-.arcloud-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-.arcloud-ctl { display:flex; flex-direction:column; gap:3px; min-width:0; }
-.arcloud-ctl label { font-size:10px; opacity:.6; display:flex; justify-content:space-between; }
-.arcloud-ctl input[type=number], .arcloud-ctl select, .arcloud-ctl textarea {
-  background:var(--comfy-input-bg,#1e1e22); border:1px solid var(--border-color,#444);
-  border-radius:5px; padding:4px 8px; color:var(--fg-color,#ddd); font:11px system-ui; min-width:0; width:100%;
-  box-sizing:border-box; }
-.arcloud-ctl textarea { resize:vertical; min-height:64px; font-family:inherit; }
-.arcloud-switch { display:flex; align-items:center; justify-content:space-between; gap:6px; }
-.arcloud-switch .lab { font-size:11px; opacity:.8; }
-.arcloud-toggle { width:34px; height:18px; border-radius:9px; background:#555; position:relative; cursor:pointer; flex:none; transition:background .15s; }
-.arcloud-toggle.on { background:#3b63c4; }
-.arcloud-toggle::after { content:""; position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%;
-  background:#ddd; transition:left .15s; }
-.arcloud-toggle.on::after { left:18px; }
+/* ===== 节点壳：本体只在标题栏 + 端口，body 全给面板 ===== */
+.arshell { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 12px;
+  font: 12px/1.5 system-ui, sans-serif; color: var(--fg-color, #dcdcde);
+  background: var(--comfy-input-bg, #2b2b30); height: 100%; box-sizing: border-box;
+  overflow-y: auto; overflow-x: hidden; }
+.arshell::-webkit-scrollbar { width: 8px; }
+.arshell::-webkit-scrollbar-thumb { background: #444a; border-radius: 4px; }
+
+/* 顶栏 */
+.ar-head { display: flex; align-items: center; gap: 10px; }
+.ar-head .t { font-weight: 700; font-size: 12.5px; letter-spacing: .5px; }
+.ar-dot { width: 9px; height: 9px; border-radius: 50%; background: #6a6a72; flex: none; }
+.ar-dot.ok { background: #4fc46a; box-shadow: 0 0 8px #4fc46a77; }
+.ar-dot.err { background: #e05555; box-shadow: 0 0 8px #e0555577; }
+.ar-dot.busy { background: #e0b855; animation: arPulse 1s infinite; }
+@keyframes arPulse { 50% { opacity: .35; } }
+.ar-head .sp { flex: 1; }
+
+/* 分段选择 */
+.ar-seg { display: flex; gap: 4px; background: rgba(0,0,0,.28); padding: 3px; border-radius: 9px; }
+.ar-seg button { flex: 1; padding: 7px 6px; border: none; border-radius: 7px;
+  background: transparent; color: var(--fg-color, #bbb); font: 11.5px system-ui;
+  cursor: pointer; transition: background .12s, color .12s; white-space: nowrap; }
+.ar-seg button.on { background: #3f66cc; color: #fff; font-weight: 600; }
+.ar-seg button:hover:not(.on) { background: rgba(255,255,255,.07); }
+
+/* 分区卡片 */
+.ar-card { border: 1px solid rgba(255,255,255,.09); border-radius: 10px;
+  background: rgba(255,255,255,.025); padding: 12px 14px; display: flex;
+  flex-direction: column; gap: 10px; }
+.ar-card>.cap { font-size: 10.5px; font-weight: 700; letter-spacing: 1px;
+  text-transform: uppercase; opacity: .5; margin-bottom: 2px; }
+
+/* 表单行 */
+.ar-row { display: flex; gap: 10px; }
+.ar-row>* { flex: 1; min-width: 0; }
+.ar-f { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ar-f>label { font-size: 10.5px; opacity: .55; }
+.ar-f input, .ar-f select, .ar-f textarea {
+  background: rgba(0,0,0,.3); border: 1px solid rgba(255,255,255,.12);
+  border-radius: 7px; padding: 7px 10px; color: var(--fg-color, #ddd);
+  font: 12px system-ui; width: 100%; box-sizing: border-box; }
+.ar-f textarea { resize: vertical; min-height: 58px; line-height: 1.45; }
+.ar-f input:focus, .ar-f select:focus, .ar-f textarea:focus {
+  outline: none; border-color: #3f66cc; }
+.ar-f input[type=number]::-webkit-inner-spin-button { opacity: .4; }
+
+/* 开关行 */
+.ar-sw { display: flex; align-items: center; justify-content: space-between;
+  padding: 3px 0; }
+.ar-sw .lab { font-size: 12px; opacity: .85; }
+.ar-tg { width: 38px; height: 20px; border-radius: 10px; background: rgba(255,255,255,.14);
+  position: relative; cursor: pointer; flex: none; transition: background .15s; }
+.ar-tg.on { background: #3f66cc; }
+.ar-tg::after { content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px;
+  border-radius: 50%; background: #e8e8ea; transition: left .15s; }
+.ar-tg.on::after { left: 21px; }
+
+/* 按钮 */
+.ar-btn { padding: 7px 16px; border: 1px solid rgba(255,255,255,.14); border-radius: 7px;
+  background: rgba(255,255,255,.06); color: var(--fg-color, #ddd);
+  font: 12px system-ui; cursor: pointer; white-space: nowrap; transition: filter .12s; }
+.ar-btn:hover { filter: brightness(1.25); }
+.ar-btn:disabled { opacity: .4; cursor: default; }
+.ar-btn.pri { background: #3f66cc; border-color: #5580e0; color: #fff; font-weight: 600; }
+
+/* 状态行 */
+.ar-status { font-size: 11.5px; min-height: 16px; word-break: break-all; opacity: .9; }
+.ar-status.ok { color: #7bd88a; }
+.ar-status.err { color: #ff7373; }
+
+/* 结果预览 */
+.ar-prev { position: relative; border: 1px solid rgba(255,255,255,.1); border-radius: 10px;
+  overflow: hidden; background: #101014; min-height: 110px;
+  display: flex; align-items: center; justify-content: center; }
+.ar-prev img { width: 100%; max-height: 240px; object-fit: contain; display: block; }
+.ar-prev .empty { font-size: 11.5px; opacity: .4; padding: 26px 12px; text-align: center; }
+.ar-boxes { position: absolute; inset: 0; pointer-events: none; }
+.ar-box { position: absolute; border: 1.5px solid #4a9ff0; background: rgba(74,159,240,.09);
+  box-shadow: 0 0 0 1px rgba(0,0,0,.4); }
+.ar-box .n { position: absolute; top: -1px; left: -1px; background: #4a9ff0; color: #fff;
+  font: 9px system-ui; padding: 1px 5px; border-radius: 0 0 5px 0; }
+.ar-meta { display: flex; gap: 16px; font-size: 11px; opacity: .7; flex-wrap: wrap; }
+.ar-meta b { opacity: 1; color: var(--fg-color, #eee); }
+
+.ar-page { display: flex; flex-direction: column; gap: 12px; }
+.ar-page.hidden { display: none; }
 `;
 
 function injectStyle() {
@@ -117,173 +145,59 @@ async function jsonFetch(url, opts = {}) {
 	return data;
 }
 
-async function adminJwt() {
-	const key = localStorage.getItem("arReverseAdminKey") || ADMIN_KEY_DEFAULT;
-	const data = await jsonFetch(`${GATEWAY}/admin/login`, {
-		method: "POST", body: JSON.stringify({ admin_key: key }),
-	});
-	return data.token;
-}
+// ================= 原生 widget 接管 =================
+//
+// node.widgets 摘掉全部原生 widget，只在面板 widget 上渲染。
+// 序列化（保存工作流 / graphToPrompt 队列）时通过覆写 serializeValue 的集合行为还原。
+// 实现：把原 widgets 存到 node[AR_ORIG]，覆写 node.serialize 用「临时换回」策略。
 
-// ---------- 账号绑定 ----------
+const AR_ORIG = Symbol("ar-orig-widgets");
 
-async function bindAccount(ui) {
-	const account = ui.accountInput.value.trim();
-	const password = ui.passwordInput.value;
-	if (!account || !password) {
-		setStatus(ui, "err", "邮箱和密码都要填");
-		return;
-	}
-	ui.bindBtn.disabled = true;
-	ui.dot.className = "arcloud-dot busy";
-	setStatus(ui, "", "正在绑定账号到本机网关…");
-	try {
-		const jwt = await adminJwt();
-		// 已存在就更新（PUT），否则新增（POST）
-		const list = await jsonFetch(`${GATEWAY}/admin/accounts`, { headers: { Authorization: `Bearer ${jwt}` } });
-		const exists = (list.items || []).some((a) => a.identifier === account);
-		if (!exists) {
-			await jsonFetch(`${GATEWAY}/admin/accounts`, {
-				method: "POST",
-				headers: { Authorization: `Bearer ${jwt}` },
-				body: JSON.stringify({ email: account, password, name: "反推节点", remark: "ComfyUI 反推节点绑定" }),
-			});
+function detachWidgets(node) {
+	// 幂等：无论被调多少次，widgets 里只剩面板；原生按名字收集（去重保序）
+	const names = new Set(node[AR_ORIG]?.map((w) => w.name) || []);
+	const natives = (node.widgets || []).filter((w) => w.name !== "arcloud_panel" && w.name !== "image");
+	const kept = [];
+	for (const w of natives) {
+		if (!names.has(w.name)) { names.add(w.name); kept.push(w); }
+		else {
+			// 已有同名原件 → 保留值新的那个（后填的）
+			const idx = node[AR_ORIG] ? node[AR_ORIG].findIndex((x) => x.name === w.name) : -1;
+			if (idx >= 0 && node[AR_ORIG]) node[AR_ORIG][idx] = w;
 		}
-		localStorage.setItem(LS_ACCOUNT, account);
-		localStorage.setItem(LS_PASSWORD, password);
-		stateFor(ui.node).account = account;
-		saveState(ui.node);
-		ui.accountInput.value = account;
-		await testAccount(ui, { silentBind: true });
-	} catch (e) {
-		ui.dot.className = "arcloud-dot err";
-		setStatus(ui, "err", "绑定失败：" + (e.message || e));
-	} finally {
-		ui.bindBtn.disabled = false;
+	}
+	node[AR_ORIG] = (node[AR_ORIG] || []).concat(kept);
+	node.widgets = (node.widgets || []).filter((w) => w.name === "arcloud_panel" || w.name === "image");
+	// 摘除的 widget 若有已挂载的 DOM（Vue/DOM widget 容器），直接卸载，防 label 残影
+	for (const w of node[AR_ORIG]) {
+		if (w.element?.parentNode) w.element.parentNode.removeChild(w.element);
+		if (w.inputEl?.parentNode) w.inputEl.parentNode.removeChild(w.inputEl);
 	}
 }
 
-async function testAccount(ui, { silentBind = false } = {}) {
-	const account = localStorage.getItem(LS_ACCOUNT) || ui.accountInput.value.trim();
-	if (!account) { setStatus(ui, "err", "没有已绑定的账号"); return null; }
-	ui.testBtn && (ui.testBtn.disabled = true);
-	ui.dot.className = "arcloud-dot busy";
-	if (!silentBind) setStatus(ui, "", "测试网关连通与账号状态…");
+function withOrigWidgets(node, fn) {
+	if (!node[AR_ORIG]) return fn();
+	const panel = node.widgets || [];
+	const own = node.widgets;
+	node.widgets = panel.concat(node[AR_ORIG]);
 	try {
-		const KEY = ui.node.widgets?.find((w) => w.name === "openai_key")?.value || "";
-		const t0 = performance.now();
-		const data = await jsonFetch(`${GATEWAY}/v1/chat/completions`, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${KEY}` },
-			body: JSON.stringify({ model: "deepseek-v4.1-flash-nothinking", max_tokens: 5,
-				messages: [{ role: "user", content: "ping" }] }),
-		});
-		const ms = Math.round(performance.now() - t0);
-		ui.dot.className = "arcloud-dot ok";
-		const who = data.model || "deepseek";
-		setStatus(ui, "ok", `连通正常（${ms}ms，${who}）`);
-		return true;
-	} catch (e) {
-		ui.dot.className = "arcloud-dot err";
-		setStatus(ui, "err", "测试失败：" + (e.message || e));
-		return false;
+		return fn();
 	} finally {
-		ui.testBtn && (ui.testBtn.disabled = false);
+		node.widgets = own;
 	}
 }
 
-function setStatus(ui, cls, text) {
-	ui.status.textContent = text;
-	ui.status.className = "arcloud-status" + (cls ? " " + cls : "");
-}
-
-// ---------- 结果可视化（特色）：框叠缩略图 ----------
-
-function renderPreview(ui, node) {
-	const st = stateFor(node);
-	const holder = ui.preview;
-	holder.innerHTML = "";
-	const result = st.lastResult;
-	if (!result || !Array.isArray(result.boxes) || !result.boxes.length) {
-		holder.append(el("div", "empty", "跑一次反推后，布局框会叠在缩略图上显示在这里"));
-		return;
-	}
-	if (result.thumb) {
-		const img = el("img");
-		img.src = result.thumb;
-		holder.append(img);
-	}
-	const layer = el("div", "arcloud-boxes");
-	const boxes = result.boxes.slice(0, 24);
-	for (const b of boxes) {
-		const [x0, y0, x1, y1] = b.bbox || [0, 0, 0, 0];
-		const d = el("div", "arcloud-box");
-		d.style.left = (x0 / 10) + "%";
-		d.style.top = (y0 / 10) + "%";
-		d.style.width = Math.max(1, (x1 - x0) / 10) + "%";
-		d.style.height = Math.max(1, (y1 - y0) / 10) + "%";
-		const idx = boxes.indexOf(b) + 1;
-		d.title = (b.desc || b.text || "").slice(0, 220);
-		d.append(el("span", "n", String(idx)));
-		layer.append(d);
-	}
-	holder.append(layer);
-}
-
-function wireResultCapture(node, api) {
-	// 拦截节点执行结果：214 的 text 输出就是反推 JSON
-	const orig = node.onExecuted;
-	node.onExecuted = function (msg) {
-		orig?.apply(this, arguments);
-		try {
-			const texts = msg?.text || (msg && Object.values(msg).find((v) => Array.isArray(v) && typeof v[0] === "string"));
-			const raw = Array.isArray(texts) ? texts[0] : texts;
-			if (typeof raw !== "string" || !raw.trim().startsWith("[")) return;
-			const boxes = JSON.parse(raw);
-			const st = stateFor(node);
-			st.lastResult = {
-				boxes: Array.isArray(boxes) ? boxes : [],
-				dur: msg?._ar_dur || null,
-				thumb: st.lastResult?.thumb || null,
-				ts: Date.now(),
-			};
-			saveState(node);
-			if (ui_map.get(node)) { renderPreview(ui_map.get(node), node); updateMeta(ui_map.get(node), st); }
-		} catch { /* 非 JSON 输出忽略 */ }
-	};
-}
-
-function updateMeta(ui, st) {
-	const r = st.lastResult;
-	const n = r && Array.isArray(r.boxes) ? r.boxes.length : 0;
-	ui.meta.innerHTML = "";
-	ui.meta.append(
-		el("span", "", "框数 "), el("b", "", String(n)),
-		el("span", "", "账号 "), el("b", "", st.account || localStorage.getItem(LS_ACCOUNT) || "未绑定"),
-	);
-}
-
-// ---------- 原生 widget 控制（真源是 widget.value，面板控件只是外壳） ----------
+// ================= 面板控件（值写回原生 widget 对象） =================
 
 function widgetOf(node, name) {
-	return (node.widgets || []).find((w) => w.name === name);
+	return (node[AR_ORIG] || []).find((w) => w.name === name);
 }
 
-function hideAllWidgets(node) {
-	// 全部原生 widget 收进面板：本体不再露出那排杆
-	for (const w of node.widgets || []) {
-		if (w.name === "arcloud_panel" || w.name === "image") continue;
-		if (w.computeSize) w.computeSize = () => [0, -1];
-		w.hidden = true;
-		if (w.onRemove) { /* keep */ }
-	}
-}
-
-function ctlText(ui, node, name, labelText, { multiline = false, placeholder = "" } = {}) {
+function ctlText(ui, name, labelText, { multiline = false, placeholder = "" } = {}) {
+	const node = ui.node;
 	const w = widgetOf(node, name);
-	const c = el("div", "arcloud-ctl");
-	const lab = el("label", "", labelText);
-	c.append(lab);
+	const c = el("div", "ar-f");
+	c.append(el("label", "", labelText));
 	let input;
 	if (multiline) {
 		input = el("textarea");
@@ -296,15 +210,16 @@ function ctlText(ui, node, name, labelText, { multiline = false, placeholder = "
 	input.value = w?.value ?? "";
 	input.addEventListener("change", () => {
 		if (w) { w.value = input.value; w.callback?.(input.value); saveState(node); }
+		ui.resize();
 	});
 	c.append(input);
-	ui.widgets[name] = { input, w };
 	return c;
 }
 
-function ctlNum(ui, node, name, labelText, { min = 0, max = 999999 } = {}) {
+function ctlNum(ui, name, labelText, { min = 0, max = 999999 } = {}) {
+	const node = ui.node;
 	const w = widgetOf(node, name);
-	const c = el("div", "arcloud-ctl");
+	const c = el("div", "ar-f");
 	c.append(el("label", "", labelText));
 	const input = el("input");
 	input.type = "number";
@@ -318,13 +233,13 @@ function ctlNum(ui, node, name, labelText, { min = 0, max = 999999 } = {}) {
 		if (w) { w.value = v; w.callback?.(v); saveState(node); }
 	});
 	c.append(input);
-	ui.widgets[name] = { input, w };
 	return c;
 }
 
-function ctlSelect(ui, node, name, labelText) {
+function ctlSelect(ui, name, labelText) {
+	const node = ui.node;
 	const w = widgetOf(node, name);
-	const c = el("div", "arcloud-ctl");
+	const c = el("div", "ar-f");
 	c.append(el("label", "", labelText));
 	const sel = el("select");
 	for (const opt of w?.options?.values || []) {
@@ -337,49 +252,205 @@ function ctlSelect(ui, node, name, labelText) {
 		if (w) { w.value = sel.value; w.callback?.(sel.value); saveState(node); }
 	});
 	c.append(sel);
-	ui.widgets[name] = { input: sel, w };
 	return c;
 }
 
-function ctlToggle(ui, node, name, labelText) {
+function ctlToggle(ui, name, labelText) {
+	const node = ui.node;
 	const w = widgetOf(node, name);
-	const row = el("div", "arcloud-switch");
+	const row = el("div", "ar-sw");
 	row.append(el("span", "lab", labelText));
-	const t = el("div", "arcloud-toggle" + (w?.value ? " on" : ""));
+	const t = el("div", "ar-tg" + (w?.value ? " on" : ""));
 	t.addEventListener("click", () => {
 		const v = !t.classList.contains("on");
 		t.classList.toggle("on", v);
 		if (w) { w.value = v; w.callback?.(v); saveState(node); }
 	});
 	row.append(t);
-	ui.widgets[name] = { input: t, w };
 	return row;
 }
 
-// ---------- 面板构建 ----------
+// ================= 账号绑定 / 测试 =================
+
+function setStatus(ui, cls, text) {
+	ui.status.textContent = text;
+	ui.status.className = "ar-status" + (cls ? " " + cls : "");
+}
+
+async function adminJwt() {
+	const key = localStorage.getItem("arReverseAdminKey") || "";
+	if (!key) throw new Error("先填网关管理密钥（ds2api admin key）");
+	const data = await jsonFetch(`${GATEWAY}/admin/login`, {
+		method: "POST", body: JSON.stringify({ admin_key: key }),
+	});
+	return data.token;
+}
+
+async function bindAccount(ui) {
+	const account = ui.accountInput.value.trim();
+	const password = ui.passwordInput.value;
+	if (!account || !password) {
+		setStatus(ui, "err", "邮箱和密码都要填");
+		return;
+	}
+	ui.bindBtn.disabled = true;
+	ui.dot.className = "ar-dot busy";
+	setStatus(ui, "", "正在绑定账号到本机网关…");
+	try {
+		const jwt = await adminJwt();
+		const list = await jsonFetch(`${GATEWAY}/admin/accounts`, { headers: { Authorization: `Bearer ${jwt}` } });
+		const exists = (list.items || []).some((a) => a.identifier === account);
+		if (!exists) {
+			await jsonFetch(`${GATEWAY}/admin/accounts`, {
+				method: "POST",
+				headers: { Authorization: `Bearer ${jwt}` },
+				body: JSON.stringify({ email: account, password, name: "反推节点", remark: "ComfyUI 反推节点绑定" }),
+			});
+		}
+		localStorage.setItem(LS_ACCOUNT, account);
+		localStorage.setItem(LS_PASSWORD, password);
+		stateFor(ui.node).account = account;
+		saveState(ui.node);
+		await testAccount(ui, { silent: true });
+	} catch (e) {
+		ui.dot.className = "ar-dot err";
+		setStatus(ui, "err", "绑定失败：" + (e.message || e));
+	} finally {
+		ui.bindBtn.disabled = false;
+		ui.resize();
+	}
+}
+
+async function testAccount(ui, { silent = false } = {}) {
+	const account = localStorage.getItem(LS_ACCOUNT) || ui.accountInput.value.trim();
+	if (!account) { setStatus(ui, "err", "没有已绑定的账号"); return null; }
+	ui.testBtn.disabled = true;
+	ui.dot.className = "ar-dot busy";
+	if (!silent) setStatus(ui, "", "测试网关连通与账号状态…");
+	try {
+		const KEY = widgetOf(ui.node, "openai_key")?.value || "";
+		const t0 = performance.now();
+		const data = await jsonFetch(`${GATEWAY}/v1/chat/completions`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${KEY}` },
+			body: JSON.stringify({ model: "deepseek-v4.1-flash-nothinking", max_tokens: 5,
+				messages: [{ role: "user", content: "ping" }] }),
+		});
+		const ms = Math.round(performance.now() - t0);
+		ui.dot.className = "ar-dot ok";
+		setStatus(ui, "ok", `连通正常（${ms}ms，${data.model || "deepseek"}）`);
+		return true;
+	} catch (e) {
+		ui.dot.className = "ar-dot err";
+		setStatus(ui, "err", "测试失败：" + (e.message || e));
+		return false;
+	} finally {
+		ui.testBtn.disabled = false;
+		ui.resize();
+	}
+}
+
+// ================= 结果可视化 =================
+
+function apiUrl(item) {
+	const p = new URLSearchParams({ filename: item.filename, subfolder: item.subfolder || "", type: item.type || "input" });
+	return "/view?" + p.toString();
+}
+
+function renderPreview(ui) {
+	const st = stateFor(ui.node);
+	const holder = ui.preview;
+	holder.innerHTML = "";
+	const result = st.lastResult;
+	if (!result || !Array.isArray(result.boxes) || !result.boxes.length) {
+		holder.append(el("div", "empty", "跑一次反推后，布局框会叠在缩略图上显示在这里"));
+	} else {
+		if (result.thumb) {
+			const img = el("img");
+			img.src = result.thumb;
+			holder.append(img);
+		}
+		const layer = el("div", "ar-boxes");
+		const boxes = result.boxes.slice(0, 24);
+		boxes.forEach((b, idx) => {
+			const [x0, y0, x1, y1] = b.bbox || [0, 0, 0, 0];
+			const d = el("div", "ar-box");
+			d.style.left = (x0 / 10) + "%";
+			d.style.top = (y0 / 10) + "%";
+			d.style.width = Math.max(1, (x1 - x0) / 10) + "%";
+			d.style.height = Math.max(1, (y1 - y0) / 10) + "%";
+			d.title = (b.desc || b.text || "").slice(0, 220);
+			d.append(el("span", "n", String(idx + 1)));
+			layer.append(d);
+		});
+		holder.append(layer);
+	}
+	const n = result && Array.isArray(result.boxes) ? result.boxes.length : 0;
+	ui.meta.innerHTML = "";
+	ui.meta.append(
+		el("span", "", "框数 "), el("b", "", String(n)),
+		el("span", "", "账号 "), el("b", "", st.account || localStorage.getItem(LS_ACCOUNT) || "未绑定"),
+	);
+	ui.resize();
+}
+
+function wireResultCapture(ui) {
+	const node = ui.node;
+	const orig = node.onExecuted;
+	node.onExecuted = function (msg) {
+		orig?.apply(this, arguments);
+		try {
+			const texts = msg?.text || (msg && Object.values(msg).find((v) => Array.isArray(v) && typeof v[0] === "string"));
+			const raw = Array.isArray(texts) ? texts[0] : texts;
+			if (typeof raw !== "string" || !raw.trim().startsWith("[")) return;
+			const boxes = JSON.parse(raw);
+			const st = stateFor(node);
+			st.lastResult = {
+				boxes: Array.isArray(boxes) ? boxes : [],
+				thumb: st.lastResult?.thumb || null,
+				ts: Date.now(),
+			};
+			saveState(node);
+			renderPreview(ui);
+		} catch { /* 非 JSON 输出忽略 */ }
+	};
+	// 输入图缩略图：LoadImage 的 image widget 带预览 img
+	const iv = setInterval(() => {
+		if (!document.contains(ui.root)) { clearInterval(iv); return; }
+		const st = stateFor(node);
+		if (!st.lastResult || st.lastResult.thumb) return;
+		const src = node.images?.[0] ? apiUrl(node.images[0]) : null;
+		if (src) {
+			st.lastResult.thumb = src;
+			renderPreview(ui);
+		}
+	}, 3000);
+}
+
+// ================= 面板 =================
 
 const ui_map = new WeakMap();
 
 function buildPanel(node) {
 	const st = stateFor(node);
-	const root = el("div", "arcloud");
-	const ui = { node, root, widgets: {} };
+	const root = el("div", "arshell");
+	const ui = {
+		node, root,
+		resize: null, // 后面挂
+	};
 	ui_map.set(node, ui);
 
-	// 头部
-	const head = el("div", "arcloud-head");
-	ui.dot = el("span", "arcloud-dot");
-	head.append(el("span", "arcloud-title", "DeepSeek 云端反推"), ui.dot);
+	// ---- 顶栏 ----
+	const head = el("div", "ar-head");
+	head.append(el("span", "t", "布局反推"));
+	ui.dot = el("span", "ar-dot");
+	head.append(ui.dot, el("span", "sp"));
 	root.append(head);
 
-	// provider 分段
-	const seg = el("div", "arcloud-seg");
-	const options = [
-		["local", "本地模型"],
-		["ds", "DeepSeek 云端"],
-		["custom", "自定义端点"],
-	];
+	// ---- provider 分段 ----
+	const seg = el("div", "ar-seg");
 	const segBtns = [];
+	const options = [["local", "本地模型"], ["ds", "DeepSeek 云端"], ["custom", "自定义端点"]];
 	for (const [key, label] of options) {
 		const b = el("button", st.provider === key ? "on" : "", label);
 		b.addEventListener("click", () => {
@@ -393,159 +464,175 @@ function buildPanel(node) {
 		seg.append(b);
 	}
 	root.append(seg);
-	root.append(ctlText(ui, node, "user_prompt", "用户提示词（画廊标签 / 手写补充）", { multiline: true, placeholder: "留空 = 只用节点输入" }));
 
-	// 页面：本地
-	const pageLocal = el("div", "arcloud-page");
-	const localGrid = el("div", "arcloud-grid");
-	localGrid.append(
-		ctlSelect(ui, node, "model_name", "模型（models/LLM 下）"),
-		ctlSelect(ui, node, "quant", "量化"),
-	);
-	pageLocal.append(localGrid);
-	pageLocal.append(ctlText(ui, node, "rule", "规则提示词（rule）", { multiline: true }));
-	const localGrid2 = el("div", "arcloud-grid");
-	localGrid2.append(
-		ctlNum(ui, node, "max_new_tokens", "最大生成长度", { min: 64, max: 65536 }),
-		ctlNum(ui, node, "batch_index", "batch_index", { min: 0, max: 64 }),
-	);
-	pageLocal.append(localGrid2);
-	const localToggles = el("div", "arcloud-grid");
-	localToggles.append(ctlToggle(ui, node, "pre_clear", "反推前清场"));
-	localToggles.append(ctlToggle(ui, node, "offload_after", "结束后卸载模型"));
-	pageLocal.append(localToggles);
-	pageLocal.append(ctlSelect(ui, node, "tag_mode", "画廊标签模式"));
+	// ---- 输入区 ----
+	const inCard = el("div", "ar-card");
+	inCard.append(el("div", "cap", "输入"));
+	inCard.append(ctlText(ui, "user_prompt", "用户提示词（画廊标签 / 手写补充）", {
+		multiline: true, placeholder: "留空 = 只用节点输入",
+	}));
+	root.append(inCard);
+
+	// ---- 本地页 ----
+	const pageLocal = el("div", "ar-page");
+	const c1 = el("div", "ar-card");
+	c1.append(el("div", "cap", "本地模型"));
+	const g1 = el("div", "ar-row");
+	g1.append(ctlSelect(ui, "model_name", "模型（models/LLM）"), ctlSelect(ui, "quant", "量化"));
+	c1.append(g1);
+	const g2 = el("div", "ar-row");
+	g2.append(ctlNum(ui, "max_new_tokens", "最大生成长度", { min: 64, max: 65536 }), ctlNum(ui, "batch_index", "batch_index", { min: 0, max: 64 }));
+	c1.append(g2);
+	pageLocal.append(c1);
+
+	const c2 = el("div", "ar-card");
+	c2.append(el("div", "cap", "运行"));
+	c2.append(ctlToggle(ui, "pre_clear", "反推前清场（腾显存）"));
+	c2.append(ctlToggle(ui, "offload_after", "结束后卸载模型"));
+	const g3 = el("div", "ar-row");
+	g3.append(ctlSelect(ui, "tag_mode", "画廊标签模式"));
+	pageLocal.append(c2, g3);
+
+	const c3 = el("div", "ar-card");
+	c3.append(el("div", "cap", "规则提示词 rule"));
+	c3.append(ctlText(ui, "rule", "布局规则（框选 / 前后关系 / 输出格式）", { multiline: true }));
+	pageLocal.append(c3);
 	root.append(pageLocal);
 
-	// 页面：云端
-	const pageDs = el("div", "arcloud-page");
-	const accountCard = el("div", "arcloud-card");
-	accountCard.append(el("div", "arcloud-card-title", "DeepSeek 账号（密码只存在本浏览器）"));
-	const rowAcc = el("div", "arcloud-row");
-	const fAcc = el("div", "arcloud-field");
+	// ---- 云端页 ----
+	const pageDs = el("div", "ar-page");
+	const acc = el("div", "ar-card");
+	acc.append(el("div", "cap", "DeepSeek 账号（密码只存本浏览器）"));
+	const r1 = el("div", "ar-row");
+	const fAcc = el("div", "ar-f");
 	fAcc.append(el("label", "", "邮箱 / 手机号"));
 	ui.accountInput = el("input");
 	ui.accountInput.value = localStorage.getItem(LS_ACCOUNT) || st.account || "";
 	fAcc.append(ui.accountInput);
-	rowAcc.append(fAcc);
-	accountCard.append(rowAcc);
-	const rowPw = el("div", "arcloud-row");
-	const fPw = el("div", "arcloud-field");
+	r1.append(fAcc);
+	acc.append(r1);
+	const r2 = el("div", "ar-row");
+	const fPw = el("div", "ar-f");
 	fPw.append(el("label", "", "密码"));
 	ui.passwordInput = el("input");
 	ui.passwordInput.type = "password";
 	ui.passwordInput.value = localStorage.getItem(LS_PASSWORD) || "";
 	fPw.append(ui.passwordInput);
-	rowPw.append(fPw);
-	ui.bindBtn = el("button", "arcloud-btn primary", "绑定");
+	r2.append(fPw);
+	ui.bindBtn = el("button", "ar-btn pri", "绑定");
 	ui.bindBtn.addEventListener("click", () => bindAccount(ui));
-	rowPw.append(ui.bindBtn);
-	accountCard.append(rowPw);
-	const rowOps = el("div", "arcloud-row");
-	ui.testBtn = el("button", "arcloud-btn", "测试连通");
+	r2.append(ui.bindBtn);
+	acc.append(r2);
+	const r3 = el("div", "ar-row");
+	ui.testBtn = el("button", "ar-btn", "测试连通");
 	ui.testBtn.addEventListener("click", () => testAccount(ui));
-	rowOps.append(ui.testBtn);
-	const keyHint = el("div", "arcloud-field");
-	keyHint.append(el("label", "", "网关管理密钥（首次绑定填一次）"));
+	r3.append(ui.testBtn);
+	const fAdmin = el("div", "ar-f");
+	fAdmin.append(el("label", "", "网关管理密钥（首次绑定填一次）"));
 	const adminInput = el("input");
 	adminInput.type = "password";
 	adminInput.placeholder = "ds2api admin key";
 	adminInput.value = localStorage.getItem("arReverseAdminKey") || "";
 	adminInput.addEventListener("change", () => localStorage.setItem("arReverseAdminKey", adminInput.value.trim()));
-	keyHint.append(adminInput);
-	rowOps.append(keyHint);
-	accountCard.append(rowOps);
-	ui.status = el("div", "arcloud-status");
-	accountCard.append(ui.status);
-	pageDs.append(accountCard);
+	fAdmin.append(adminInput);
+	r3.append(fAdmin);
+	acc.append(r3);
+	ui.status = el("div", "ar-status");
+	acc.append(ui.status);
+	pageDs.append(acc);
 	root.append(pageDs);
 
-	// 页面：自定义端点
-	const pageCustom = el("div", "arcloud-page");
-	pageCustom.append(ctlText(ui, node, "openai_base", "请求地址（base URL）", { placeholder: "https://api.deepseek.com" }));
-	pageCustom.append(ctlText(ui, node, "openai_key", "API 密钥", { placeholder: "sk-..." }));
-	pageCustom.append(ctlText(ui, node, "openai_model", "模型名", { placeholder: "deepseek-v4.1-flash" }));
-	pageCustom.append(ctlToggle(ui, node, "deepseek_thinking", "深度思考"));
+	// ---- 自定义端点页 ----
+	const pageCustom = el("div", "ar-page");
+	const cc = el("div", "ar-card");
+	cc.append(el("div", "cap", "OpenAI 兼容端点"));
+	cc.append(ctlText(ui, "openai_base", "请求地址（base URL）", { placeholder: "https://api.deepseek.com" }));
+	cc.append(ctlText(ui, "openai_key", "API 密钥", { placeholder: "sk-..." }));
+	cc.append(ctlText(ui, "openai_model", "模型名", { placeholder: "deepseek-v4.1-flash" }));
+	cc.append(ctlToggle(ui, "deepseek_thinking", "深度思考（关了更快）"));
+	pageCustom.append(cc);
 	root.append(pageCustom);
 
-	// 结果预览（特色）
-	const previewCard = el("div", "arcloud-card");
-	previewCard.append(el("div", "arcloud-card-title", "最近一次反推结果"));
-	ui.preview = el("div", "arcloud-preview");
+	// ---- 结果预览 ----
+	const pc = el("div", "ar-card");
+	pc.append(el("div", "cap", "最近一次反推结果"));
+	ui.preview = el("div", "ar-prev");
 	ui.preview.append(el("div", "empty", "跑一次反推后，布局框会叠在缩略图上显示在这里"));
-	previewCard.append(ui.preview);
-	ui.meta = el("div", "arcloud-meta");
-	previewCard.append(ui.meta);
-	root.append(previewCard);
+	pc.append(ui.preview);
+	ui.meta = el("div", "ar-meta");
+	pc.append(ui.meta);
+	root.append(pc);
+
+	const PROVIDER_MAP = { local: "本地模型（transformers）", ds: "DeepSeek 云端（ds2api 本地网关）", custom: "自定义 OpenAI 兼容端点" };
 
 	function applyProvider() {
 		pageLocal.classList.toggle("hidden", st.provider !== "local");
 		pageDs.classList.toggle("hidden", st.provider !== "ds");
 		pageCustom.classList.toggle("hidden", st.provider !== "custom");
-		// 同步 provider widget 值
-		const w = (node.widgets || []).find((x) => x.name === "provider");
-		if (w) {
-			const map = { local: "本地模型（transformers）", ds: "DeepSeek 云端（ds2api 本地网关）", custom: "自定义 OpenAI 兼容端点" };
-			if (w.value !== map[st.provider]) { w.value = map[st.provider]; w.callback?.(); }
+		const w = widgetOf(node, "provider");
+		if (w && w.value !== PROVIDER_MAP[st.provider]) {
+			w.value = PROVIDER_MAP[st.provider];
+			w.callback?.();
 		}
+		ui.resize();
+	}
+
+	ui.resize = () => {
 		requestAnimationFrame(() => {
-			const panel = ui.root.getBoundingClientRect().height || 500;
-			node.setSize([node.size[0], panel + 46]);
+			if (!document.contains(root)) return;
+			const h = Math.ceil(root.scrollHeight) + 12;
+			const w0 = 430;
+			if (Math.abs((node.size[1] || 0) - h) > 6 || !(node.size[0] >= w0)) {
+				node.setSize([Math.max(node.size[0] || w0, w0), h]);
+			}
 			app.graph.setDirtyCanvas(true, true);
 		});
-	}
+	};
 	ui.applyProvider = applyProvider;
-	hideAllWidgets(node);
+
 	applyProvider();
-	renderPreview(ui, node);
-	updateMeta(ui, st);
+	renderPreview(ui);
 	return ui;
 }
+
+// ================= 扩展入口 =================
 
 app.registerExtension({
 	name: "AssembledRecipes.ReverseCloudPanel",
 
 	beforeRegisterNodeDef(nodeType, nodeData) {
 		if (nodeData?.name !== NODE_CLASS) return;
-		const orig = nodeType.prototype.onNodeCreated;
+
+		// 序列化（保存 / graphToPrompt）时把原生 widget 临时拼回，值按原顺序写出
+		const origSerialize = nodeType.prototype.serialize;
+		nodeType.prototype.serialize = function () {
+			if (!this[AR_ORIG]) return origSerialize?.apply(this, arguments);
+			return withOrigWidgets(this, () => origSerialize.apply(this, arguments));
+		};
+
+		const origOn = nodeType.prototype.onNodeCreated;
 		nodeType.prototype.onNodeCreated = function () {
-			const r = orig?.apply(this, arguments);
+			const r = origOn?.apply(this, arguments);
 			injectStyle();
+
+			// 先摘掉全部原生 widget（存 AR_ORIG），再建面板（控件从 AR_ORIG 取值），最后挂面板
+			detachWidgets(this);
 			const ui = buildPanel(this);
 			const widget = this.addDOMWidget("arcloud_panel", "custom", ui.root, { serialize: false });
-			widget.computeSize = () => [0, 420];
-			this.setSize([Math.max(this.size[0] || 320, 380), Math.max(this.size[1] || 300, 460)]);
-			wireResultCapture(this);
-			// 带缩略图：抓输入图的预览（LiteGraph 的 image 输入会在节点上挂 img）
-			const origExec = this.onExecuted;
-			this.onExecuted = function (msg) {
-				origExec?.apply(this, arguments);
+			widget.computeSize = () => {
+				const h = Math.ceil(ui.root.scrollHeight || 600) + 12;
+				return [0, h];
 			};
+			this.widgetsChanged?.();
+			ui.resize();
+			// 二次清扫：Vue 前端可能在 createNode 后又填充一轮 widget
+			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); ui.resize(); }, 0);
+			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); ui.resize(); }, 300);
+			wireResultCapture(ui);
+			// 输入图 / 节点尺寸变化时重算高度
+			const ro = new ResizeObserver(() => ui.resize());
+			ro.observe(ui.root);
 			return r;
 		};
-	},
-
-	nodeCreated(node) {
-		if (node.comfyClass !== NODE_CLASS) return;
-		// 输入图变化时把缩略图写进 lastResult.thumb（从节点的图像上传组件拿）
-		const tryThumb = () => {
-			const st = stateFor(node);
-			const ui = ui_map.get(node);
-			const imgWidget = (node.widgets || []).find((w) => w.name === "image" && w.img?.src) ||
-				(node.images?.[0] ? { img: { src: "/view?" + new URLSearchParams(node.images[0]) } } : null);
-			const src = imgWidget?.img?.src || (node.images?.[0] ? apiUrl(node.images[0]) : null);
-			if (src && st.lastResult && st.lastResult.thumb !== src) {
-				st.lastResult.thumb = src;
-				if (ui) renderPreview(ui, node);
-			}
-		};
-		function apiUrl(item) {
-			const p = new URLSearchParams({ filename: item.filename, subfolder: item.subfolder || "", type: item.type || "input" });
-			return "/view?" + p.toString();
-		}
-		const iv = setInterval(() => {
-			if (!document.contains(node?.domWidgetDataList?.[0]?.element || document.body)) { clearInterval(iv); return; }
-			tryThumb();
-		}, 3000);
 	},
 });
