@@ -1,224 +1,492 @@
-"""DeepSeek 节点内直连（不走 ds2api 网关）：账密登录 + 传图 + 补全。
+# -*- coding: utf-8 -*-
+"""DeepSeek 网页/App 协议直连客户端（纯 Python，无外部网关）。
 
-协议照 ds2api（Go）源码移植：
-  登录  POST /api/v0/users/login   明文 JSON {email|mobile, password, device_id, os:"web"}
-  上传  POST /api/v0/file/upload_file  multipart + x-model-type:default + PoW + x-file-size
-  就绪  GET  /api/v0/file/fetch_files?file_ids=...  轮询到 status SUCCESS
-  补全  POST /api/v0/chat/completion  SSE，ref_file_ids 带图片
-所有请求带数美指纹头（x-device-id / x-device-model）与 PoW（sha3 wasm solver）。
+协议逐条实弹验证过（本机，走代理）：
+  登录   POST /api/v0/users/login        body 混合加密（AES-128-CBC + RSA-OAEP-SHA256），
+                                        密文为请求体，key||iv 用公钥加密后放 x-request-encryption-key
+  会话   POST /api/v0/chat_session/create
+  PoW    POST /api/v0/chat/create_pow_challenge → DeepSeekHashV1 搜 nonce → x-ds-pow-response
+  传图   POST /api/v0/file/upload_file   multipart + x-model-type + PoW，轮询 fetch_files 到就绪
+  补全   POST /api/v0/chat/completion    SSE，fragments 按 id 覆盖累计
+
+风控要点（推翻早前结论）：真正的关卡是 **device_id 必须是真实数美指纹**，
+不是 TLS/H2 指纹 —— 裸 httpx + 真实 device_id 实测可登录可补全；编造的 device_id
+一律 RISK_DEVICE_DETECTED。所以本客户端不引入 curl_cffi/uTLS 之类指纹伪装。
+
+出口铁律：所有请求必须走代理，检测不到代理就直接报错，绝不裸奔暴露本机 IP。
 """
-
 from __future__ import annotations
 
+import base64
 import io
 import json
+import os
+import re
 import threading
 import time
 
 import httpx
 
+from . import pow as _pow
+
 BASE = "https://chat.deepseek.com"
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
-DEVICE_MODEL = "WA9ESmLzLGE"  # Windows 档案展示型号（ds2api 默认档案同位）
-SEC_CH_UA = '"Chromium";v="146", "Google Chrome";v="146", "Not?A_Brand";v="24"'
+APP_VERSION = "2.7.5"
+ANDROID_API_LEVEL = "34"
+TARGET_COMPLETION = "/api/v0/chat/completion"
+TARGET_CONTINUE = "/api/v0/chat/continue"
+TARGET_UPLOAD = "/api/v0/file/upload_file"
 
-_LOGIN_LOCK = threading.Lock()
-_TOKEN_CACHE = {}  # (account, device_id) -> {"token":..., "ts":...}
+# DeepSeek 生产认证接口公钥（逆向自 Android v2.7.5 / Web v2.7.1，与 ds2api 同源）
+_AUTH_RSA_PUB_B64 = (
+    "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0RLAhx1TOJhAQBHS1LHXlnkfOg86O"
+    "+uhsmKWNNkmugVrRqO6cl13SnjBs2otRYZGJd50xpBG4We2i6/oCJCwxA/49YZfIwaeDmTx+WB"
+    "IN7qrwhwP7vGCi6Osesmn/Ddgdye6mifYkRpRMonQjGY6VPaUMTw1jjOAIKph5YZn0bDVmGLvs"
+    "5eH6CoQYHM5/Z1Nfhj36VL28eZi3elJHoz/L6Tzi2wY1rCYqYHfepq3Ysy8y5Y5BeFJXN60RYL"
+    "lbs+MRC+2kyJqcfApUnn1O/W2om9dhxc6Rc5dqas1YB4X4CWCttrKk/suhpIx9zpQY9kqtotbe"
+    "5zweYaKv0rCVeqx8wIDAQAB"
+)
 
-
-class DirectError(RuntimeError):
-    pass
-
-
-def _headers(token=None, device_uuid=None, extra=None):
-    """Android App 协议头（ds2api LoginHeaders/BaseHeadersFor 同款）。"""
-    h = {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "user-agent": "DeepSeek/2.7.5 Android/34",
-        "x-client-bundle-id": "com.deepseek.chat",
-        "x-client-locale": "zh_CN",
-        "x-client-platform": "android",
-        "x-client-timezone-offset": "28800",
-        "x-client-version": "2.7.5",
-    }
-    if token:
-        h["authorization"] = "Bearer " + token
-    if device_uuid:
-        h["x-device-id"] = device_uuid
-    if extra:
-        h.update(extra)
-    return h
+_LOCK = threading.Lock()
 
 
-def _client(proxy=None):
-    return httpx.Client(base_url=BASE, timeout=30.0, proxy=proxy, follow_redirects=True)
+class _Accumulator:
+    """SSE 结果累加器。
 
-
-def _unwrap(data):
-    if data.get("code") not in (0, None):
-        raise DirectError("DeepSeek: %s" % (data.get("msg") or data))
-    inner = data.get("data") or {}
-    if inner.get("biz_code") not in (0, None):
-        raise DirectError("DeepSeek: %s" % (inner.get("biz_msg") or inner))
-    biz = inner.get("biz_data")
-    if biz is None:
-        raise DirectError("DeepSeek 响应异常: " + json.dumps(data, ensure_ascii=False)[:200])
-    return biz
-
-
-def login(account, password, device_id, proxy=None):
-    """账密登录（Android App 协议，明文 JSON），返回 bearer token。
-
-    account 含 @ 走 email，否则手机号。device_id 为 B 前缀的 88 字符设备指纹
-    （网页版数美 SDK 产物，登录专用）；登录后的 API 用 UUID v4 形式的 x-device-id。
+    实测内容会**分两路**来：开头几块走带 fragment id 的 patch，后面的走裸 {"v":"…"} 打字机——
+    两边不重复，是一前一后同一条流的两段（typed=3 + raw=482 刚好拼成完整 JSON）。
+    所以正文 = 按到达顺序把两路拼起来；收尾的 {"p":"response/fragments","v":[…]} 分片表
+    只用来拆 THINK/RESPONSE（开思考时它是唯一能分清推理与正文的地方）。
     """
-    account = (account or "").strip()
-    is_email = "@" in account
-    body = {
-        "email": account if is_email else "",
-        "mobile": "" if is_email else account,
-        "password": password,
-        "area_code": "" if is_email else "+86",
-        "device_id": device_id,
-        "os": "android",
-    }
-    with _client(proxy) as http:
-        r = http.post("/api/v0/users/login", json=body,
-                      headers=_headers(extra={"Host": "chat.deepseek.com"}))
+
+    def __init__(self):
+        self.parts = []        # 正文，按到达顺序（patch 非推理 + 裸 v）
+        self.table_answer = {}  # 分片表里的 RESPONSE 分片
+        self.think = {}         # 分片表 / patch 里的推理分片
+        self.typed = False      # 收到过带 id 的正文（影响 on_delta 去重）
+        self.message_id = None
+        self.auto_continue = False
+        self.finished = False
+
+    def text(self) -> str:
+        joined = "".join(self.parts)
+        table = "".join(self.table_answer[k] for k in sorted(self.table_answer))
+        # 实测开头会被分片表先拿走一块（例如 “ [” 两字符），而后面全在打字机流里；
+        # 只要流开头不是这段，就把它接回头部，否则永远缺开头那个 [。
+        if table and len(table) < len(joined) and not joined.startswith(table[:min(len(table), 8)]):
+            joined = table + joined
+        chosen = table if len(table) >= len(joined) else joined
+        if _DEBUG:
+            print("[ds-sse] 正文选型 stream=%d table=%d -> %s" %
+                  (len(joined), len(table), "table" if chosen is table else "stream"), flush=True)
+            print("[ds-sse]   最终头:", repr(chosen[:44]), flush=True)
+        return chosen
+
+    def thinking_text(self) -> str:
+        return "".join(self.think[k] for k in sorted(self.think))
+
+
+class DeepSeekError(RuntimeError):
+    """带错误码的直连异常（biz_msg / code 原样带出，便于面板显示真因）。"""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+    @property
+    def rate_limited(self) -> bool:
+        text = str(self).upper()
+        return "TOO_MANY_REQUESTS" in text or "RATE" in text
+
+
+# 上游限流时的退避重试（实测短时间连打多枪会回 TOO_MANY_REQUESTS）
+_RETRY_WAITS = (15.0, 30.0, 60.0)
+_DEBUG = bool(os.environ.get("ASSEMBLED_DS_DEBUG"))
+
+
+def _with_rate_retry(fn, what: str):
+    for attempt, wait in enumerate(_RETRY_WAITS):
         try:
-            data = r.json()
+            return fn()
+        except DeepSeekError as e:
+            if not e.rate_limited:
+                raise
+            print("[DS网关] %s 被限流，%ds 后重试（第%d次）" % (what, int(wait), attempt + 1), flush=True)
+            time.sleep(wait)
+    return fn()
+
+
+# ============================ 出口代理 ============================
+
+def detect_proxy() -> str:
+    """按 环境变量 → Windows 系统代理 的顺序找出口；找不到就抛错（禁止裸奔）。"""
+    for key in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        val = (os.environ.get(key) or "").strip()
+        if val and not val.startswith("socks"):
+            return val if "://" in val else "http://" + val
+    try:  # Windows Internet Settings（FlClash 等客户端改的就是这里）
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as k:
+            enable, _ = winreg.QueryValueEx(k, "ProxyEnable")
+            if enable:
+                server, _ = winreg.QueryValueEx(k, "ProxyServer")
+                server = str(server).strip()
+                host = server.split(";")[0].split("=")[-1].strip()
+                if host:
+                    return "http://" + host
+    except Exception:
+        pass
+    raise DeepSeekError("没有检测到可用代理出口，已拒绝直连（防止暴露本机真实 IP）")
+
+
+# ============================ 请求体加密 ============================
+
+def _encrypt_auth_body(plain: bytes):
+    """AES-128-CBC(PKCS7) 加密请求体；key||iv 用 RSA-OAEP(SHA-256) 加密后 base64。
+
+    返回 (密文, x-request-encryption-key 头值)；加密库缺失时返回 (None, None) 由调用方走平文。
+    """
+    try:
+        import secrets
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding as aspad
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.serialization import load_der_public_key
+    except Exception:
+        return None, None
+    key, iv = secrets.token_bytes(16), secrets.token_bytes(16)
+    pad = 16 - (len(plain) % 16)
+    enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    ct = enc.update(plain + bytes([pad]) * pad) + enc.finalize()
+    pub = load_der_public_key(base64.b64decode(_AUTH_RSA_PUB_B64))
+    wrapped = pub.encrypt(key + iv, aspad.OAEP(mgf=aspad.MGF1(algorithm=hashes.SHA256()),
+                                               algorithm=hashes.SHA256(), label=None))
+    return ct, base64.b64encode(wrapped).decode()
+
+
+# ============================ 客户端 ============================
+
+class DeepSeekClient:
+    """一个账号一个实例；token 自动登录与续期，PoW 按 target_path 缓存。"""
+
+    def __init__(self, account: str, password: str, device_id: str, proxy: str | None = None):
+        self.account = (account or "").strip()
+        self.password = (password or "").strip()
+        self.device_id = (device_id or "").strip()
+        self.proxy = proxy or detect_proxy()
+        self._token = ""
+        self._token_ts = 0.0
+        self._http = httpx.Client(timeout=httpx.Timeout(30.0, read=600.0),
+                                  proxy=self.proxy, follow_redirects=True)
+
+    # ---- 基础 ----
+    def close(self):
+        try:
+            self._http.close()
+        except Exception:
+            pass
+
+    def _headers(self, token: bool = False, extra: dict | None = None) -> dict:
+        h = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "user-agent": "DeepSeek/%s Android/%s" % (APP_VERSION, ANDROID_API_LEVEL),
+            "x-client-bundle-id": "com.deepseek.chat",
+            "x-client-platform": "android",
+            "x-client-version": APP_VERSION,
+            "x-client-locale": "zh_CN",
+            "x-client-timezone-offset": str(-time.timezone) if time.timezone else "-28800",
+        }
+        if token:
+            h["authorization"] = "Bearer " + self._token
+            h["x-device-id"] = self.device_id
+        if extra:
+            h.update(extra)
+        return h
+
+    @staticmethod
+    def _unwrap(payload: dict) -> dict:
+        """逐层剥 code / biz_code / biz_data，把上游错误码原样抛出来。"""
+        if not isinstance(payload, dict):
+            raise DeepSeekError("响应不是 JSON 对象")
+        code = payload.get("code")
+        inner = payload.get("data") or {}
+        biz_code = inner.get("biz_code") if isinstance(inner, dict) else None
+        biz = inner.get("biz_data") if isinstance(inner, dict) else None
+        if code not in (0, None):
+            raise DeepSeekError("DeepSeek: %s" % (payload.get("msg") or code), code=code)
+        if biz_code not in (0, None):
+            raise DeepSeekError("DeepSeek: %s" % (inner.get("biz_msg") or biz_code), code=biz_code)
+        if biz is None:
+            raise DeepSeekError("DeepSeek 响应缺 biz_data: " + json.dumps(payload, ensure_ascii=False)[:180])
+        return biz
+
+    # ---- 登录 ----
+    def login(self) -> str:
+        is_email = "@" in self.account
+        body = {"password": self.password, "device_id": self.device_id, "os": "android"}
+        if is_email:
+            body["email"] = self.account
+        else:
+            body["mobile"] = self.account
+            body["area_code"] = "+86"
+        plain = json.dumps(body, separators=(",", ":")).encode()
+        ct, key_hdr = _encrypt_auth_body(plain)
+        headers = self._headers(extra={"x-request-encryption-key": key_hdr} if key_hdr else None)
+        r = self._http.post(BASE + "/api/v0/users/login",
+                            content=(ct if ct else plain), headers=headers)
+        try:
+            payload = r.json()
         except ValueError:
-            raise DirectError("登录响应非 JSON（HTTP %s）: %s" % (r.status_code, r.text[:150]))
-        biz = _unwrap(data)
-        token = ((biz.get("user") or {}).get("token")) or biz.get("token")
+            raise DeepSeekError("登录响应非 JSON（HTTP %s）: %s" % (r.status_code, r.text[:150]))
+        biz = self._unwrap(payload)
+        token = (biz.get("user") or {}).get("token") or biz.get("token")
         if not token:
-            raise DirectError("登录成功但未返回 token")
+            raise DeepSeekError("登录成功但没有 token")
+        self._token, self._token_ts = token, time.time()
         return token
 
+    def ensure_token(self, max_age: float = 5 * 3600.0) -> str:
+        with _LOCK:
+            if not self._token or time.time() - self._token_ts > max_age:
+                return self.login()
+            return self._token
 
-def get_token(account, password, device_id, proxy=None, max_age=3600 * 5):
-    key = (account, device_id)
-    with _LOGIN_LOCK:
-        hit = _TOKEN_CACHE.get(key)
-        if hit and time.time() - hit["ts"] < max_age:
-            return hit["token"]
-        token = login(account, password, device_id, proxy)
-        _TOKEN_CACHE[key] = {"token": token, "ts": time.time()}
-        return token
+    # ---- PoW ----
+    def pow_header(self, target_path: str, force: bool = True) -> str:
+        """取一份新 challenge 并求解。
 
+        实测：challenge 是一次性的——同一个 x-ds-pow-response 打第二枪，上游回 200 但流是空的。
+        所以这里不缓存，每次请求都重新算（取 challenge ~0.15s + 求解 ~0.5-1.4s）。
+        """
+        self.ensure_token()
+        r = self._http.post(BASE + "/api/v0/chat/create_pow_challenge",
+                            content=json.dumps({"target_path": target_path}).encode(),
+                            headers=self._headers(token=True))
+        challenge = self._unwrap(r.json())["challenge"]
+        answer = _pow.solve(challenge["challenge"], challenge["salt"],
+                            int(challenge["expire_at"]), int(challenge["difficulty"]))
+        return _pow.make_header(challenge, answer)
 
-def _pow_header(pow_solver, http, token, device_uuid, target_path):
-    r = http.post("/api/v0/chat/create_pow_challenge", json={"target_path": target_path},
-                  headers=_headers(token, device_uuid))
-    challenge = _unwrap(r.json())["challenge"]
-    return pow_solver.make_header(challenge)
+    # ---- 会话 ----
+    def create_session(self) -> str:
+        self.ensure_token()
+        r = self._http.post(BASE + "/api/v0/chat_session/create", content=b"{}",
+                            headers=self._headers(token=True))
+        return self._unwrap(r.json())["chat_session"]["id"]
 
+    # ---- 传图 ----
+    def upload_image(self, data: bytes, filename: str = "layout.jpg",
+                     content_type: str = "image/jpeg", wait_ready_s: float = 90.0) -> str:
+        """上传 PIL 图，返回 file_id（内部轮询到解析 SUCCESS）。"""
+        return _with_rate_retry(
+            lambda: self._upload_once(data, filename, content_type, wait_ready_s), "upload_file")
 
-def upload_image(token, device_uuid, pil, proxy=None, max_side=1280, timeout_s=90.0):
-    """上传 PIL 图，返回 file_id（内部轮询到解析 SUCCESS）。"""
-    from .pow import DeepSeekPow
-    buf = io.BytesIO()
-    im = pil
-    if max(im.size) > max_side:
-        ratio = max_side / max(im.size)
-        im = im.resize((max(1, round(im.width * ratio)), max(1, round(im.height * ratio))))
-    if im.mode != "RGB":
-        im = im.convert("RGB")
-    im.save(buf, "JPEG", quality=92)
-    data = buf.getvalue()
-    pow_solver = DeepSeekPow()
-    with _client(proxy) as http:
-        pow_h = _pow_header(pow_solver, http, token, device_uuid, "/api/v0/file/upload_file")
-        files = {"file": ("layout.jpg", data, "image/jpeg")}
-        headers = _headers(token, device_uuid, {
+    def _upload_once(self, data, filename, content_type, wait_ready_s) -> str:
+        self.ensure_token()
+        boundary = "----arboundary%016x" % int.from_bytes(os.urandom(8), "big")
+        head = ("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+                "Content-Type: %s\r\n\r\n" % (boundary, filename.replace('"', "_"), content_type)).encode()
+        body = head + data + ("\r\n--%s--\r\n" % boundary).encode()
+        headers = self._headers(token=True, extra={
+            "content-type": "multipart/form-data; boundary=%s" % boundary,
             "x-model-type": "default",
-            "x-ds-pow-response": pow_h,
             "x-file-size": str(len(data)),
-            "x-thinking-enabled": "1",
+            "x-ds-pow-response": self.pow_header(TARGET_UPLOAD),
         })
-        r = http.post("/api/v0/file/upload_file", files=files, headers=headers, timeout=120.0)
-        biz = _unwrap(r.json())
+        r = self._http.post(BASE + "/api/v0/file/upload_file", content=body, headers=headers)
+        biz = self._unwrap(r.json())
         node = biz.get("node") or biz
-        file_id = node.get("id") or ""
+        file_id = node.get("id") or node.get("file_id") or ""
         if not file_id:
-            raise DirectError("上传成功但无 file id: " + json.dumps(biz, ensure_ascii=False)[:200])
-        status = (node.get("status") or node.get("file_status") or "").upper()
-        deadline = time.time() + timeout_s
-        while status not in ("SUCCESS", "COMPLETED") and time.time() < deadline:
+            raise DeepSeekError("上传成功但没有 file id: " + json.dumps(biz, ensure_ascii=False)[:180])
+        status = str(node.get("status") or node.get("file_status") or "").upper()
+        ready = ("SUCCESS", "COMPLETED", "PROCESSED", "READY", "DONE", "AVAILABLE")
+        deadline = time.time() + wait_ready_s
+        while status not in ready and time.time() < deadline:
             time.sleep(1.0)
-            r2 = http.get("/api/v0/file/fetch_files", params={"file_ids": file_id},
-                          headers=_headers(token, device_uuid))
-            biz2 = _unwrap(r2.json())
-            flist = biz2.get("files")
-            if isinstance(flist, list) and flist:
-                node = flist[0]
-                status = (node.get("status") or node.get("file_status") or "").upper()
-            elif isinstance(biz2, dict) and biz2.get("id"):
-                status = (biz2.get("status") or biz2.get("file_status") or "").upper()
-        if status not in ("SUCCESS", "COMPLETED"):
-            raise DirectError("图片解析未就绪: status=%s" % status)
+            rr = self._http.get(BASE + "/api/v0/file/fetch_files",
+                                 params={"file_ids": file_id}, headers=self._headers(token=True))
+            biz2 = self._unwrap(rr.json())
+            files = biz2.get("files") if isinstance(biz2, dict) else None
+            node = (files[0] if isinstance(files, list) and files else biz2)
+            status = str(node.get("status") or node.get("file_status") or "").upper()
+        if status not in ready:
+            raise DeepSeekError("图片解析未就绪: status=%s" % status)
         return file_id
 
+    # ---- 补全 ----
+    def completion(self, prompt: str, session_id: str | None = None,
+                   parent_message_id=None, file_ids=None, thinking: bool = False,
+                   search: bool = False, on_delta=None, ensure=None,
+                   max_continue: int = 3) -> dict:
+        """跑一轮补全，返回 {text, session_id, message_id, thinking_text}。
 
-def completion(token, device_uuid, prompt, file_ids=None, thinking=True,
-               proxy=None, timeout_s=600.0):
-    """新建会话 → SSE 补全 → 返回 RESPONSE 全文（THINK 除外）。"""
-    from .pow import DeepSeekPow
-    pow_solver = DeepSeekPow()
-    with _client(proxy) as http:
-        r = http.post("/api/v0/chat_session/create", json={},
-                      headers=_headers(token, device_uuid))
-        session_id = _unwrap(r.json())["chat_session"]["id"]
+        被限流时整轮重做；ensure(text) 返回 False（例如 JSON 被拦腰截断）时
+        自动走 /api/v0/chat/continue 续写，最多 max_continue 轮。
+        """
+        result = _with_rate_retry(
+            lambda: self._completion_once(prompt, session_id, parent_message_id,
+                                          file_ids, thinking, search, on_delta),
+            "completion")
+        rounds = 0
+        while rounds < max_continue and result["message_id"] and not self._ensure_ok(ensure, result["text"]):
+            rounds += 1
+            more = self._continue_round(result["session_id"], result["message_id"])
+            if not more:
+                break
+            result["text"] += more
+        return result
+
+    @staticmethod
+    def _ensure_ok(ensure, text) -> bool:
+        if ensure is None:
+            return True
+        try:
+            return bool(ensure(text))
+        except Exception:
+            return True
+
+    def _continue_round(self, session_id: str, message_id) -> str:
+        """/api/v0/chat/continue 续写一轮（官方客户端在回答被截断时就是这么做的）。
+
+        注意：PoW 的 target_path **没有** /api/v0/chat/continue 这一档（实测回
+        INVALID_TARGET_PATH），续写枪用的是 completion 的 challenge（ds2api 也是这么做的）。
+        """
+        self.ensure_token()
+        body = {"chat_session_id": session_id, "message_id": int(message_id),
+                "fallback_to_resume": True, "shumei_device_id": self.device_id}
+        headers = self._headers(token=True, extra={
+            "Referer": BASE + "/a/chat/s/" + session_id,
+            "x-ds-pow-response": self.pow_header(TARGET_COMPLETION),
+        })
+        acc = _Accumulator()
+        with self._http.stream("POST", BASE + TARGET_CONTINUE,
+                               content=json.dumps(body).encode(), headers=headers) as resp:
+            if resp.status_code != 200:
+                raw = resp.read()
+                raise DeepSeekError("continue HTTP %s: %s" % (resp.status_code, raw[:200]))
+            self._consume_sse(resp, acc)
+        return acc.text()
+
+    def _completion_once(self, prompt, session_id, parent_message_id, file_ids,
+                         thinking, search, on_delta) -> dict:
+        """跑一轮补全，返回 {text, session_id, message_id, thinking_text}。"""
+        self.ensure_token()
+        session_id = session_id or self.create_session()
         body = {
             "chat_session_id": session_id,
-            "parent_message_id": None,
+            "parent_message_id": parent_message_id,
+            "model_type": "default",
             "prompt": prompt,
-            "ref_file_ids": file_ids or [],
+            "ref_file_ids": list(file_ids or []),
             "thinking_enabled": bool(thinking),
-            "search_enabled": False,
+            "search_enabled": bool(search),
             "action": None,
             "preempt": False,
-            "model_type": "default",
+            "shumei_device_id": self.device_id,
         }
-        pow_h = _pow_header(pow_solver, http, token, device_uuid, "/api/v0/chat/completion")
-        out = []
-        with http.stream("POST", "/api/v0/chat/completion", json=body,
-                         headers=_headers(token, device_uuid, {
-                             "content-type": "application/json",
-                             "x-ds-pow-response": pow_h,
-                             "x-thinking-enabled": "1" if thinking else "0",
-                             "x-model-type": "default",
-                         }),
-                         timeout=httpx.Timeout(30.0, read=timeout_s)) as resp:
-            resp.raise_for_status()
-            for raw in resp.iter_lines():
-                if not raw or not raw.startswith("data:"):
+        headers = self._headers(token=True, extra={
+            "Referer": BASE + "/a/chat/s/" + session_id,
+            "x-ds-pow-response": self.pow_header(TARGET_COMPLETION),
+        })
+        acc = _Accumulator()
+        with self._http.stream("POST", BASE + TARGET_COMPLETION,
+                               content=json.dumps(body).encode(), headers=headers) as resp:
+            if resp.status_code != 200:
+                raw = resp.read()
+                raise DeepSeekError("completion HTTP %s: %s" % (resp.status_code, raw[:200]))
+            self._consume_sse(resp, acc, on_delta)
+        answer = acc.text()
+        if acc.auto_continue and acc.message_id:
+            answer = answer + self._continue_round(session_id, acc.message_id)
+        return {
+            "text": answer,
+            "thinking_text": acc.thinking_text(),
+            "session_id": session_id,
+            "message_id": acc.message_id,
+        }
+
+    def _consume_sse(self, resp, acc, on_delta=None):
+        """DeepSeek 原生 SSE 三种形态（实测）：
+          · {"p":"response/fragments/<id>/[thinking/]content","o":"APPEND|SET","v":"…"} → 带类型增量
+          · {"v":{"response":{...,"fragments":[{id,type,content}]}}} → 快照（该 fragment 全量）
+          · {"v":"文本"} → 打字机重复流（会混推理，只当兵底 + 没开思考时驱动 on_delta）
+        """
+        debug = bool(os.environ.get("ASSEMBLED_DS_DEBUG"))
+        for raw in resp.iter_lines():
+            if not raw or not raw.startswith("data:"):
+                continue
+            payload = raw[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                event = json.loads(payload)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if debug and isinstance(event.get("p"), str) and "fragments" in event["p"] \
+                    and isinstance(event.get("v"), list):
+                print("[ds-sse] 分片表", json.dumps(
+                    [(f.get("id"), f.get("type"), len(f.get("content") or ""))
+                     for f in event["v"] if isinstance(f, dict)], ensure_ascii=False), flush=True)
+            if "request_message_id" in event:
+                acc.message_id = event.get("response_message_id") or acc.message_id
+                continue
+            path = event.get("p")
+            val = event.get("v")
+            if isinstance(path, str):
+                # 收尾的权威分片表：{"p":"response/fragments","v":[{id,type,content},…]}
+                # 开思考时只有这里能分开推理与正文（THINK/RESPONSE）
+                if path == "response/fragments" and isinstance(val, list):
+                    for f in val:
+                        if not isinstance(f, dict):
+                            continue
+                        fid = int(f.get("id") or 0)
+                        content = f.get("content") or ""
+                        if not content:
+                            continue
+                        if str(f.get("type") or "RESPONSE").upper() == "THINK":
+                            acc.think[fid] = content
+                        else:
+                            acc.table_answer[fid] = content
                     continue
-                payload = raw[5:].strip()
-                if not payload or payload == "[DONE]":
+                if path in ("response/status", "response/quasi_status", "quasi_status"):
+                    acc.finished = val == "FINISHED"
                     continue
-                try:
-                    event = json.loads(payload)
-                except ValueError:
-                    continue
-                data = event.get("data")
-                if not isinstance(data, dict):
-                    continue
-                biz = data.get("biz_data")
-                if not isinstance(biz, dict):
-                    continue
-                resp_obj = biz.get("response") or biz
-                frags = resp_obj.get("fragments")
-                if isinstance(frags, list):
-                    for f in frags:
-                        if isinstance(f, dict) and (f.get("type") or "RESPONSE") == "RESPONSE":
-                            out.append(f.get("content") or "")
-                patch = data.get("patch") or biz.get("patch")
-                if isinstance(patch, list):
-                    for p in patch:
-                        if isinstance(p, dict) and (p.get("p") or "").endswith("/content") \
-                                and p.get("o") == "APPEND" and isinstance(p.get("v"), str):
-                            out.append(p["v"])
-        return "".join(out)
+                m = re.match(r"response/fragments/(-?\d+)/(thinking/)?content", path)
+                if m and isinstance(val, str):
+                    if m.group(2):
+                        acc.think[int(m.group(1))] = val  # 推理单独存，不污染正文
+                    else:
+                        acc.parts.append(val)
+                        acc.typed = True
+                        if on_delta:
+                            on_delta(val)
+                continue
+            if isinstance(val, str):
+                acc.parts.append(val)
+                if on_delta:
+                    on_delta(val)
+            elif isinstance(val, dict) and "response" in val:
+                r = val.get("response") or {}
+                acc.auto_continue = bool(r.get("auto_continue"))
+                if r.get("message_id"):
+                    acc.message_id = r["message_id"]
+                for f in (r.get("fragments") or []):
+                    if not isinstance(f, dict):
+                        continue
+                    fid = int(f.get("id") or 0)
+                    content = f.get("content") or ""
+                    if not content:
+                        continue
+                    if str(f.get("type") or "RESPONSE").upper() == "THINK":
+                        acc.think[fid] = content
+                    else:
+                        acc.table_answer[fid] = content
+                        acc.typed = True
+
+    def _auto_continue(self, session_id, message_id, answer, headers):
+        """上游 auto_continue=true 时按官方客户端方式续写（兼容旧入口）。"""
+        return answer + self._continue_round(session_id, message_id)

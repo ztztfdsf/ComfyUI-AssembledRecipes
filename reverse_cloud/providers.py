@@ -1,16 +1,12 @@
-"""统一反推入口：local（transformers 进程内）/ deepseek（网页版免费）/ openai（自定义端点）。
+"""统一反推入口：local（transformers 进程内）/ deepseek（内置网关直连 DeepSeek）/ openai（自定义端点）。
 
-三个 provider 都吃同一套输入（PIL 图 + system 规则 + 用户参考提示词），
-吐同一格式的输出：只含 JSON 数组的字符串，交给下游 ReverseJsonSanitize。
+三个 provider 都吐同一格式：模型原始文本（JSON 数组，可能带思考前缀），
+由下游 extract_json_array / ReverseJsonSanitize 清洗。
 
-OpenAI 兼容模式走标准 vision chat.completions（image_url 用 data URL），
-DeepSeek 网页版不能传图 —— 它只吃文本，所以把图片先在本地跑一遍轻量 OCR/描述？
-不：DeepSeek 网页版聊天也不支持视觉输入（截至 2026-11），但 deepseek 平台 API 有
-视觉模型？也没有。所以 deepseek 模式的定位 = **文本智能层**：本地图反推（快速粗框）
-已经由本地小模型完成时，把「图上文字 OCR + 本地粗结果」交给 DeepSeek 精修排序与关系描述。
-为避免歧义：**deepseek 模式要求本地有一个小模型先出粗稿**（models/LLM 下任意一个），
-云端只做「关系描述精修 + JSON 重排」。这正是主人要的「云端或者本地 AI」组合：
-本地负责看，云端负责想。
+DeepSeek 云端可以直接看图：官方客户端的图片通道是
+  POST /api/v0/file/upload_file → file_id → completion 的 ref_file_ids
+（本机实弹验证过，实现见 reverse_cloud/direct.py），所以云端模式是完整的视觉反推。
+网关由本包的 gateway.py 提供（纯 Python），不再依赖外部 ds2api.exe。
 """
 
 from __future__ import annotations
@@ -77,18 +73,23 @@ def _openai_chat(base_url: str, api_key: str, model: str, system: str, user_text
 
 def run_caption(provider: str, pil, system_rule: str, user_text: str,
                 local_runner=None, openai_base: str = "", openai_key: str = "",
-                openai_model: str = "") -> str:
+                openai_model: str = "", thinking: bool = True) -> str:
     """provider: local / deepseek / openai。
 
-    local: 调 local_runner(pil, system_rule, user_text)（节点里现有的 transformers 路径）
-    deepseek: 文本进 DeepSeek 网页版（不吃图；把画面 OCR/本地粗稿拼进 user_text 由调用方完成）
-    openai: 标准视觉 chat.completions
-    返回模型原始文本（JSON 数组或含思考前缀），交给清洗节点。
+    local:    调 local_runner(pil, system_rule, user_text)（节点里现有的 transformers 路径）
+    deepseek: 内置网关——真实图片上传 + DeepSeek 补全（进程内直调，不开端口也能用）
+    openai:   标准视觉 chat.completions（任意 OpenAI 兼容端点）
     """
     if provider == "local":
         if local_runner is None:
             raise ProviderError("local provider 没给 local_runner")
         return local_runner(pil, system_rule, user_text)
+    if provider == "deepseek":
+        try:
+            from . import gateway
+        except ImportError:  # 包名导入失败时（前端直接加载模块）兜底
+            import gateway  # type: ignore
+        return gateway.caption(pil, system_rule, user_text, thinking=thinking)
     if provider == "openai":
         if not openai_base:
             raise ProviderError("OpenAI 自定义模式需要填请求地址")
@@ -97,7 +98,7 @@ def run_caption(provider: str, pil, system_rule: str, user_text: str,
 
 
 def extract_json_array(text: str):
-    """从模型输出里抠出第一个可解析的 JSON 数组（含思考前缀/代码块也能抠）。"""
+    """从模型输出里抠出第一个可解析的 JSON 数组（思考前缀/代码块/字符串里带括号也能抠）。"""
     s = (text or "").strip()
     # 去代码块
     if "```" in s:
@@ -109,20 +110,39 @@ def extract_json_array(text: str):
             if p2.startswith("["):
                 s = p2
                 break
-    start = s.find("[")
-    if start < 0:
-        return None
-    depth = 0
-    for i in range(start, len(s)):
-        c = s[i]
-        if c == "[":
-            depth += 1
-        elif c == "]":
-            depth -= 1
-            if depth == 0:
-                try:
-                    v = json.loads(s[start:i + 1])
-                    return v if isinstance(v, list) else None
-                except ValueError:
-                    return None
+    # 逐个 [ 开试（云端带推理前缀时，第一个 [ 可能不是真数组的开头）。
+    # 只认「非空对象数组」：布局 JSON 的元素必为 dict。
+    # 找不到就返回 None——宁可不改原文、让下游清洗节点拿到完整文本，
+    # 也不能退而求其次拿 bbox（那会把四个数字当成品交下去）。
+    for start in range(len(s)):
+        if s[start] != "[":
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(s)):
+            c = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        v = json.loads(s[start:i + 1])
+                    except ValueError:
+                        break  # 这个 [ 不行，换下一个
+                    if isinstance(v, list) and v and all(isinstance(o, dict) for o in v):
+                        return v
+                    break
+        # 内层走完没闭合，继续找下一个 [
     return None

@@ -93,9 +93,42 @@ git clone https://github.com/ztztfdsf/ComfyUI-AssembledRecipes
 ## 说明
 
 - 不修改 ComfyUI 核心；所有功能都是节点；逐层流水通过自有 patcher 实例绑定实现
-- 本插件**不再注册任何 HTTP 路由、不再有前端 `web/` 资源**
+- 插件自带一个前端面板（`web/reverse_cloud.js`）与几个同源路由 `/assembled-recipes/ds/*`，
+  只给反推节点的「账号绑定 / 连通测试 / 内置网关启停」用，全部只监听本机
 - 旧工作流若还留着 `配方保存` / `配方·画廊选择` 节点，重启后会显示为缺失节点，删掉即可：
   把 `model` 链直接接到下游，`image` 链直接连到出图节点
+
+## 内置 DeepSeek 网关（云端反推，零外部依赖）
+
+反推节点的 `provider = DeepSeek 云端（内置网关）` 用的是插件自带的纯 Python 客户端
+（`reverse_cloud/direct.py` + `pow.py`），**不需要 ds2api.exe、不需要任何 Go/Rust 网关**，
+依赖只有 `httpx / numpy / cryptography`（ComfyUI 环境里本来就有）。
+
+协议（逐条本机实弹验过）：
+
+| 环节 | 做法 |
+|---|---|
+| 登录 | `POST /api/v0/users/login`，请求体 AES-128-CBC 加密，key‖iv 用 RSA-OAEP(SHA-256) 封在 `x-request-encryption-key`；头为 Android App 形状 |
+| 会话 | `POST /api/v0/chat_session/create` |
+| 防机器 | `POST /api/v0/chat/create_pow_challenge` → 解 `DeepSeekHashV1`（= SHA3-256 但跳过 Keccak 第 0 轮）→ `x-ds-pow-response`；numpy 批量搜 nonce，difficulty 144000 约 0.5s。**challenge 是一次性的**，每枪都重新取 |
+| 看图 | `POST /api/v0/file/upload_file`（multipart + `x-model-type` + PoW）→ `file_id` → completion 的 `ref_file_ids`；所以云端是完整视觉反推 |
+| 输出 | 原生 SSE。正文与推理在收尾的 `{"p":"response/fragments","v":[{id,type,content}]}` 里才分开；裸 `{"v":"…"}` 是打字机流（推理和正文混在一起），只当兵底 |
+
+坑位实录（推翻上一版结论）：
+
+- **风控关卡是 `device_id`，不是 TLS/H2 指纹**。编造的 device_id 一律 `RISK_DEVICE_DETECTED`；
+  换成真实浏览器数美 SDK 抓到的那串后，**裸 `httpx`（不带任何指纹伪装）登录与补全全部通过**。
+  所以本实现不需要 `curl_cffi`/uTLS 之类。device_id 只能自己抓（浏览器 F12 看 `deviceprofile/v4`），
+  插件不能代劳。
+- **出口铁律**：客户端启动时自动读环境变量 → Windows 系统代理；**找不到代理直接报错**，绝不裸走真实 IP。
+- 短时间连打多枪会回 `TOO_MANY_REQUESTS`，已内置 15/30/60s 退避重试。
+
+凭据存放（重要）：邮箱/密码/device_id 存在
+`<ComfyUI>/user/AssembledRecipes/ds_gateway.json`（本地文件，插件自管），
+**不写进工作流 JSON、不进日志、不进提示词**。日志里只会出现邮箱脱敏后的形式与耗时。
+
+同时它还开了一个 OpenAI 兼容服务（`http://127.0.0.1:5812/v1`，仅监听本机，`Authorization: Bearer <配置里的 key>`），
+带 `stream` 与 base64 图片；反推节点本体走进程内直调，不依赖这个端口。
 
 ## 为什么移除配方缓存（2026-11-14 实证）
 

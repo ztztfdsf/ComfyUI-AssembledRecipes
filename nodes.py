@@ -1303,9 +1303,26 @@ class ReverseJsonSanitize:
 _VLM_CACHE = {}  # 模型目录 -> (processor, model) 内存常驻缓存
 
 
+def _ds_gateway():
+    """延迟导入内置网关（依赖缺失时也不影响节点加载）。"""
+    try:
+        from .reverse_cloud import gateway
+    except ImportError:
+        _pd = os.path.dirname(os.path.abspath(__file__))
+        if _pd not in sys.path:
+            sys.path.insert(0, _pd)
+        import importlib as _il
+        gateway = _il.import_module("reverse_cloud.gateway")
+    return gateway
+
+
 # 规则要点：限死框数（防过度分割）、禁止把画廊 tag 逐条变框、desc 120~220 词、坐标用模型原生的 xyxy（清洗节点统一转 yxyx）
-def _cloud_caption(kind, pil, rule, user_text, base="", key="", model=""):
-    """云端反推统一入口（延迟导入，不依赖网络库也能加载节点）。"""
+def _cloud_caption(kind, pil, rule, user_text, base="", key="", model="", thinking=True):
+    """云端反推统一入口（延迟导入，不依赖网络库也能加载节点）。
+
+    kind 含 DeepSeek → 走内置纯 Python 网关（进程内，图片走官方 file 通道）；
+    其余（自定义 OpenAI 端点）→ 标准 OpenAI vision 请求。
+    """
     try:
         from .reverse_cloud import providers
     except ImportError:
@@ -1314,6 +1331,8 @@ def _cloud_caption(kind, pil, rule, user_text, base="", key="", model=""):
         if _pd not in _sys.path:
             _sys.path.insert(0, _pd)
         providers = _il.import_module("reverse_cloud.providers")
+    if "DeepSeek" in str(kind):
+        return providers.run_caption("deepseek", pil, rule, user_text, thinking=thinking)
     env_key = os.environ.get("ASSEMBLED_OPENAI_KEY", "")
     return providers.run_caption("openai", pil, rule, user_text,
                                  openai_base=base, openai_key=key or env_key,
@@ -1430,21 +1449,21 @@ class ReverseLayoutCaption:
         return {
             "required": {
                 "image": ("IMAGE", {"tooltip": "要反推的图"}),
-                "provider": (["本地模型（transformers）", "DeepSeek 云端（ds2api 本地网关）", "自定义 OpenAI 兼容端点"],
+                "provider": (["本地模型（transformers）", "DeepSeek 云端（内置网关）", "自定义 OpenAI 兼容端点"],
                              {"default": "本地模型（transformers）",
-                              "tooltip": "本地=进程内跑 models/LLM 下的模型；DeepSeek 云端=走本机 ds2api 网关（http://127.0.0.1:5001，账密在它 config.json，免费、原生视觉）；自定义=任意 OpenAI 兼容视觉端点"}),
+                              "tooltip": "本地=进程内跑 models/LLM 下的模型；DeepSeek 云端=插件自带的纯 Python 网关（直连 DeepSeek 官方接口，图片走官方 file 通道，账密在节点面板「账号绑定」里填一次）；自定义=任意 OpenAI 兼容视觉端点"}),
                 "rule": ("STRING", {"multiline": True, "default": _LAYOUT_RULE_DEFAULT, "tooltip": "反推规则（system 提示词）"}),
                 "user_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "画廊提示词等角色参考资料，遇到不认识的角色用它补全"}),
-                "model_name": (_list_llm_models(), {"tooltip": "本地模式用的模型：ComfyUI/models/LLM/ 下的目录（新放进去的需重启 ComfyUI）；DeepSeek 网页版模式也用它先出粗稿"}),
+                "model_name": (_list_llm_models(), {"tooltip": "本地模式用的模型：ComfyUI/models/LLM/ 下的目录（新放进去的需重启 ComfyUI）；云端模式用不到它"}),
                 "max_new_tokens": ("INT", {"default": 4096, "min": 128, "max": 16384, "tooltip": "输出 token 上限（desc 详细版建议 >=2048）。实际硬顶 6144：规则最多 10 框×220 词≈3000 tok，再高只会让模型不吐 EOS 时白算很久"}),
                 "pre_clear": ("BOOLEAN", {"default": True, "tooltip": "反推前把 ComfyUI 全部模型卸回内存，显存同一时间只住一个模型"}),
                 "offload_after": ("BOOLEAN", {"default": True, "tooltip": "反推完本模型退卡回内存（内存常驻，下次上卡免盘读）"}),
             },
             "optional": {
-                "openai_base": ("STRING", {"default": "http://127.0.0.1:5001/v1", "tooltip": "自定义端点请求地址，如 https://api.deepseek.com 或 https://api.openai.com/v1（自动补全 /v1/chat/completions）"}),
-                "openai_key": ("STRING", {"default": "sk-ar-6a898a13c8bed2b59f506468841e5f1f", "tooltip": "端点密钥（Bearer）。默认已填本机 ds2api 网关的 key"}),
-                "openai_model": ("STRING", {"default": "deepseek-v4.1-flash", "tooltip": "模型名（ds2api 网关用 deepseek-v4.1-flash，原生支持视觉）"}),
-                "deepseek_thinking": ("BOOLEAN", {"default": True, "tooltip": "云端模式：开思考（关了模型名自动加 -nothinking，更快）"}),
+                "openai_base": ("STRING", {"default": "", "tooltip": "仅自定义端点模式用：请求地址，如 https://api.deepseek.com 或 https://api.openai.com/v1（自动补全 /v1/chat/completions）"}),
+                "openai_key": ("STRING", {"default": "", "tooltip": "仅自定义端点模式用：Bearer 密钥（也可用环境变量 ASSEMBLED_OPENAI_KEY）"}),
+                "openai_model": ("STRING", {"default": "deepseek-v4.1-flash", "tooltip": "仅自定义端点模式用的模型名（内置 DeepSeek 网关自动选自已在用的那个）"}),
+                "deepseek_thinking": ("BOOLEAN", {"default": True, "tooltip": "云端模式：开思考（更准但更慢；关掉快 30-50%）"}),
                 # 放在后面：旧工作流 widgets_values 保持对齐；缺省=4bit
                 "quant": (["4bit (NF4，显存最省)", "8bit", "none (bf16，原精度)"], {"default": "4bit (NF4，显存最省)", "tooltip": "量化方式。4bit 显存最省（12B 在 16GB 卡上只有它能跑）；8bit / bf16 只有小模型或大显存卡才装得下，不够时节点会直接报错不等加载"}),
                 # 大模型（如 Gemma4-12B）有能力自己从一堆 tag 里筛出画面真实内容，
@@ -1707,19 +1726,22 @@ class ReverseLayoutCaption:
         provider_ds = "DeepSeek" in str(provider)
         provider_openai = "OpenAI" in str(provider)
 
-        # ---------- 云端路径（不占本地显存清场那套；DeepSeek 网页版先用本地小模型出粗稿） ----------
+        # ---------- 云端路径（不占本地显存，不需要清场） ----------
         if not provider_local:
             t0 = time.time()
             up_all = self._trim_user_prompt(user_prompt, max_chars=100000)
             try:
-                # DeepSeek 云端(ds2api) 与自定义端点同路径：标准 OpenAI 兼容视觉补全
-                from PIL import Image as _PIL
                 pil = self._image_to_pil(image, max_side=1024, index=batch_index)
-                model_use = openai_model
-                if provider_ds and not deepseek_thinking and "-nothinking" not in model_use:
-                    model_use = model_use.replace("-search", "") + "-nothinking"
-                text_out = _cloud_caption("openai", pil, rule, up_all,
-                                          base=openai_base, key=openai_key, model=model_use)
+                if provider_ds:
+                    # 内置纯 Python 网关：图片上传 + DeepSeek 补全（进程内）
+                    text_out = _cloud_caption(provider, pil, rule, up_all,
+                                              thinking=bool(deepseek_thinking))
+                else:
+                    model_use = openai_model
+                    if not deepseek_thinking and "-nothinking" not in model_use:
+                        model_use = model_use.replace("-search", "") + "-nothinking"
+                    text_out = _cloud_caption(provider, pil, rule, up_all,
+                                              base=openai_base, key=openai_key, model=model_use)
             except Exception as e:
                 raise RuntimeError(f"云端反推[{provider}] 失败: {e}") from e
             try:
@@ -2061,3 +2083,16 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ReverseLayoutCaption (AssembledRecipes)": "布局反推",
     "BlankToNone (AssembledRecipes)": "配方·空串转无",
 }
+
+
+# ---------------------------------------------------------------------------
+# 内置 DeepSeek 网关：随插件加载注册面板接口并把本地服务拉起来
+# （服务只监听 127.0.0.1；失败不影响本地反推路径）
+# ---------------------------------------------------------------------------
+
+try:
+    _gw = _ds_gateway()
+    _gw.register_routes()
+    _gw.start()
+except Exception as _e:  # 网关起不来只是云端不可用，本地路径照常
+    print(f"[AssembledRecipes] DeepSeek 内置网关未能拉起: {_e}", flush=True)

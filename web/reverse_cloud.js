@@ -17,7 +17,8 @@ const NODE_CLASS = "ReverseLayoutCaption (AssembledRecipes)";
 const PROP = "arReverseCloud";
 const LS_PASSWORD = "arReverseDeepseekPassword";
 const LS_ACCOUNT = "arReverseDeepseekAccount";
-const GATEWAY = "http://127.0.0.1:5001";
+const LS_DEVICE_ID = "arReverseDeepseekDeviceId";
+const DS_API = "/assembled-recipes/ds"; // 内置网关的控制面（同源，走 ComfyUI 自已在的端口）
 
 const STYLE_ID = "ar-reverse-cloud-css";
 const CSS = `
@@ -101,6 +102,10 @@ details.ar-card[open]>summary { margin-bottom: 6px; }
 .ar-btn.pri { background: #3f66cc; border-color: #5580e0; color: #fff; font-weight: 600; }
 
 /* 状态行 */
+.ar-hint { font-size: 10.5px; opacity: .62; margin: 4px 0 2px; word-break: break-all; }
+.ar-logs { font-size: 10px; line-height: 1.45; margin: 4px 0 0; padding: 6px 8px; max-height: 96px;
+  overflow: auto; background: rgba(0,0,0,.28); border-radius: 6px; color: #cfd6e4;
+  white-space: pre-wrap; word-break: break-all; font-family: Consolas, Menlo, monospace; }
 .ar-status { font-size: 11.5px; min-height: 16px; word-break: break-all; opacity: .9; }
 .ar-status.ok { color: #7bd88a; }
 .ar-status.err { color: #ff7373; }
@@ -267,41 +272,35 @@ function setStatus(ui, cls, text) {
 	ui.status.className = "ar-status" + (cls ? " " + cls : "");
 }
 
-async function adminJwt() {
-	const key = localStorage.getItem("arReverseAdminKey") || "";
-	if (!key) throw new Error("先填网关管理密钥（ds2api admin key）");
-	const data = await jsonFetch(`${GATEWAY}/admin/login`, {
-		method: "POST", body: JSON.stringify({ admin_key: key }),
-	});
-	return data.token;
-}
-
 async function bindAccount(ui) {
 	const account = ui.accountInput.value.trim();
 	const password = ui.passwordInput.value;
+	const deviceId = (ui.deviceIdInput?.value || "").trim();
 	if (!account || !password) {
 		setStatus(ui, "err", "邮箱和密码都要填");
 		return;
 	}
 	ui.bindBtn.disabled = true;
 	ui.dot.className = "ar-dot busy";
-	setStatus(ui, "", "正在绑定账号到本机网关…");
+	setStatus(ui, "", "正在绑定账号到内置网关…");
 	try {
-		const jwt = await adminJwt();
-		const list = await jsonFetch(`${GATEWAY}/admin/accounts`, { headers: { Authorization: `Bearer ${jwt}` } });
-		const exists = (list.items || []).some((a) => a.identifier === account);
-		if (!exists) {
-			await jsonFetch(`${GATEWAY}/admin/accounts`, {
-				method: "POST",
-				headers: { Authorization: `Bearer ${jwt}` },
-				body: JSON.stringify({ email: account, password, name: "反推节点", remark: "ComfyUI 反推节点绑定" }),
-			});
-		}
+		const data = await jsonFetch(`${DS_API}/bind`, {
+			method: "POST",
+			body: JSON.stringify({ email: account, password, device_id: deviceId }),
+		});
 		localStorage.setItem(LS_ACCOUNT, account);
 		localStorage.setItem(LS_PASSWORD, password);
+		if (deviceId) localStorage.setItem(LS_DEVICE_ID, deviceId);
 		stateFor(ui.node).account = account;
 		saveState(ui.node);
-		await testAccount(ui, { silent: true });
+		if (data.ok) {
+			ui.dot.className = "ar-dot ok";
+			setStatus(ui, "ok", `绑定成功，登录+试跑 ${data.ms}ms（回：${data.echo || "ok"}）`);
+		} else {
+			ui.dot.className = "ar-dot err";
+			setStatus(ui, "err", "绑定失败：" + (data.error || "未知错"));
+		}
+		refreshGatewayInfo(ui);
 	} catch (e) {
 		ui.dot.className = "ar-dot err";
 		setStatus(ui, "err", "绑定失败：" + (e.message || e));
@@ -311,30 +310,71 @@ async function bindAccount(ui) {
 }
 
 async function testAccount(ui, { silent = false } = {}) {
-	const account = localStorage.getItem(LS_ACCOUNT) || ui.accountInput.value.trim();
-	if (!account) { setStatus(ui, "err", "没有已绑定的账号"); return null; }
 	ui.testBtn.disabled = true;
 	ui.dot.className = "ar-dot busy";
-	if (!silent) setStatus(ui, "", "测试网关连通与账号状态…");
+	if (!silent) setStatus(ui, "", "内置网关登录 + 跑一枪极小补全…");
 	try {
-		const KEY = widgetOf(ui.node, "openai_key")?.value || "";
 		const t0 = performance.now();
-		const data = await jsonFetch(`${GATEWAY}/v1/chat/completions`, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${KEY}` },
-			body: JSON.stringify({ model: "deepseek-v4.1-flash-nothinking", max_tokens: 5,
-				messages: [{ role: "user", content: "ping" }] }),
-		});
+		const data = await jsonFetch(`${DS_API}/test`, { method: "POST", body: "{}" });
 		const ms = Math.round(performance.now() - t0);
-		ui.dot.className = "ar-dot ok";
-		setStatus(ui, "ok", `连通正常（${ms}ms，${data.model || "deepseek"}）`);
-		return true;
+		if (data.ok) {
+			ui.dot.className = "ar-dot ok";
+			setStatus(ui, "ok", `连通正常（${data.ms}ms，${data.model}）`);
+		} else {
+			ui.dot.className = "ar-dot err";
+			setStatus(ui, "err", "不通：" + (data.error || "未知错"));
+		}
+		return data.ok;
 	} catch (e) {
 		ui.dot.className = "ar-dot err";
 		setStatus(ui, "err", "测试失败：" + (e.message || e));
 		return false;
 	} finally {
 		ui.testBtn.disabled = false;
+		refreshGatewayInfo(ui);
+	}
+}
+
+// 网关服务面：状态行 + 启停按钮（服务是内置的，不需要外部 ds2api）
+async function refreshGatewayInfo(ui) {
+	let st = null;
+	try {
+		st = await jsonFetch(`${DS_API}/status`);
+	} catch (e) {
+		if (ui.svcLine) ui.svcLine.textContent = "内置网关状态读不到：" + (e.message || e);
+		return null;
+	}
+	if (ui.svcLine) {
+		ui.svcLine.textContent = st.running
+			? `服务运行中 ${st.base} · 代理 ${st.proxy || "无"} · 本会话 ${st.requests} 次（最近 ${st.last_ms}ms）`
+			: `服务未运行${st.error ? "（" + st.error + "）" : ""}`;
+	}
+	if (ui.svcBtn) ui.svcBtn.textContent = st.running ? "停掉服务" : "拉起服务";
+	if (ui.dot && !ui.bindBtn.disabled && !ui.testBtn.disabled) {
+		ui.dot.className = "ar-dot " + (st.bound && st.running ? "ok" : st.running ? "" : "err");
+	}
+	if (ui.accountInput && !ui.accountInput.value && st.email) ui.accountInput.value = st.email;
+	if (ui.deviceIdInput && !ui.deviceIdInput.value && st.has_device_id) ui.deviceIdInput.placeholder = "已绑过 device_id（留空则沿用）";
+	if (ui.svcLogs) ui.svcLogs.textContent = (st.logs || []).join("\n");
+	return st;
+}
+
+async function toggleService(ui) {
+	let st = null;
+	try { st = await jsonFetch(`${DS_API}/status`); } catch (e) { /* 当作未运行 */ }
+	const action = st?.running ? "stop" : "start";
+	ui.svcBtn.disabled = true;
+	setStatus(ui, "", action === "start" ? "正在拉起内置网关…" : "正在停掉内置网关…");
+	try {
+		const data = await jsonFetch(`${DS_API}/service`, { method: "POST", body: JSON.stringify({ action }) });
+		setStatus(ui, data.ok ? "ok" : "err", data.ok
+			? (action === "start" ? `服务已拉起（${data.port}）` : "服务已停")
+			: ("失败：" + (data.error || "未知错")));
+	} catch (e) {
+		setStatus(ui, "err", "操作失败：" + (e.message || e));
+	} finally {
+		ui.svcBtn.disabled = false;
+		refreshGatewayInfo(ui);
 	}
 }
 
@@ -479,7 +519,7 @@ function buildPanel(node) {
 	// ---- 云端页 ----
 	const pageDs = el("div", "ar-page");
 	const acc = el("div", "ar-card");
-	acc.append(el("div", "cap", "DeepSeek 账号（密码只存本浏览器）"));
+	acc.append(el("div", "cap", "DeepSeek 账号（账密存插件本地配置，不进日志也不进工作流文件）"));
 	const r1 = el("div", "ar-row");
 	const fAcc = el("div", "ar-f");
 	fAcc.append(el("label", "", "邮箱 / 手机号"));
@@ -487,6 +527,13 @@ function buildPanel(node) {
 	ui.accountInput.value = localStorage.getItem(LS_ACCOUNT) || st.account || "";
 	fAcc.append(ui.accountInput);
 	r1.append(fAcc);
+	const fDev = el("div", "ar-f");
+	fDev.append(el("label", "", "device_id（数美指纹，可留空沿用）"));
+	ui.deviceIdInput = el("input");
+	ui.deviceIdInput.placeholder = "BK…（真实浏览器抓的 89 字串）";
+	ui.deviceIdInput.value = localStorage.getItem(LS_DEVICE_ID) || "";
+	fDev.append(ui.deviceIdInput);
+	r1.append(fDev);
 	acc.append(r1);
 	const r2 = el("div", "ar-row");
 	const fPw = el("div", "ar-f");
@@ -496,7 +543,7 @@ function buildPanel(node) {
 	ui.passwordInput.value = localStorage.getItem(LS_PASSWORD) || "";
 	fPw.append(ui.passwordInput);
 	r2.append(fPw);
-	ui.bindBtn = el("button", "ar-btn pri", "绑定");
+	ui.bindBtn = el("button", "ar-btn pri", "绑定并试跑");
 	ui.bindBtn.addEventListener("click", () => bindAccount(ui));
 	r2.append(ui.bindBtn);
 	acc.append(r2);
@@ -504,20 +551,20 @@ function buildPanel(node) {
 	ui.testBtn = el("button", "ar-btn", "测试连通");
 	ui.testBtn.addEventListener("click", () => testAccount(ui));
 	r3.append(ui.testBtn);
-	const fAdmin = el("div", "ar-f");
-	fAdmin.append(el("label", "", "网关管理密钥（首次绑定填一次）"));
-	const adminInput = el("input");
-	adminInput.type = "password";
-	adminInput.placeholder = "ds2api admin key";
-	adminInput.value = localStorage.getItem("arReverseAdminKey") || "";
-	adminInput.addEventListener("change", () => localStorage.setItem("arReverseAdminKey", adminInput.value.trim()));
-	fAdmin.append(adminInput);
-	r3.append(fAdmin);
+	ui.svcBtn = el("button", "ar-btn", "服务状态待读");
+	ui.svcBtn.addEventListener("click", () => toggleService(ui));
+	r3.append(ui.svcBtn);
 	acc.append(r3);
+	ui.svcLine = el("div", "ar-hint");
+	ui.svcLine.textContent = "正在读内置网关状态…";
+	acc.append(ui.svcLine);
+	ui.svcLogs = el("pre", "ar-logs");
+	acc.append(ui.svcLogs);
 	ui.status = el("div", "ar-status");
 	acc.append(ui.status);
 	pageDs.append(acc);
 	body.append(pageDs);
+	refreshGatewayInfo(ui);
 
 	// ---- 自定义端点页 ----
 	const pageCustom = el("div", "ar-page");
@@ -530,7 +577,7 @@ function buildPanel(node) {
 	pageCustom.append(cc);
 	body.append(pageCustom);
 
-	const PROVIDER_MAP = { local: "本地模型（transformers）", ds: "DeepSeek 云端（ds2api 本地网关）", custom: "自定义 OpenAI 兼容端点" };
+	const PROVIDER_MAP = { local: "本地模型（transformers）", ds: "DeepSeek 云端（内置网关）", custom: "自定义 OpenAI 兼容端点" };
 
 	function applyProvider() {
 		pageLocal.classList.toggle("hidden", st.provider !== "local");
