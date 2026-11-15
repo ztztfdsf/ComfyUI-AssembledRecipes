@@ -21,15 +21,22 @@ const GATEWAY = "http://127.0.0.1:5001";
 
 const STYLE_ID = "ar-reverse-cloud-css";
 const CSS = `
-/* ===== 节点壳：本体只在标题栏 + 端口，body 全给面板 ===== */
-.arshell { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 12px;
+/* ===== 面板壳（照抄画廊节点的防回环配方）=====
+ * .dom-widget 容器高度由 LiteGraph 从 widget 测量回写；壳必须与内容尺寸解耦：
+ *   min-height:0 + grid minmax(0,1fr) 让滚动区可以小于内容高
+ *   content-visibility + contain-intrinsic-size 切断「内容高 → 容器高」的测量反馈 */
+.dom-widget:has(> .arshell) { pointer-events: none !important; }
+.arshell { width: 100%; height: 100%; min-width: 0; min-height: 0;
+  display: grid; grid-template-rows: minmax(0, 1fr); overflow: hidden;
+  box-sizing: border-box; pointer-events: auto;
   font: 12px/1.5 system-ui, sans-serif; color: var(--fg-color, #dcdcde);
-  background: var(--comfy-input-bg, #2b2b30); box-sizing: border-box;
-  height: 100%; overflow-y: auto; overflow-x: hidden; }
-.arshell::-webkit-scrollbar { width: 8px; }
-.arshell::-webkit-scrollbar-thumb { background: #444a; border-radius: 4px; }
-.arshell::-webkit-scrollbar { width: 8px; }
-.arshell::-webkit-scrollbar-thumb { background: #444a; border-radius: 4px; }
+  background: var(--comfy-input-bg, #2b2b30);
+  content-visibility: auto; contain-intrinsic-size: 430px 560px; }
+.arbody { min-height: 0; overflow-y: auto; overflow-x: hidden;
+  padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 12px; }
+.arbody::-webkit-scrollbar { width: 8px; }
+.arbody::-webkit-scrollbar-thumb { background: #444a; border-radius: 4px; }
+.arshell.is-resizing, .arshell.is-resizing * { pointer-events: none !important; user-select: none !important; }
 
 /* 顶栏 */
 .ar-head { display: flex; align-items: center; gap: 10px; }
@@ -143,11 +150,22 @@ async function jsonFetch(url, opts = {}) {
 // 实现：把原 widgets 存到 node[AR_ORIG]，覆写 node.serialize 用「临时换回」策略。
 
 const AR_ORIG = Symbol("ar-orig-widgets");
+const AR_ORDER = Symbol("ar-widget-order");
+const PANEL_NAME = "arcloud_panel";
+
+function sortOrig(node) {
+	const order = node[AR_ORDER];
+	if (!order) return;
+	node[AR_ORIG].sort((a, b) => {
+		const ia = order.indexOf(a.name); const ib = order.indexOf(b.name);
+		return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib);
+	});
+}
 
 function detachWidgets(node) {
 	// 幂等：无论被调多少次，widgets 里只剩面板；原生按名字收集（去重保序）
 	const names = new Set(node[AR_ORIG]?.map((w) => w.name) || []);
-	const natives = (node.widgets || []).filter((w) => w.name !== "arcloud_panel" && w.name !== "image");
+	const natives = (node.widgets || []).filter((w) => w.name !== PANEL_NAME);
 	const kept = [];
 	for (const w of natives) {
 		if (!names.has(w.name)) { names.add(w.name); kept.push(w); }
@@ -157,13 +175,36 @@ function detachWidgets(node) {
 			if (idx >= 0 && node[AR_ORIG]) node[AR_ORIG][idx] = w;
 		}
 	}
+	if (!node[AR_ORDER]) node[AR_ORDER] = (node[AR_ORIG] || []).concat(kept).map((w) => w.name);
 	node[AR_ORIG] = (node[AR_ORIG] || []).concat(kept);
-	node.widgets = (node.widgets || []).filter((w) => w.name === "arcloud_panel" || w.name === "image");
+	sortOrig(node);
+	node.widgets = (node.widgets || []).filter((w) => w.name === PANEL_NAME);
 	// 摘除的 widget 若有已挂载的 DOM（Vue/DOM widget 容器），直接卸载，防 label 残影
 	for (const w of node[AR_ORIG]) {
 		if (w.element?.parentNode) w.element.parentNode.removeChild(w.element);
 		if (w.inputEl?.parentNode) w.inputEl.parentNode.removeChild(w.inputEl);
 	}
+}
+
+// Classic 模式下前端会在 loadGraphData 后重建 widget（不靠定时清扫，直接在创建处收编）
+function installAddWidgetGuard(nodeType) {
+	const prev = nodeType.prototype.addWidget;
+	if (prev?.__arGuarded) return;
+	function addWidget(type, name, value, options) {
+		const w = prev ? prev.apply(this, arguments) : LiteGraph.LGraphNode.prototype.addWidget.call(this, type, name, value, options);
+		if (w && this[AR_ORIG] && w.name !== PANEL_NAME) {
+			const i = this[AR_ORIG].findIndex((x) => x.name === w.name);
+			if (i >= 0) this[AR_ORIG][i] = w;
+			else { this[AR_ORIG].push(w); this[AR_ORDER]?.push(w.name); }
+			sortOrig(this);
+			const k = (this.widgets || []).indexOf(w);
+			if (k >= 0) this.widgets.splice(k, 1);
+			if (w.element?.parentNode) w.element.parentNode.removeChild(w.element);
+		}
+		return w;
+	}
+	addWidget.__arGuarded = true;
+	nodeType.prototype.addWidget = addWidget;
 }
 
 function withOrigWidgets(node, fn) {
@@ -345,6 +386,82 @@ function apiUrl(item) {
 	return "/view?" + p.toString();
 }
 
+// ================= 尺寸处理（照搬画廊节点已验证配方）=================
+
+const MIN_SIZE = [430, 320]; // 面板最小尺寸（用户可拖大，不可拖小）
+const DEFAULT_SIZE = [430, 560]; // 新建时的初始尺寸
+let instanceSeq = 0;
+
+function clampSize(size) {
+	if (!size) return;
+	size[0] = Math.max(MIN_SIZE[0], size[0]);
+	size[1] = Math.max(MIN_SIZE[1], size[1]);
+}
+
+// 拖节点边框时让事件透传到画布（面板自己不能吃缩放手柄）
+function installResizePassthrough(node, ...elements) {
+	node._arResizeElements = [...new Set([...(node._arResizeElements || []), ...elements.filter(Boolean)])];
+	if (node._arResizePatched) return;
+	node._arResizePatched = true;
+
+	const prevGetWidgetOnPos = node.getWidgetOnPos;
+	node.getWidgetOnPos = function (x, y) {
+		// 命中测试必须无副作用：共享指针按下时另一手势会查询本节点
+		if (this.findResizeDirection?.(x, y)) return undefined;
+		return prevGetWidgetOnPos?.apply(this, arguments);
+	};
+
+	const prevResize = node.onResize;
+	node.onResize = function () {
+		if (app.canvas?.resizing_node === this) beginResizePassthrough(this);
+		return prevResize?.apply(this, arguments);
+	};
+}
+
+function beginResizePassthrough(node) {
+	if (node._arResizeCleanup) return;
+	for (const el of node._arResizeElements || []) el?.classList?.add("is-resizing");
+	const cleanup = () => {
+		document.removeEventListener("pointerup", cleanup, true);
+		document.removeEventListener("pointercancel", cleanup, true);
+		for (const el of node._arResizeElements || []) el?.classList?.remove("is-resizing");
+		node._arResizeCleanup = null;
+	};
+	node._arResizeCleanup = cleanup;
+	document.addEventListener("pointerup", cleanup, true);
+	document.addEventListener("pointercancel", cleanup, true);
+}
+
+// 尺寸接管：一手证据——前端 ComfyNode._arrangeWidgets → arrange 会按 widget 行数回写 setSize，
+// 而 loadGraphData 后 restore 会绕过 addWidget 把原生 widget 重新 push 回 node.widgets（实测 29 个），
+// 于是每次 arrange 都按旧行数把节点撞高（只增不减 = 疯涨）。
+// 做法：arrange/_arrangeWidgets 前先清扫，执行完把尺寸强制回到「用户尺寸」。
+function takeOverSize(node) {
+	if (node._arSizeOwned) return;
+	node._arSizeOwned = true;
+	node._arDesiredSize = [Math.max(node.size[0], MIN_SIZE[0]), Math.max(node.size[1], MIN_SIZE[1])];
+	for (const method of ["arrange", "_arrangeWidgets"]) {
+		const prev = node[method];
+		if (typeof prev !== "function") continue;
+		node[method] = function (...args) {
+			if (node[AR_ORIG]) detachWidgets(node);
+			const want = node._arDesiredSize;
+			const r = prev.apply(node, args);
+			if (Math.abs(node.size[0] - want[0]) > 1 || Math.abs(node.size[1] - want[1]) > 1) {
+				node.setSize([want[0], want[1]]);
+			}
+			return r;
+		};
+	}
+	// 用户拖动是唯一能改尺寸的路径：记下来
+	const prevResize = node.onResize;
+	node.onResize = function (size) {
+		clampSize(size);
+		node._arDesiredSize = [size[0], size[1]];
+		prevResize?.apply(node, arguments);
+	};
+}
+
 // ================= 面板 =================
 
 const ui_map = new WeakMap();
@@ -352,6 +469,8 @@ const ui_map = new WeakMap();
 function buildPanel(node) {
 	const st = stateFor(node);
 	const root = el("div", "arshell");
+	const body = el("div", "arbody");
+	root.append(body);
 	const ui = {
 		node, root,
 		resize: null, // 后面挂
@@ -363,7 +482,7 @@ function buildPanel(node) {
 	head.append(el("span", "t", "布局反推"));
 	ui.dot = el("span", "ar-dot");
 	head.append(ui.dot, el("span", "sp"));
-	root.append(head);
+	body.append(head);
 
 	// ---- provider 分段 ----
 	const seg = el("div", "ar-seg");
@@ -381,7 +500,7 @@ function buildPanel(node) {
 		segBtns.push(b);
 		seg.append(b);
 	}
-	root.append(seg);
+	body.append(seg);
 
 	// ---- 本地页 ----
 	const pageLocal = el("div", "ar-page");
@@ -409,7 +528,7 @@ function buildPanel(node) {
 	c3.append(sum);
 	c3.append(ctlText(ui, "rule", "布局规则（框选 / 前后关系 / 输出格式）", { multiline: true }));
 	pageLocal.append(c3);
-	root.append(pageLocal);
+	body.append(pageLocal);
 
 	// ---- 云端页 ----
 	const pageDs = el("div", "ar-page");
@@ -452,7 +571,7 @@ function buildPanel(node) {
 	ui.status = el("div", "ar-status");
 	acc.append(ui.status);
 	pageDs.append(acc);
-	root.append(pageDs);
+	body.append(pageDs);
 
 	// ---- 自定义端点页 ----
 	const pageCustom = el("div", "ar-page");
@@ -463,7 +582,7 @@ function buildPanel(node) {
 	cc.append(ctlText(ui, "openai_model", "模型名", { placeholder: "deepseek-v4.1-flash" }));
 	cc.append(ctlToggle(ui, "deepseek_thinking", "深度思考（关了更快）"));
 	pageCustom.append(cc);
-	root.append(pageCustom);
+	body.append(pageCustom);
 
 	const PROVIDER_MAP = { local: "本地模型（transformers）", ds: "DeepSeek 云端（ds2api 本地网关）", custom: "自定义 OpenAI 兼容端点" };
 
@@ -494,6 +613,9 @@ app.registerExtension({
 	beforeRegisterNodeDef(nodeType, nodeData) {
 		if (nodeData?.name !== NODE_CLASS) return;
 
+		// Classic 模式：loadGraphData 后重建的 widget 在创建处直接收编（不等定时清扫）
+		installAddWidgetGuard(nodeType);
+
 		// 序列化（保存 / graphToPrompt）时把原生 widget 临时拼回，值按原顺序写出
 		// 工作流加载（configure 重建 widget）后清扫：重摘原生、面板复位
 		const origConfigure = nodeType.prototype.onConfigure;
@@ -502,8 +624,21 @@ app.registerExtension({
 			if (this[AR_ORIG]) {
 				detachWidgets(this);
 				this.widgetsChanged?.();
+				// 旧工作流里存的尺寸是原生 widget 时代留下的（过高/过矮都不适用），收敛到可用区间；
+				// 区间内的尺寸尊重用户自己的拖动结果
+				if (this.size[1] < 500 || this.size[1] > DEFAULT_SIZE[1] + 240) {
+					this.setSize([Math.max(this.size[0], MIN_SIZE[0]), DEFAULT_SIZE[1]]);
+				}
+				this._arDesiredSize = [this.size[0], this.size[1]];
 			}
 			return r;
+		};
+
+		// Classic 的 expandToFitContent 只增不减（按 widget 行高撞开节点）——面板接管后必须封死
+		const origExpand = nodeType.prototype.expandToFitContent;
+		nodeType.prototype.expandToFitContent = function () {
+			// 面板接管后：尺寸完全由用户拖动决定，不按内容撞开（旧行为只增不减 = 疯涨根源）
+			if (!this[AR_ORIG]) return origExpand?.apply(this, arguments);
 		};
 
 		const origSerialize = nodeType.prototype.serialize;
@@ -520,25 +655,45 @@ app.registerExtension({
 			// 先摘掉全部原生 widget（存 AR_ORIG），再建面板（控件从 AR_ORIG 取值），最后挂面板
 			detachWidgets(this);
 			const ui = buildPanel(this);
-			const widget = this.addDOMWidget("arcloud_panel", "custom", ui.root, { serialize: false });
-			// 面板高度 100% 跟随节点（节点尺寸由用户拖动决定，同画廊节点）；computeSize 只保证最小高度
-			widget.computeSize = () => [0, 560];
+
+			// —— 以下整套尺寸处理照搬画廊节点（ComfyUI-Aaalice-Nodes）的已验证配方 ——
+			// ① widget type 加实例后缀：Nodes 2.0 按 node id + widget name + type 缓存渲染器，
+			//    撤销重建时稳定 key 会复用旧组件导致 element 挂不上
+			const widget = this.addDOMWidget("arcloud_panel", `custom__ar_instance_${++instanceSeq}`, ui.root, {
+				serialize: false, hideOnZoom: true, margin: 0,
+				getMinHeight: () => MIN_SIZE[1], getValue: () => "", setValue: () => {},
+			});
+			// ② 宽度绑定到节点：前端（#12443）会把陈旧的测量值回写 widget.width ——
+			//    回写成 0/小值时 DOM 容器塔成细条，高度测量无限增长（就是之前的“疯涨”）
+			Object.defineProperty(widget, "width", {
+				configurable: true, enumerable: true,
+				get: () => this.width, set(_w) {},
+			});
+			// ③ 不定义 widget.computeSize：高度由 getMinHeight + 节点尺寸决定，面板 CSS 自己填满
 			this.widgetsChanged?.();
-			// 初始尺寸只设一次；之后用户拖多大就是多大
+
+			// ④ 拖拽命中透传：命中节点缩放手柄时交给画布，不让 widget 抢事件
+			installResizePassthrough(this, ui.root);
+			takeOverSize(this);
+
+			// ⑤ node.computeSize 固定返回最小高（内容不得撑大节点）
+			const prevComputeSize = this.computeSize;
+			this.computeSize = function () {
+				const size = prevComputeSize?.apply(this, arguments) || [MIN_SIZE[0], MIN_SIZE[1]];
+				return [Math.max(MIN_SIZE[0], Number(size[0]) || 0), Math.max(MIN_SIZE[1], Number(size[1]) || 0)];
+			};
+			// ⑥ 初始尺寸只设一次（onResize 已在 takeOverSize 里接管，用户拖动是唯一改尺寸的路径）
 			if (!this._arSized) {
 				this._arSized = true;
-				this.setSize([Math.max(this.size[0] || 430, 430), Math.max(this.size[1] || 620, 620)]);
+				const w = Math.max(this.size[0] || MIN_SIZE[0], MIN_SIZE[0]);
+				const h = Math.max(this.size[1] || DEFAULT_SIZE[1], DEFAULT_SIZE[1]);
+				this.setSize([w, h]);
+				this._arDesiredSize = [w, h];
 			}
-			const prevResize = this.onResize;
-			this.onResize = function (size) {
-				size[0] = Math.max(430, size[0]);
-				size[1] = Math.max(300, size[1]);
-				prevResize?.apply(this, arguments);
-			};
-			// 二次清扫：Vue 前端可能在 createNode 后又填充一轮 widget
+			// ⑧ 二次清扫：前端可能在 createNode 后又填一轮 widget
 			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); }, 0);
 			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); }, 300);
-		
+
 			return r;
 		};
 	},
