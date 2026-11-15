@@ -25,7 +25,7 @@ const CSS = `
 .arshell { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 12px;
   font: 12px/1.5 system-ui, sans-serif; color: var(--fg-color, #dcdcde);
   background: var(--comfy-input-bg, #2b2b30); box-sizing: border-box;
-  height: 540px; overflow-y: auto; overflow-x: hidden; }
+  height: 100%; overflow-y: auto; overflow-x: hidden; }
 .arshell::-webkit-scrollbar { width: 8px; }
 .arshell::-webkit-scrollbar-thumb { background: #444a; border-radius: 4px; }
 .arshell::-webkit-scrollbar { width: 8px; }
@@ -201,7 +201,6 @@ function ctlText(ui, name, labelText, { multiline = false, placeholder = "" } = 
 	input.value = w?.value ?? "";
 	input.addEventListener("change", () => {
 		if (w) { w.value = input.value; w.callback?.(input.value); saveState(node); }
-		ui.resize();
 	});
 	c.append(input);
 	return c;
@@ -308,7 +307,6 @@ async function bindAccount(ui) {
 		setStatus(ui, "err", "绑定失败：" + (e.message || e));
 	} finally {
 		ui.bindBtn.disabled = false;
-		ui.resize();
 	}
 }
 
@@ -337,7 +335,6 @@ async function testAccount(ui, { silent = false } = {}) {
 		return false;
 	} finally {
 		ui.testBtn.disabled = false;
-		ui.resize();
 	}
 }
 
@@ -479,20 +476,10 @@ function buildPanel(node) {
 			w.value = PROVIDER_MAP[st.provider];
 			w.callback?.();
 		}
-		ui.resize();
 	}
 
-	ui.resize = () => {
-		requestAnimationFrame(() => {
-			if (!document.contains(root)) return;
-			const w0 = 430;
-			// 高度完全静态（CSS 540px），只保证最小宽度
-			if (!(node.size[0] >= w0) || !(node.size[1] >= 580)) {
-				node.setSize([Math.max(node.size[0] || w0, w0), Math.max(node.size[1] || 580, 580)]);
-			}
-			app.graph.setDirtyCanvas(true, true);
-		});
-	};
+	// 节点尺寸完全由用户拖动（同画廊节点）；面板 height:100% 跟随，内容内部滚动
+	ui.resize = () => {};
 	ui.applyProvider = applyProvider;
 
 	applyProvider();
@@ -534,12 +521,23 @@ app.registerExtension({
 			detachWidgets(this);
 			const ui = buildPanel(this);
 			const widget = this.addDOMWidget("arcloud_panel", "custom", ui.root, { serialize: false });
-			widget.computeSize = () => [0, 552]; // 静态：面板 CSS 锁 540px + 余量，永不测量
+			// 面板高度 100% 跟随节点（节点尺寸由用户拖动决定，同画廊节点）；computeSize 只保证最小高度
+			widget.computeSize = () => [0, 560];
 			this.widgetsChanged?.();
-			ui.resize();
+			// 初始尺寸只设一次；之后用户拖多大就是多大
+			if (!this._arSized) {
+				this._arSized = true;
+				this.setSize([Math.max(this.size[0] || 430, 430), Math.max(this.size[1] || 620, 620)]);
+			}
+			const prevResize = this.onResize;
+			this.onResize = function (size) {
+				size[0] = Math.max(430, size[0]);
+				size[1] = Math.max(300, size[1]);
+				prevResize?.apply(this, arguments);
+			};
 			// 二次清扫：Vue 前端可能在 createNode 后又填充一轮 widget
-			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); ui.resize(); }, 0);
-			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); ui.resize(); }, 300);
+			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); }, 0);
+			setTimeout(() => { detachWidgets(this); this.widgetsChanged?.(); }, 300);
 		
 			return r;
 		};
