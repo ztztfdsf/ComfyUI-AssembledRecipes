@@ -19,6 +19,7 @@
 import json
 import os
 import re
+import re as _re  # 类体内用 _re，模块级代码用 re；同一个模块对象
 import sys
 import time
 import types
@@ -1191,6 +1192,55 @@ class ReverseJsonSanitize:
             return True
         return False
 
+    # 审查/打码字样：这些词一旦被写进布局提示词，文生图模型会照着在画面上**画出马赛克块**。
+    # 规则层已经全面禁止（reverse_rule.py「审查遮蔽」一节），但实测小模型不遵守
+    # （LFM3-VL-2B 照样吐 "eyes obscured by pixelation"，同规则 gemma-4-E2B 零命中），
+    # 所以这里做确定性剥离——不指望模型自觉。
+    # 注意不收 blur/blurred：那在「softly blurred background」里是景深描述，不是审查。
+    _CENSOR_RE = _re.compile(
+        r"mosaic|censor(?:ed|ing|ship)?|pixelis(?:ed|ation)|pixeliz(?:ed|ation)|pixelat(?:ed|ion)"
+        r"|redact(?:ed|ion)?|bar\s+censor|heart\s+censor|sticker\s+censorship"
+        r"|涂黑|打码|马赛克|像素化|审查条|遮挡贴纸|模糊遮挡", _re.I)
+    # 一句一句切（只按句末切，避免把 "a, b, c" 这种短语切碎误伤）
+    # 中文句号后不带空格，不能只用 `\s+` 切（实测整段中文会变成一句，
+    # 于是「她的下半身被打码处理。身上穿黄色毛衣」被当一句整段削空）
+    _SENT_SPLIT = _re.compile(r"(?<=[.!?])\s+|(?<=[。！？；])")
+
+    # 短语级切分：先按句切，句内再按逗号/and 切，只删命中审查字样的那一小段。
+    # 直接删整句会连带丢掉合法描述（实测 LFM3 把「整人框」的 desc 写成一句，
+    # 整句删掉就把整个人物框一起丢了 → character_boxes 错位）。
+    _CLAUSE_SPLIT = _re.compile(r"\s*,\s*|\s+and\s+|\s*;\s*|，|；|、")
+
+    def _scrub_censor(self, text):
+        """削掉含审查字样的短语。返回 (清洗后文本, 削掉的短语数)。"""
+        if not text or not self._CENSOR_RE.search(text):
+            return text, 0
+        kept, cut = [], 0
+        for sent in self._SENT_SPLIT.split(text):
+            if not sent.strip():
+                continue
+            if self._CENSOR_RE.search(sent):
+                parts = [p.strip() for p in self._CLAUSE_SPLIT.split(sent)]
+                good = []
+                for part in parts:
+                    if part and self._CENSOR_RE.search(part):
+                        cut += 1
+                        continue
+                    if part:
+                        good.append(part)
+                if not good:
+                    continue          # 整句都在说审查 → 这句不要了
+                # 粘回去：末段带句末标点的保持原样，中间用逗号连
+                merged = good[0]
+                for g in good[1:]:
+                    merged += (", " if not merged.endswith((".", "!", "?", "。", "！", "？")) else " ") + g
+                kept.append(merged)
+            else:
+                kept.append(sent)
+        out = _re.sub(r"\s+", " ", " ".join(kept)).strip()
+        out = _re.sub(r"\s+([,.!?;:])", r"", out)
+        return out, cut
+
     def sanitize(self, text, on_empty="报错停止（默认）"):
         report = []
         raw = text or ""
@@ -1255,6 +1305,7 @@ class ReverseJsonSanitize:
                         pass
         out, dropped, bbox_fixed, meta_dropped = [], 0, 0, 0
         promoted = 0
+        censor_cut = 0
         if isinstance(data, list):
             # 第一遍：定性谁是 meta（水印/署名/声明/链接/角落人名）
             items = [e for e in data if isinstance(e, dict)]
@@ -1293,6 +1344,13 @@ class ReverseJsonSanitize:
                     etype = "obj"
                 # 官方 schema 里描述字段叫 caption，我们叫 desc：两个都收
                 desc = str(e.get("desc") or e.get("caption") or "").strip() or "unknown"
+                # 审查字样剥离：写了马赛克 = 让重绘图长出马赛克，所以整句删掉
+                desc, n_cut = self._scrub_censor(desc)
+                if n_cut:
+                    censor_cut += n_cut
+                    if not desc:
+                        dropped += 1
+                        continue
                 # 坐标序交换：模型按原生习惯输出 xyxy [x0,y0,x1,y1]，
                 # CreateBoundingBoxes 要 yxyx [y0,x0,y1,x1]。规则层拗不过模型（实测），
                 # 在这里确定性交换，保证下游永远吃到 yxyx。
@@ -1341,6 +1399,11 @@ class ReverseJsonSanitize:
                     promoted += 1
             if promoted:
                 report.append("按 desc 措辞补标 %d 个 character 框" % promoted)
+        if summary:
+            summary, n_cut = self._scrub_censor(summary)
+            censor_cut += n_cut
+        if censor_cut:
+            report.append("剥掉 %d 句审查/打码描述（写了就会让重绘图长出马赛克）" % censor_cut)
         msg = f"保留 {len(out)} 个框"
         if not out and (raw or "").strip() and on_empty.startswith("报错"):
             # 上游确实给了东西、这里却一个框都洗不出来 = 反推输出不可用，直接停
@@ -1499,6 +1562,21 @@ except ImportError:  # 以脚本方式加载（非包上下文）时的兜底
     _LAYOUT_RULE_DEFAULT = _il.import_module("reverse_rule").LAYOUT_RULE
 
 
+def _merge_extra_rule(rule: str, extra: str) -> str:
+    """把「额外要求」拼到规则末尾当 system 提示词。
+
+    位置在末尾不是随意：长 system 提示词里靠后的指令对生成的影响更直接，
+    而且这段是主人本次现写的临时约束，本来就该压过前面那些通用规则
+    （比如「只框人物不框背景」要能盖掉通用的「背景可给一个 obj 框」）。
+    """
+    base = (rule or "").rstrip()
+    add = (extra or "").strip()
+    if not add:
+        return base
+    return (base + "\n\n# 额外要求（本次，优先级高于以上所有规则；与之冲突时以本节为准）"
+            + "\n" + add + "\n")
+
+
 class ReverseLayoutCaption:
     """MOSS 布局反推（进程内直载 transformers，零外部进程、零黑框）。
 
@@ -1552,6 +1630,10 @@ class ReverseLayoutCaption:
                                              "自定义端点→原值发 reasoning_effort（端点不认该字段会自动去掉重试）；"
                                              "DeepSeek 云端→官方只有布尔开关，medium/high/max 算开、minimal/low 算关、"
                                              "不思考=不覆盖，回落到「深度思考」那个开关"}),
+                # ---- 额外要求（最后一个，位置=widgets_values 末尾，不能往前挪）----
+                "extra_requirement": ("STRING", {"multiline": True, "default": "",
+                                                 "tooltip": "本次的额外要求，拼在规则后面一起当 system 提示词（优先级最高）。"
+                                                           "用来写一次性的临时约束，比如「只框人物不框背景」「这段文字必须逐字保留」"}),
             },
         }
 
@@ -1804,8 +1886,11 @@ class ReverseLayoutCaption:
                 max_new_tokens=4096, pre_clear=True, offload_after=True,
                 deepseek_thinking=True,
                 quant="4bit (NF4，显存最省)", tag_mode="全部（推荐 12B 级大模型）", batch_index=0,
-                custom_stream=False, custom_effort="不思考", endpoint=""):
+                custom_stream=False, custom_effort="不思考", endpoint="", extra_requirement=""):
         import torch
+        # 额外要求一进来就并进规则：三条 provider 路径、provenance、日志全都吃同一份，
+        # 不允许某条路漏掉（以前云端/本地各拼一套，漏一次就查半天）
+        rule = _merge_extra_rule(rule, extra_requirement)
         provider_local = str(provider).startswith("本地")
         provider_ds = "DeepSeek" in str(provider)
         provider_openai = "OpenAI" in str(provider)

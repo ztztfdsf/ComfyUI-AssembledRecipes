@@ -844,6 +844,15 @@ function buildPanel(node) {
 	cTag.append(ctlSelect(ui, "tag_mode", "喂给模型多少标签"));
 	pageMain.append(cTag);
 
+	// 额外要求：放在规则上面，且不进折叠区——这是每次现写的临时约束，要一眼看到
+	const cExtra = el("div", "ar-card");
+	cExtra.append(el("div", "cap", "额外要求"));
+	cExtra.append(ctlText(ui, "extra_requirement", "本次额外要求（拼在规则末尾，冲突时以这里为准）", {
+		multiline: true,
+		placeholder: "例：只框人物不框背景；画面文字必须逐字保留",
+	}));
+	pageMain.append(cExtra);
+
 	const c3 = el("details", "ar-card");
 	const sum = el("summary", "", "提示词规则 rule");
 	sum.style.cursor = "pointer";

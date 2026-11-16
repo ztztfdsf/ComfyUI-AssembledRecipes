@@ -410,6 +410,13 @@ def prompt_provenance(rule: str, user_text: str, **params) -> str:
     lines = ["提示词来源与形状："]
     lines.append("  rule 规则：%d 字（sha1 %s），首行「%s」" %
                  (len(r), _h(r), (r.splitlines() or [""])[0][:40]))
+    # 额外要求是整段 rule 里唯一「本次现写、下次不会一样」的东西，必须单独摊出来；
+    # 否则出错时只能看到 rule 总字数变了，看不出到底追加了什么约束
+    _mk = "# 额外要求（本次"
+    if _mk in r:
+        _extra = r.split(_mk, 1)[1]
+        _extra = _extra.split("\n", 1)[1] if "\n" in _extra else _extra
+        lines.append("  额外要求（本次）：%s" % (_extra.strip().replace("\n", " ") or "（空）"))
     lines.append("  user_prompt：%s，%d 字（sha1 %s）" % (src, len(u), _h(u)))
     lines.append("  内容：%s" % (u[:200].replace("\n", " ") + ("…" if len(u) > 200 else "")))
     for k, v in params.items():

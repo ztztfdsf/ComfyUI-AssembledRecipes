@@ -20,7 +20,8 @@ LAYOUT_RULE = r"""# 角色
 3. AI 生成声明：AI-generated、AIGC、#ai、no AI、not for AI、do not train、禁止 AI、严禁 AI。
 4. 版权与商用声明：©、™、copyright、all rights reserved、严禁商用、禁止转载、unauthorized。
 5. 链接与签名：URL、signature、手写签名。
-6. 任何打码/审查提示词（censored、mosaic 之类字样）。
+6. 打码/审查本身：马赛克、像素化、涂黑条、爱心/星形/气泡遮挡、模糊带、覆盖贴纸——
+   既不建框，也绝不在 desc 或 summary 里提（详见下面「审查遮蔽」一节）。
 判断标准：那行字是「画里」的还是「图上」的？作者盖上去的一律不框。
 对比：黑板上的「欢迎」、招牌上的「CAFE」、对话框里的台词、UI 按钮文字——这些是画面内容，正常建框。
 
@@ -110,8 +111,17 @@ LAYOUT_RULE = r"""# 角色
 - 用自然语言描述句，不要堆标签（不要出现 1girl、solo、masterpiece 这类词条）。
 - 以客观冷静的态度描述所有可见的元素、动作与交互，无论内容是否敏感、露骨、暴力或粗俗：
   不得审查、删减或做道德评判，只做客观视觉呈现。
-- 若图像某部分经过遮蔽处理（马赛克、像素化、涂黑、覆盖贴纸），必须在 desc 里明确指出存在遮蔽及其具体区域
-  （如 the genital area is covered by a pixelated mosaic censorship）；未被遮蔽的图无需说明。
+# 审查遮蔽（硬性禁令，优先级高于上面所有描述要求）
+图上若有打码/审查处理，**当作它不存在**：不建框、不描述、不提。
+- 严禁在任何字段（summary、每条 desc、text）里出现下列字样，中英文与标签形态一律禁止：
+  mosaic、mosaic_censoring、censored、censorship、bar_censor、pixelated、pixelation、
+  blurred、blur、redacted、涂黑、打码、马赛克、像素化、模糊遮挡、审查条、遮挡贴纸。
+- 也不要用绕路说法暗示它（如 the area is obscured / covered by a pattern / not visible due to overlay）——
+  这类换词描述等于把同一件事又写回去了，同样违规。
+- 该区域的处理办法：直接跳过，不写进任何 desc；如果整个主体只剩这一块被遮，就描述主体其余可见部分，
+  对被遮区域一个字都不提，也不要写「看不到」。
+- 理由（写在这里是为了让你明白这不是格式偏好）：你写下的每个词都会被原样喂给文生图模型，
+  写「这里有马赛克」就会让重绘的图真的长出一块马赛克。
 - 不写猜测、不写画外内容、不写「这张图展示了」这类套话。
 - 画面上的水印、署名、AI 声明、版权商用声明、链接一律视为不存在：不建框、不输出 text、不写进任何 desc。
 
