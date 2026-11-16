@@ -1019,8 +1019,8 @@ class ReverseJsonSanitize:
                                           {"default": "报错停止（默认）",
                                            "tooltip": "洗出来 0 个框时怎么办：报错停止（不要静默白跑一张）/ 输出空布局继续（当没反推）"})}}
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("json", "character_boxes")
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("json", "character_boxes", "summary")
     FUNCTION = "sanitize"
     CATEGORY = "AssembledRecipes"
     DESCRIPTION = "修复反推输出的病 JSON（裸换行/字符串 bbox/截断），并把坐标从 xyxy 转成 yxyx，喂给边界框画布。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
@@ -1194,7 +1194,25 @@ class ReverseJsonSanitize:
     def sanitize(self, text, on_empty="报错停止（默认）"):
         report = []
         raw = text or ""
-        s = raw.strip()
+        # 现行默认规则要求的是「对象」：{"summary": 整图总述, "items": [...]}
+        # 老工作流与部分模型仍会直接吐裸数组，两种都要吃；summary 单独走一个输出口。
+        summary = ""
+        try:
+            from .reverse_cloud.providers import parse_layout
+        except ImportError:
+            import importlib as _il, sys as _sys
+            _rd = os.path.dirname(os.path.abspath(__file__))
+            if _rd not in _sys.path:
+                _sys.path.insert(0, _rd)
+            parse_layout = _il.import_module("reverse_cloud.providers").parse_layout
+        parsed = parse_layout(raw)
+        if parsed is not None and parsed[0]:
+            summary, _items = parsed
+            # 把 items 单独序列化下去，后面那套容错（裸控制字符/截断回退）照旧复用
+            s = json.dumps(_items, ensure_ascii=False)
+            report.append("读到 summary（%d 字）" % len(summary))
+        else:
+            s = raw.strip()
         if "```" in s:
             for part in s.split("```"):
                 p = part.strip()
@@ -1236,6 +1254,7 @@ class ReverseJsonSanitize:
                     except Exception:
                         pass
         out, dropped, bbox_fixed, meta_dropped = [], 0, 0, 0
+        promoted = 0
         if isinstance(data, list):
             # 第一遍：定性谁是 meta（水印/署名/声明/链接/角落人名）
             items = [e for e in data if isinstance(e, dict)]
@@ -1303,6 +1322,25 @@ class ReverseJsonSanitize:
                     uniq[pos]["desc"] = it["desc"]
             msg_dup = len(out) - len(uniq)
             out = uniq
+        # character 兜底推导：小模型（实测 LFM3-VL-2B）会照旧把所有框写成 obj，
+        # 但它会把「整人」和「部位」在 desc 里分得很清楚（Whole character (full body) of…
+        # 对 Upper clothing region of… / Head region of…）。官方节点的 character/object
+        # 判错会在部位特写框里多画一颗人头，所以这里按 desc 的措辞确定性补标，
+        # 而不是指望 1.9B 模型记住一条规则。
+        if out and not any(it["type"] == "character" for it in out):
+            _whole = re.compile(r"whole\s+(?:the\s+)?character\b|\b(?:full|whole)[- ]body\b", re.I)
+            _part = re.compile(r"\bregion\b|close[- ]?up|\binset\b|\bcrop\b|detail of", re.I)
+            _person = re.compile(r"\b(?:girl|boy|woman|man|character|lady|guy|person|figure|"
+                                 r"cat ?ears?|girlfriend|maid|idol|girl)\b", re.I)
+            for it in out:
+                if it["type"] != "obj":
+                    continue
+                d = it["desc"]
+                if _whole.search(d) and not _part.search(d) and _person.search(d):
+                    it["type"] = "character"
+                    promoted += 1
+            if promoted:
+                report.append("按 desc 措辞补标 %d 个 character 框" % promoted)
         msg = f"保留 {len(out)} 个框"
         if not out and (raw or "").strip() and on_empty.startswith("报错"):
             # 上游确实给了东西、这里却一个框都洗不出来 = 反推输出不可用，直接停
@@ -1329,7 +1367,7 @@ class ReverseJsonSanitize:
             report.append("人物框: " + ", ".join(char_idx))
         result = json.dumps(out, ensure_ascii=False)
         print(f"[AssembledRecipes] 反推JSON清洗: {'; '.join(report)} | 输出 {len(result)} 字符", flush=True)
-        return (result, ", ".join(char_idx))
+        return (result, ", ".join(char_idx), summary)
 
 
 _VLM_CACHE = {}  # 模型目录 -> (processor, model) 内存常驻缓存
@@ -1450,100 +1488,15 @@ def _cloud_caption(kind, pil, rule, user_text, thinking=True,
                                  stream=bool(stream), effort=effort or "", endpoint=endpoint)
 
 
-_LAYOUT_RULE_DEFAULT = (
-    '# 角色\n'
-    '你是图像版面解析引擎，把画面拆成「布局元素」，供文生图按区域重绘。\n'
-    '\n'
-    '# 绝对禁框（最高优先级，无例外）\n'
-    '凡是图的「外部元信息」，不管长在画面哪个位置、不管多显眼，都视为不存在：不建框、不进 text、不进 desc。\n'
-    '禁止的类别（命中任一即丢）：\n'
-    '1. 水印：watermark、半透明角标、重复铺满的底纹文字。\n'
-    '2. 作者/画师署名与社交 handle：@xxxx、Qianliu、qianliu@fanbox.cc、FANBOX、PIXIV、Patreon、推特/X 用户名。\n'
-    '3. AI 生成声明：AI-generated、AIGC、#ai、no AI、not for AI、do not train、禁止 AI、严禁 AI。\n'
-    '4. 版权与商用声明：©、™、copyright、all rights reserved、严禁商用、禁止转载、do not repost、unauthorized。\n'
-    '5. 链接与签名：URL、邮箱、signature、签名。\n'
-    '对比：黑板上写的「欢迎」、招牌上的「CAFE」、对话框里的台词、UI 里的按钮文字 —— 这些是画面内容，正常建框。\n'
-    '判断标准：那行字是「画里」的还是「图上」的？图上的（作者盖上去的）一律不框。\n'
-    '\n'
-    '# 内部流程（只在心里做，不要输出）\n'
-    '1. 先数画面里有几个主要主体：人物/动物各算一个主体，成段的文字算一个元素，占据显眼位置的大物体算一个元素。\n'
-    '2. 同一主体的头发、眼睛、衣服、手、配饰全部属于它，只给它一个框，不拆。\n'
-    '\n'
-    '# 框选规则\n'
-    '- 框允许重叠：两个主体靠在一起、人物与前景道具交叉时，各框照实拉，不要为了不重叠而把框切小或把两个主体合并。\n'
-    '- 多主体必须分开建框：画面里有几个人物/动物就建几个框，各自写各自的 desc，禁止把两个及以上的人合并进同一个框。只有画面确实只有一个主体时才允许整幅大框。\n'
-    '- 框数上限 10 个，宁少勿多；超过 10 个说明你在把画面拆碎。\n'
-    '- 框要紧贴该元素在图中真实可见的范围：人物包含头发、四肢、手持物和衣摆；不要把阴影、背景算进去。\n'
-    '- 人物 / 动物：框住整个轮廓（全身图含头顶到脚下，半身图到画面下沿或腰线）。\n'
-    '- 文字块：整段文字一个框，不要一行一个框、不要一个字一个框。\n'
-    '- 大物体：只框占据画面显著位置的（家具、大型道具、明显前景物）。\n'
-    '- 对画面重要的整块背景环境（天空、街道、房间、荒野）可以给一个覆盖它的 obj 框，放最底层；但背景光斑、装饰星星、纹理不算。\n'
-    '- 只框图里真实看得见的东西，不要编造图上不存在的元素。\n'
-    '- 除背景层外，单个框的最大跨度不要超过画面宽/高的 90%：超过就说明你在框背景而不是框元素。\n'
-    '- 禁止建框：发丝、眼睛、单件饰品、衣褶、背景光斑、装饰星星、纹理、细小图案、logo 细节。\n'
-    '- 禁止建框（任何情况下，包括 type=text）：水印、画师/作者署名、AI 生成声明（如 AI-generated、禁止AI使用）、版权与商用声明、网址链接、logo、签名等非画面内容文字——一律当作不存在：不建框、不输出、不描述。\n'
-    '\n'
-    '# 前后关系（重叠框必填，缺了下游就会把遮挡画错）\n'
-    '- 凡两个框有重叠，双方的 desc 都必须写清两者关系：谁在前谁在后、被遮住的是哪一侧/哪一部分（例如 her left arm is partially occluded by the wooden crate in the foreground）。\n'
-    '- 每个非背景框都必须含明确的深度词：background / midground / foreground 三选一，并写相对关系（in front of / behind / partially occluding / partially occluded by + 对象）。\n'
-    '- 重叠区域两侧的描述必须互相对得上：A 说被 B 遮住左臂，B 的 desc 就要写它在前景遮住了 A 的左臂；禁止两边说法矛盾。\n'
-    '- 不确定谁在前时，按遮挡边缘判断：边界清晰锐利的在前景，被压住轮廓的在背景。\n'
-    '# 坐标\n'
-    '- 归一化 0~1000 的整数，顺序是 [左, 上, 右, 下]，也就是 xmin, ymin, xmax, ymax。\n'
-    '- 例：[0, 0, 1000, 1000] 是整张图；[0, 0, 1000, 500] 是画面上半部分整宽；[570, 266, 797, 500] 是画面中间偏右下的一块。\n'
-    '- 必须 xmin < xmax 且 ymin < ymax；四个值都是纯数字，不加引号、不写成字符串。\n'
-    '- bbox 的 x 和 y 是**各自独立**归一化的：x 的 0~1000 对应整幅画面的宽，y 的 0~1000 对应整幅画面的高。\n'
-    '- 所以框的宽高比必须按画面真实比例换算，不能凭"正方形"直觉给：一张 9:16 的竖图里，画面中真正正方形的物体，它的框应该是横向窄、纵向宽（x 跨度远小于 y 跨度）。\n'
-    '- 具体做法：先估出元素占画面宽的百分之几、占画面高的百分之几，再各自换算成 0~1000 的整数；不要直接把"看起来的宽高比"同时填进两个方向。\n'
-    '- 除覆盖整块的背景层之外，任何框的宽跨度或高跨度都不要超过 900（画面的 90%），避免一个大框吞掉整幅画面、其他元素反而没被覆盖。\n'
-    '\n'
-    '# 输出（直接喂给「创建边界框」节点，字段必须严格照它的规则）\n'
-    '只输出一个 JSON 数组。不要 markdown 代码块，不要解释，不要任何前后缀文字。\n'
-    '数组元素两种形态：\n'
-    '{"type":"obj","bbox":[xmin,ymin,xmax,ymax],"desc":"英文描述"}\n'
-    '{"type":"text","bbox":[xmin,ymin,xmax,ymax],"text":"画面文字原文","desc":"英文说明"}\n'
-    '- type 只有 "text" 是特殊值，其余元素一律写 "obj"，不要自创别的类型。\n'
-    '- text 字段只在 type 为 "text" 时出现；obj 元素不要带 text。\n'
-    '- 可选字段 "color_palette"：能明确判断该区域主色调时，写最多 5 个十六进制色，如 ["#1b2a44","#d8c7a1"]；拿不准就整个字段省略，不要猜。\n'
-    '- 排序：从背景到前景（先背景元素，主体在后），下游按顺序理解遮挡。\n'
-    '\n'
-    '# desc 要求（按 MOSS 官方布局数据的详细程度写，别怕长）\n'
-    '- 必须是英文，不得出现中文或日文。\n'
-    '- 每条 120~220 个英文单词，写成一个完整段落，详细到能照着这段重新画出来。框数上限 10 个，所以尽管写细，总量可控。\n'
-    '- 长度不随框数缩水：即使画面里有多个主体、多个框，每条 desc 也必须独立保持 120 词以上，不要因为分了框就把每段写短。\n'
-    '- 必须写到这些：\n'
-    '  · 主体身份与外观（物种/性别/年龄段）、发型发色的长度与质感、有无角/耳/尾等特征；\n'
-    '  · 服装的层数、材质、剪裁、颜色、配饰，要具体（例如 layered white ceremonial robes with wide draping sleeves）；\n'
-    '  · 姿势：手在哪、身体朝向哪边、头转向哪里、视线看向哪里、重心落在哪只脚；\n'
-    '  · 表情必须写死：眼睛/眼睑/瞳孔反应、眉毛走向、嘴型（是否张开、有无牙齿舌头）、脸红、泪痕、汗滴、情绪词（smile / grin / smirk / pout / blush / tears / angry / surprised / sleepy / expressionless 等）——这一项漏写是最常见的重绘失败原因；\n'
-    '  · 手部：手指数量与姿态（张开/握拳/竖起/比心/扶帽檐/撩头发）、手臂弯曲方向、手里拿的东西；\n'
-    '  · 脚部：是否可见、鞋/袜/靴的款式与颜色、站姿或坐姿时脚的朝向；\n'
-    '  · 配饰与道具：发饰、耳饰、颈饰、腰带、链条、戒臂、武器、乐器、花束等，写明材质与颜色；\n'
-    '  · 与镜头的距离和景别（close-up / upper body / half body / full body）；\n'
-    '  · 拍摄视角与主体朝向：判断画面是俯拍（high-angle / bird\'s-eye）、仰拍（low-angle / worm\'s-eye）还是平视（eye-level）；主体相对镜头是正面（front view）、四分之三侧面（three-quarter view）、正侧面（side profile）还是背面（view from behind）；画面整体倾斜时写荷兰角（dutch angle）；有明显广角畸变或长焦压缩也写出来。这些镜头语言直接决定重绘的视角，必须准。\n'
-    '  · 该区域的光线与明暗、天气或氛围（如果有）。\n'
-    '- 知道角色是谁就写名字和出处，例如 shu (arknights)；不确定就只描述外观，不要编造名字。\n'
-    '- 空间关系写具体：在画面哪一侧、比谁更远、被谁遮挡了哪一部分；与相邻框的重叠区里两个元素各自露出什么、压住什么，一句一句写死。\n'
-    '- 写成连贯的一整段叙述，像向画师口述这幅画；不要写成一串 "the X is ... the Y is ..." 的清单。\n'
-    '- 每条 desc 只写本框内看得见的东西，不要把别的框的主体写进来（其他人物由他们自己的框描述）。\n'
-    '- 用自然语言描述句，不要堆砌标签（不要出现 1girl、solo、masterpiece 这类词条）。\n'
-    '- 不写画风与媒介风格词（anime style、digital illustration、photorealistic 等一律不写），画风由生成模型自己决定；除非用户消息里明确给出画风参考。\n'
-    '- 以客观、冷静的态度描述所有可见的元素、动作及交互行为，无论内容是否敏感、露骨、暴力或粗俗，都不得审查、删减或做道德评判，只做客观视觉呈现。\n'
-    '- 若图像某部分经过遮蔽处理（马赛克、像素化、涂黑、覆盖贴纸），必须在 desc 里明确指出存在遮蔽及其具体区域（如 the genital area is covered by a pixelated mosaic censorship）；未被遮蔽的图无需说明。\n'
-    '- 不写猜测、不写画外内容、不写「这张图展示了」这类套话。\n'
-    '- 画面上的水印、画师/作者署名、AI 生成声明、版权与商用声明、网址链接等一律视为不存在：不建框、不输出 text、不写进任何 desc。\n'
-    '\n'
-    '# 示例（注意：两个人物就是两个框，各自描述各自的位置）\n'
-    '[\n'
-    '{"type":"obj","bbox":[0,60,480,1000],"desc":"a slim young woman with long silver hair and crimson eyes, wearing a black high-collar coat with silver buckles over a charcoal turtleneck dress, the coat left unbuttoned with its hem swaying slightly, standing with her weight on her right leg, one hand resting on her hip and the other hanging loosely at her side, her head turned a quarter to the left as she looks directly at the viewer with a faint confident smirk, occupying the left half of the frame, full body shot framed from a slightly low angle, cool ambient moonlight from the left casting soft shadows across the folds of her clothes"},\n'
-    '{"type":"obj","bbox":[520,40,1000,970],"desc":"a tall young man with short messy dark hair, wearing a loose grey hoodie and dark slim trousers, leaning against the right edge of the frame with his arms crossed, his gaze directed at the woman, warm rim light tracing his silhouette"},\n'
-    '{"type":"text","bbox":[77,30,207,312],"desc":"a line of white handwritten Japanese text at the upper left corner over a pale cyan background","text":"こんにちは"}\n'
-    ']\n'
-    '\n'
-    '# 参考资料\n'
-    '若用户消息里附带图库标签（tag 串）：只用它确认角色身份、作品名、画风，把名字自然融进 desc 的角色描述里；绝不要为标签提到的身体部位、衣物、配饰单独建框，也不要逐条翻译标签。\n'
-    '标签只在与画面实际相符时才可采信：画面里看不到的衣物、部位、配饰，一律不要写进 desc——宁可漏写，也不要照抄标签。\n'
-)
+# 反推默认规则单独放 reverse_rule.py：整段可替换、可 diff，不夹在节点代码里
+try:
+    from .reverse_rule import LAYOUT_RULE as _LAYOUT_RULE_DEFAULT
+except ImportError:  # 以脚本方式加载（非包上下文）时的兜底
+    import importlib as _il, sys as _sys, os as _os
+    _rd = _os.path.dirname(_os.path.abspath(__file__))
+    if _rd not in _sys.path:
+        _sys.path.insert(0, _rd)
+    _LAYOUT_RULE_DEFAULT = _il.import_module("reverse_rule").LAYOUT_RULE
 
 
 class ReverseLayoutCaption:
@@ -1880,14 +1833,15 @@ class ReverseLayoutCaption:
             except Exception as e:
                 raise RuntimeError(f"云端反推[{provider}] 失败: {e}") from e
             try:
-                from .reverse_cloud.providers import check_layout, prompt_provenance
+                from .reverse_cloud.providers import check_layout, parse_layout, prompt_provenance
             except ImportError:
                 import importlib as _il, sys as _sys, os as _os
                 _pd = _os.path.dirname(_os.path.abspath(__file__))
                 if _pd not in _sys.path:
                     _sys.path.insert(0, _pd)
                 _pv = _il.import_module("reverse_cloud.providers")
-                check_layout, prompt_provenance = _pv.check_layout, _pv.prompt_provenance
+                check_layout, parse_layout, prompt_provenance = (
+                    _pv.check_layout, _pv.parse_layout, _pv.prompt_provenance)
             # 格式不对就直接停，不要把一堆废话交给下游清洗节点静默变空布局：
             # 旧行为是“云端喷了非 JSON / 被截断 → 清洗保留 0 框 → 整条链路当没反推继续出图”，
             # 看上去 success，实际白跑一张。
@@ -1913,8 +1867,12 @@ class ReverseLayoutCaption:
                        (text_out or "")[-60:], prov,
                        (text_out or "")[:300].replace(chr(10), " "), dump))
             # 直接吃 check_layout 的结果（它已经处理过截断判定与补外壳），
-            # 不再二次 extract——上一版在这里对 None 求 len 当场炸了整单
-            text_out = json.dumps(boxes, ensure_ascii=False)
+            # 不再二次 extract——上一版在这里对 None 求 len 当场炸了整单。
+            # summary 必须原样带下去：清洗节点靠它填官方布局的 summary.caption，
+            # 这里只回吐 items 数组就等于把整图总述丢了（实测踩过）。
+            _summ = (parse_layout(text_out) or ("", None))[0]
+            text_out = (json.dumps({"summary": _summ, "items": boxes}, ensure_ascii=False)
+                        if _summ else json.dumps(boxes, ensure_ascii=False))
             print(f"[AssembledRecipes] 云端反推[{provider}]: {time.time() - t0:.1f}s | "
                   f"{len(boxes)} 个框{('（' + note + '）' if note else '')} | rule {len(rule)}字 sha1={_sha8(rule)} | "
                   f"user_prompt {len(up_all)}字 sha1={_sha8(up_all)}", flush=True)

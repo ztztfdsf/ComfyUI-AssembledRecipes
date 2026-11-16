@@ -309,6 +309,48 @@ def salvage_objects(text: str):
     return objs if objs and all(("bbox" in o) for o in objs) else None
 
 
+def parse_layout(text: str):
+    """把反推正文解析成 (summary, items)。两种形状都收：
+       · 新版（现行默认规则要求的）：{"summary": "...", "items": [...]}
+       · 旧版/模型偷懒：裸数组 [...]，此时 summary 为空串
+    解析不出来返回 None。不做字段校验（校验在 check_layout）。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    # 剥 markdown 围栏
+    if "```" in raw:
+        for part in raw.split("```"):
+            q = part.strip()
+            if q.lower().startswith("json"):
+                q = q[4:].strip()
+            if q[:1] in ("[", "{"):
+                raw = q
+                break
+    # 先试对象（新版）
+    i, j = raw.find("{"), raw.rfind("}")
+    if i >= 0 and j > i:
+        try:
+            v = json.loads(raw[i:j + 1])
+        except ValueError:
+            v = None
+        if isinstance(v, dict) and ("items" in v or "summary" in v):
+            items = v.get("items")
+            if isinstance(items, str):
+                try:
+                    items = json.loads(items)
+                except ValueError:
+                    items = None
+            return str(v.get("summary") or "").strip(), (items if isinstance(items, list) else [])
+    arr = extract_json_array(raw)
+    if arr is not None:
+        return "", arr
+    salv = salvage_objects(raw) if raw.count("[") <= raw.count("]") else None
+    if salv:
+        return "", salv
+    return None
+
+
 def check_layout(text: str):
     """云端返回的正文到底是不是一份能用的布局 JSON。
 
@@ -319,8 +361,12 @@ def check_layout(text: str):
     raw = (text or "").strip()
     if not raw:
         return None, "模型返回空正文", ""
-    arr = extract_json_array(raw)
+    parsed = parse_layout(raw)
     note = ""
+    if parsed is None:
+        arr = None
+    else:
+        arr = parsed[1]
     if arr is None:
         # 截断优先判：少掉的是内容不是噪声，宁可停也不要拿半份布局去出图
         if raw.count("[") > raw.count("]"):
