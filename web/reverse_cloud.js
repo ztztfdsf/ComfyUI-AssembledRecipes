@@ -593,6 +593,7 @@ async function toggleService(ui) {
 // 元数据（发图=发 key）、还进 /history。现在本机一个文件里存真值，工作流只带一个名字。
 // 界面上就一个端点：地址 / 密钥 / 模型下拉——没有列表、没有增删、没有多路轮换。
 const EP_NAME = "default";
+let EP_NAME_ROW = EP_NAME;   // 本机文件里那一条的真实名字（旧数据可能不叫 default）
 let EP = { base: "", model: "", has_key: false, models: [] };
 
 async function loadEndpoints(ui) {
@@ -617,7 +618,6 @@ async function loadEndpoints(ui) {
 		if (ui.epBase) ui.epBase.placeholder = "读不到本机端点配置：" + (e.message || e);
 	}
 }
-let EP_NAME_ROW = EP_NAME;
 
 // 改地址/密钥就整体存一次（密钥留空 = 不动已存的那把）
 async function saveCustomEndpoint(ui) {
