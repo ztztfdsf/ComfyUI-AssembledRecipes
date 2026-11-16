@@ -1019,8 +1019,8 @@ class ReverseJsonSanitize:
                                           {"default": "报错停止（默认）",
                                            "tooltip": "洗出来 0 个框时怎么办：报错停止（不要静默白跑一张）/ 输出空布局继续（当没反推）"})}}
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("json",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("json", "character_boxes")
     FUNCTION = "sanitize"
     CATEGORY = "AssembledRecipes"
     DESCRIPTION = "修复反推输出的病 JSON（裸换行/字符串 bbox/截断），并把坐标从 xyxy 转成 yxyx，喂给边界框画布。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
@@ -1261,8 +1261,19 @@ class ReverseJsonSanitize:
                     continue
                 if fixed:
                     bbox_fixed += 1
-                etype = "text" if str(e.get("type", "")).strip().lower() == "text" else "obj"
-                desc = str(e.get("desc", "")).strip() or "unknown"
+                _t = str(e.get("type", e.get("label", ""))).strip().lower()
+                # 官方 MOSSImageLayoutPrompt 的 label 只有三值：object / character / text。
+                # 我们内部仍用 obj/text 两个词，但新增认 character：带完整头身的人物主体
+                # 标 character、局部特写/道具/文字标 obj——这是官方节点 character_boxes
+                # 那格的语义，写对了他就不用手工填 "1, 3"。
+                if _t in ("text",):
+                    etype = "text"
+                elif _t in ("character", "char", "人物"):
+                    etype = "character"
+                else:
+                    etype = "obj"
+                # 官方 schema 里描述字段叫 caption，我们叫 desc：两个都收
+                desc = str(e.get("desc") or e.get("caption") or "").strip() or "unknown"
                 # 坐标序交换：模型按原生习惯输出 xyxy [x0,y0,x1,y1]，
                 # CreateBoundingBoxes 要 yxyx [y0,x0,y1,x1]。规则层拗不过模型（实测），
                 # 在这里确定性交换，保证下游永远吃到 yxyx。
@@ -1311,9 +1322,14 @@ class ReverseJsonSanitize:
         if bbox_fixed:
             msg += f"，修复 {bbox_fixed} 个字符串 bbox"
         report.append(msg)
+        # 官方 MOSSImageLayoutPrompt 的 character_boxes 是「第几个框算人物」的 1-based 编号串，
+        # 以前只能在工作流里手工填 "1"。这里按清洗后的顺序自动算出来，接上那根线就通了。
+        char_idx = [str(i + 1) for i, it in enumerate(out) if it["type"] == "character"]
+        if char_idx:
+            report.append("人物框: " + ", ".join(char_idx))
         result = json.dumps(out, ensure_ascii=False)
         print(f"[AssembledRecipes] 反推JSON清洗: {'; '.join(report)} | 输出 {len(result)} 字符", flush=True)
-        return (result,)
+        return (result, ", ".join(char_idx))
 
 
 _VLM_CACHE = {}  # 模型目录 -> (processor, model) 内存常驻缓存
