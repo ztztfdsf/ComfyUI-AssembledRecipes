@@ -204,9 +204,12 @@ function stateFor(node) {
 	node.properties ||= {};
 	node.properties[PROP] ||= { provider: "", tab: "main", lastResult: null, account: "" };
 	const st = node.properties[PROP];
-	// provider 的真源是 widget（旧工作流里就存着它）：面板自己记的只是上次看的是哪页
+	// provider 的唯一真源是 widget：面板里那份只是“上次看的是哪页”。
+	// 必须每次都用 widget 覆盖，否则 node.properties 被 loadGraphData 换掉后，
+	// 面板缓存的旧对象会和工作流里的模式各说各话（灯、页面都跟着错的走）。
 	const fromWidget = providerKeyOf(node);
-	if (!st.provider || st.provider === "local") st.provider = fromWidget || st.provider || "local";
+	if (fromWidget) st.provider = fromWidget;
+	else if (!st.provider) st.provider = "local";
 	return st;
 }
 
@@ -407,7 +410,7 @@ function renderAccounts(ui, st) {
 	const rows = (st && st.accounts) || [];
 	ui.acctList.textContent = "";
 	if (!rows.length) {
-		ui.acctList.append(el("div", "ar-hint", "账号池是空的——下面填一个邮箱+密码点「添加并试跑」。多个账号会自动轮巡。"));
+		ui.acctList.append(el("div", "ar-hint", "账号池是空的——填邮箱+密码点「添加并试跑」。"));
 		return;
 	}
 	rows.forEach((a) => {
@@ -432,11 +435,9 @@ function renderAccounts(ui, st) {
 	const line = el("div", "ar-hint");
 	const total = rows.length;
 	if (st.ready > 0) {
-		line.textContent = `池内 ${total} 个，${st.ready} 个可用，按顺序轮巡（上一个跑完自动转下一个，风控压力摊开）` +
-			(st.last_account ? ` · 上一次用的是 ${st.last_account}` : "");
+		line.textContent = `${st.ready}/${total} 可用` + (st.last_account ? ` · 上次 ${st.last_account}` : "");
 	} else if (total === 1) {
-		line.textContent = "唯一账号不可用" + (st.recover_text ? `，最早 ${st.recover_text} 恢复` : "") +
-			"——再添加一个就能接着跑";
+		line.textContent = "不可用" + (st.recover_text ? ` · ${st.recover_text} 恢复` : "");
 	} else {
 		line.textContent = `池内 ${total} 个全部不可用` + (st.recover_text ? `，最早 ${st.recover_text} 恢复` : "");
 	}
@@ -479,16 +480,14 @@ async function bindAccount(ui) {
 		stateFor(ui.node).account = account;
 		saveState(ui.node);
 		if (data.ok) {
-			ui.dot.className = "ar-dot ok";
 			setStatus(ui, "ok", `已加入账号池并试跑成功，登录+一枪 ${data.ms}ms（回：${data.echo || "ok"}）`);
 		} else {
-			ui.dot.className = "ar-dot err";
 			setStatus(ui, "err", "这个账号不通：" + (data.error || "未知错") + "（已存进池子，可随时再试跑）");
 		}
-		refreshGatewayInfo(ui);
+		refreshModeDot(ui);
 	} catch (e) {
-		ui.dot.className = "ar-dot err";
 		setStatus(ui, "err", "绑定失败：" + (e.message || e));
+		refreshModeDot(ui);
 	} finally {
 		ui.bindBtn.disabled = false;
 	}
@@ -503,21 +502,48 @@ async function testAccount(ui, email) {
 		const data = await jsonFetch(`${DS_API}/test`, { method: "POST", body: JSON.stringify({ email: email || "" }) });
 		const ms = Math.round(performance.now() - t0);
 		if (data.ok) {
-			ui.dot.className = "ar-dot ok";
 			setStatus(ui, "ok", `连通正常（${data.email || ""} · ${data.ms}ms，${data.model}）`);
 		} else {
-			ui.dot.className = "ar-dot err";
 			setStatus(ui, "err", "不通：" + (data.error || "未知错"));
 		}
 		return data.ok;
 	} catch (e) {
-		ui.dot.className = "ar-dot err";
 		setStatus(ui, "err", "测试失败：" + (e.message || e));
 		return false;
 	} finally {
 		ui.testBtn.disabled = false;
-		refreshGatewayInfo(ui);
+		refreshModeDot(ui);
 	}
+}
+
+// 状态灯：只跟**当前模式**判定“连上没连上”，而且是唯一写者
+//   本地模型 → 选了模型就是绿的（不需要网络）
+//   DeepSeek 云端 → 网关在跑且池子里有可用账号才绿
+//   自定义端点 → 本机存过拉到的模型列表 = 这个端点通过过
+// 上一模式的异步结果不能盖掉新模式的灯（dotSeq 卡一下）。
+async function refreshModeDot(ui) {
+	const seq = (ui.dotSeq = (ui.dotSeq || 0) + 1);
+	const paint = (cls) => {
+		if (ui.dotSeq === seq && ui.dot) ui.dot.className = "ar-dot " + cls;
+	};
+	const st = stateFor(ui.node);
+	if (st.provider === "local") {
+		const w = widgetOf(ui.node, "model_name");
+		paint(w && w.value ? "ok" : "err");
+		return;
+	}
+	if (st.provider === "custom") {
+		const base = (ui.epBase?.value || EP.base || "").trim();
+		if (!base) return paint("err");
+		paint((EP.models || []).length ? "ok" : "");
+		return;
+	}
+	let gw = null;
+	try {
+		gw = await refreshGatewayInfo(ui);
+	} catch (e) { /* 读不到就灰着，不拿旧值骗人 */ }
+	if (ui.dotSeq !== seq) return;
+	paint(gw && gw.running && gw.ready > 0 ? "ok" : gw ? "err" : "");
 }
 
 // 网关服务面：状态行 + 启停按钮（服务是内置的，不需要外部 ds2api）
@@ -535,10 +561,7 @@ async function refreshGatewayInfo(ui) {
 			: `服务未运行${st.error ? "（" + st.error + "）" : ""}`;
 	}
 	if (ui.svcBtn) ui.svcBtn.textContent = st.running ? "停掉服务" : "拉起服务";
-	if (ui.dot && !ui.bindBtn.disabled && !ui.testBtn.disabled) {
-		// 灯色跟池子实况走：有可用账号=绿，服务在但池子全忙=红，服务没起=红
-		ui.dot.className = "ar-dot " + (st.running && st.ready > 0 ? "ok" : "err");
-	}
+	// 灯不在这里画（多个异步写者会互相盖），统一由 refreshModeDot 管
 	if (ui.accountInput && !ui.accountInput.value && st.email) ui.accountInput.value = st.email;
 	if (ui.deviceIdInput && !ui.deviceIdInput.value && st.has_device_id) ui.deviceIdInput.placeholder = "已绑过 device_id（留空则沿用）";
 	if (ui.svcLogs) ui.svcLogs.textContent = (st.logs || []).join("\n");
@@ -565,193 +588,126 @@ async function toggleService(ui) {
 	}
 }
 
-// ================= 本地端点库（地址/密钥/模型名只存本机）=================
-// 为什么这么设：base/key/model 当 widget 时，它们会跟着工作流存盘、被写进每张出图 PNG
-// 的 workflow 元数据（发图=发 key）、还进 /history。现在工作流只带端点**名字**。
-let EP = { current: "", endpoints: [], path: "" };
+// ================= 自定义端点（地址/密钥/模型名只存本机）=================
+// 为什么这么设：这三项当 widget 时，会跟着工作流存盘、被写进每张出图 PNG 的 workflow
+// 元数据（发图=发 key）、还进 /history。现在本机一个文件里存真值，工作流只带一个名字。
+// 界面上就一个端点：地址 / 密钥 / 模型下拉——没有列表、没有增删、没有多路轮换。
+const EP_NAME = "default";
+let EP = { base: "", model: "", has_key: false, models: [] };
 
 async function loadEndpoints(ui) {
 	try {
-		const data = await jsonFetch(`${DS_API}/endpoints`, {
-			method: "POST", body: JSON.stringify({ action: "list" }),
-		});
-		if (data.ok) EP = data;
-		renderEndpoints(ui);
+		const data = await jsonFetch(`${DS_API}/endpoints`, { method: "POST", body: JSON.stringify({ action: "list" }) });
+		if (data.ok) {
+			const row = (data.endpoints || []).find((e) => e.name === EP_NAME) ||
+				(data.endpoints || [])[0] || { name: EP_NAME, base: "", model: "", models: [] };
+			EP = { base: row.base || "", model: row.model || "", has_key: !!row.has_key, models: row.models || [] };
+			EP_NAME_ROW = row.name || EP_NAME;
+			// 名字进 widget（工作流里只有它），地址/密钥/模型名不进
+			const w = widgetOf(ui.node, "endpoint");
+			if (w) {
+				if (!w.options.values.includes(EP_NAME_ROW)) w.options.values = [EP_NAME_ROW];
+				if (w.value !== EP_NAME_ROW) { w.value = EP_NAME_ROW; w.callback?.(EP_NAME_ROW); }
+			}
+			if (ui.epBase && !ui.epBase.value) ui.epBase.value = EP.base;
+			if (ui.epKey) ui.epKey.placeholder = EP.has_key ? "已存 · 留空不动" : "sk-…";
+			renderModelSelect(ui);
+		}
 	} catch (e) {
-		if (ui.epList) ui.epList.textContent = "端点库读不到：" + (e.message || e);
+		if (ui.epBase) ui.epBase.placeholder = "读不到本机端点配置：" + (e.message || e);
 	}
 }
+let EP_NAME_ROW = EP_NAME;
 
-async function saveEndpoint(ui) {
-	const name = ui.epName.value.trim();
-	if (!name) { setStatus(ui, "err", "端点名字不能空"); return; }
-	const body = { action: "save", name, base: ui.epBase.value.trim(), model: ui.epModel.value.trim() };
+// 改地址/密钥就整体存一次（密钥留空 = 不动已存的那把）
+async function saveCustomEndpoint(ui) {
+	const body = { action: "save", name: EP_NAME_ROW, base: ui.epBase.value.trim(), model: EP.model };
 	const key = ui.epKey.value.trim();
-	if (key) body.key = key;              // 留空 = 不动已存的那把
-	ui.epSaveBtn.disabled = true;
-	setStatus(ui, "", "正在写进本机的端点库…");
+	if (key) body.key = key;
 	try {
 		const data = await jsonFetch(`${DS_API}/endpoints`, { method: "POST", body: JSON.stringify(body) });
 		if (data.ok) {
-			EP = data;
-			ui.epKey.value = "";
-			renderEndpoints(ui);
-			syncEndpointWidget(ui);
-			setStatus(ui, "ok", `已保存端点 ${name}（密钥只存本机文件，工作流与出图元数据里只有名字）`);
+			if (key) ui.epKey.value = "";
+			await loadEndpoints(ui);
+			setStatus(ui, "ok", "已存到本机");
+			refreshModeDot(ui);
 		} else setStatus(ui, "err", "保存失败：" + (data.error || "未知错"));
 	} catch (e) {
 		setStatus(ui, "err", "保存失败：" + (e.message || e));
-	} finally { ui.epSaveBtn.disabled = false; }
-}
-
-async function selectEndpoint(ui, name) {
-	try {
-		const data = await jsonFetch(`${DS_API}/endpoints`, {
-			method: "POST", body: JSON.stringify({ action: "select", name }),
-		});
-		if (data.ok) { EP = data; renderEndpoints(ui); syncEndpointWidget(ui); }
-		else setStatus(ui, "err", "切换失败：" + (data.error || "未知错"));
-	} catch (e) { setStatus(ui, "err", "切换失败：" + (e.message || e)); }
-}
-
-async function deleteEndpoint(ui, name) {
-	try {
-		const data = await jsonFetch(`${DS_API}/endpoints`, {
-			method: "POST", body: JSON.stringify({ action: "delete", name }),
-		});
-		if (data.ok) { EP = data; renderEndpoints(ui); setStatus(ui, "ok", `已删除端点 ${name}`); }
-		else setStatus(ui, "err", "删除失败：" + (data.error || "未知错"));
-	} catch (e) { setStatus(ui, "err", "删除失败：" + (e.message || e)); }
-}
-
-// 把选中的端点名写回 widget（工作流里只会出现这个名字）
-function syncEndpointWidget(ui, name) {
-	const w = widgetOf(ui.node, "endpoint");
-	const val = name || EP.current || (EP.endpoints[0] && EP.endpoints[0].name) || "";
-	if (!w || !val) return;
-	if (!w.options.values.includes(val)) w.options.values.push(val);
-	if (w.value !== val) { w.value = val; w.callback?.(val); saveState(ui.node); }
-	if (ui.epPick) ui.epPick.value = val;
-}
-
-function renderEndpoints(ui) {
-	if (!ui.epList) return;
-	ui.epList.textContent = "";
-	const rows = EP.endpoints || [];
-	if (!rows.length) {
-		ui.epList.append(el("div", "ar-hint", "端点库是空的——下面填名字/地址/密钥点「保存端点」。"));
-	} else {
-		rows.forEach((e) => {
-			const row = el("div", "ar-acct");
-			const dot = el("span", "ar-badge " + (e.name === EP.current ? "ok" : ""),
-				e.name === EP.current ? "在用" : "备用");
-			const mail = el("span", "ar-mail", e.name);
-			const pick = el("button", "ar-mini", "切到这个");
-			pick.addEventListener("click", () => selectEndpoint(ui, e.name));
-			const del = el("button", "ar-mini danger", "删除");
-			del.addEventListener("click", () => deleteEndpoint(ui, e.name));
-			const meta = el("div", "ar-meta",
-				`${e.base || "（没地址）"} · ${e.model || "（没选模型）"} · 密钥${e.has_key ? "已存 " + e.key_hint : "没填"}` +
-				((e.models || []).length ? ` · 拉过 ${e.models.length} 个模型` : ""));
-			row.append(dot, mail, pick, del, meta);
-			ui.epList.append(row);
-		});
-	}
-	const line = el("div", "ar-hint");
-	line.textContent = `本机 ${rows.length} 个端点，当前：${EP.current || "（没选）"}`;
-	ui.epList.append(line);
-	if (ui.epPath) ui.epPath.textContent = EP.path || "";
-	// 工作流里那个端点下拉的选项跟着本地库走
-	if (ui.epPick) {
-		const names = rows.map((x) => x.name);
-		const cur = String(widgetOf(ui.node, "endpoint")?.value || "") || EP.current;
-		const opts = cur && !names.includes(cur) ? [cur, ...names] : names;
-		ui.epPick.textContent = "";
-		for (const nm of opts) ui.epPick.append(el("option", "", nm));
-		if (opts.length) { ui.epPick.value = cur || opts[0]; ui.epPick.disabled = false; }
-		else { ui.epPick.append(el("option", "", "（还没端点）")); ui.epPick.disabled = true; }
-		const w = widgetOf(ui.node, "endpoint");
-		if (w) w.options.values = opts.slice();
 	}
 }
 
-// 拉模型列表：只传端点名，密钥由后端从本地库取（不过浏览器也不进工作流）
-async function fetchModels(ui) {
-	const name = ui.epPick?.value || EP.current || String(widgetOf(ui.node, "endpoint")?.value || "");
-	if (!name) {
-		setStatus(ui, "err", "先在端点库里选一个");
-		return;
-	}
-	ui.modelFetchBtn.disabled = true;
-	setStatus(ui, "", `正在拉 ${name} 的模型列表…`);
-	try {
-		const data = await jsonFetch(`${DS_API}/models`, {
-			method: "POST",
-			body: JSON.stringify({ endpoint: name }),
-		});
-		if (data.ok) {
-			const models = data.models || [];
-			setStatus(ui, "ok", `拿到 ${models.length} 个模型（${data.ms}ms）`);
-			if (models.length) {
-				const hit = models.find((m) => m === (EP.endpoints.find((e) => e.name === name) || {}).model) || models[0];
-				await jsonFetch(`${DS_API}/endpoints`, {
-					method: "POST",
-					body: JSON.stringify({ action: "save", name, model: hit }),
-				});
-				await loadEndpoints(ui);
-				setStatus(ui, "ok", `拿到 ${models.length} 个模型（${data.ms}ms），已选 ${hit}`);
-			}
-		} else {
-			setStatus(ui, "err", "拉取失败：" + (data.error || "未知错"));
-		}
-	} catch (e) {
-		setStatus(ui, "err", "拉取失败：" + (e.message || e));
-	} finally {
-		ui.modelFetchBtn.disabled = false;
-	}
-}
-
-// 模型下拉：选项来自本地库里缓存的那份（拉过一次就有）
+// 模型下拉：选项来自本机缓存的那份（拉过一次就有）
 function renderModelSelect(ui) {
-	const name = ui.epPick?.value || EP.current || String(widgetOf(ui.node, "endpoint")?.value || "");
-	const row = (EP.endpoints || []).find((e) => e.name === name);
 	const sel = ui.modelSel;
 	if (!sel) return;
-	const names = (row && row.models) || [];
-	const cur = (row && row.model) || "";
+	const names = EP.models || [];
+	const cur = EP.model || "";
 	const opts = cur && !names.includes(cur) ? [cur, ...names] : names;
 	sel.textContent = "";
 	if (!opts.length) {
-		sel.append(el("option", "", "（还没拉取列表）"));
+		sel.append(el("option", "", "（点拉取模型列表）"));
 		sel.disabled = true;
 	} else {
 		sel.disabled = false;
 		for (const nm of opts) sel.append(el("option", "", nm));
 	}
 	sel.value = cur || (opts[0] || "");
-	if (ui.modelHint) {
-		ui.modelHint.textContent = opts.length
-			? `当前 ${cur || opts[0]} · 下拉里 ${opts.length} 个可选`
-			: "点「拉取模型列表」从端点 GET /models 取模型；也可以下面手填。";
-	}
 }
 
 async function setModelValue(ui, value) {
-	const name = ui.epPick?.value || EP.current || String(widgetOf(ui.node, "endpoint")?.value || "");
-	if (!name) {
-		setStatus(ui, "err", "先在端点库里选一个");
-		return;
-	}
-	const row = (EP.endpoints || []).find((e) => e.name === name) || {};
+	EP.model = value;
 	try {
 		await jsonFetch(`${DS_API}/endpoints`, {
 			method: "POST",
-			body: JSON.stringify({ action: "save", name, base: row.base || "", model: value }),
+			body: JSON.stringify({ action: "save", name: EP_NAME_ROW, base: ui.epBase.value.trim() || EP.base, model: value }),
 		});
 		await loadEndpoints(ui);
-		setStatus(ui, "ok", `模型已存进本机端点库：${name} → ${value}`);
+		setStatus(ui, "ok", "已选 " + value);
+		refreshModeDot(ui);
 	} catch (e) {
 		setStatus(ui, "err", "保存失败：" + (e.message || e));
+	}
+}
+
+// 拉模型列表：只传端点名，密钥由后端从本机文件取（不进浏览器也不进工作流）
+async function fetchModels(ui, quiet) {
+	const name = EP_NAME_ROW;
+	if (!ui.epBase.value.trim() && !EP.base) {
+		setStatus(ui, "err", "先填请求地址");
+		return;
+	}
+	ui.modelFetchBtn.disabled = true;
+	if (!quiet) setStatus(ui, "", "正在拉模型列表…");
+	try {
+		const data = await jsonFetch(`${DS_API}/models`, { method: "POST", body: JSON.stringify({ endpoint: name }) });
+		if (data.ok) {
+			const models = data.models || [];
+			EP.models = models;
+			if (models.length && !models.includes(EP.model)) EP.model = models[0];
+			if (models.length) {
+				await jsonFetch(`${DS_API}/endpoints`, {
+					method: "POST",
+					body: JSON.stringify({ action: "save", name, base: ui.epBase.value.trim() || EP.base, model: EP.model }),
+				});
+			}
+			await loadEndpoints(ui);
+			setStatus(ui, "ok", quiet ? `连通正常（${data.ms}ms，${models.length} 个模型）`
+				: `拿到 ${models.length} 个模型（${data.ms}ms）`);
+			refreshModeDot(ui);
+			return true;
+		}
+		setStatus(ui, "err", "不通：" + (data.error || "未知错"));
+		EP.models = [];
+		refreshModeDot(ui);
+		return false;
+	} catch (e) {
+		setStatus(ui, "err", "不通：" + (e.message || e));
+		EP.models = [];
+		refreshModeDot(ui);
+		return false;
+	} finally {
+		ui.modelFetchBtn.disabled = false;
 	}
 }
 
@@ -830,7 +786,8 @@ function takeOverSize(node) {
 const ui_map = new WeakMap();
 
 function buildPanel(node) {
-	const st = stateFor(node);
+	// 每次都现取：node.properties 会被 loadGraphData 整个换掉，缓存对象就成孤儿了
+	const st = () => stateFor(node);
 	const root = el("div", "arshell");
 	const body = el("div", "arbody");
 	root.append(body);
@@ -850,7 +807,7 @@ function buildPanel(node) {
 	// ---- 顶部：两个控件（主界面 + 模式下拉），不再三个分段按钮 ----
 	const MODES = [["local", "本地模型"], ["ds", "DeepSeek 云端"], ["custom", "自定义端点"]];
 	const bar = el("div", "ar-seg");
-	const mainBtn = el("button", st.tab === "mode" ? "" : "on", "主界面");
+	const mainBtn = el("button", st().tab === "mode" ? "" : "on", "主界面");
 	mainBtn.title = "运行 / 画廊标签 / 提示词规则";
 	bar.append(mainBtn);
 	const modeWrap = el("div", "ar-modesel");
@@ -861,7 +818,7 @@ function buildPanel(node) {
 		o.value = key;
 		modeSel.append(o);
 	}
-	modeSel.value = st.provider;
+	modeSel.value = st().provider;
 	modeWrap.append(modeSel);
 	bar.append(modeWrap);
 	body.append(bar);
@@ -884,7 +841,6 @@ function buildPanel(node) {
 	const cTag = el("div", "ar-card");
 	cTag.append(el("div", "cap", "画廊标签"));
 	cTag.append(ctlSelect(ui, "tag_mode", "喂给模型多少标签"));
-	cTag.append(el("div", "ar-hint", "全部：画质/装束细节更准。精简：只给开头几个作品/角色名，防小模型“看到多少 tag 就框多少个”。"));
 	pageMain.append(cTag);
 
 	const c3 = el("details", "ar-card");
@@ -902,7 +858,6 @@ function buildPanel(node) {
 	const g1 = el("div", "ar-row");
 	g1.append(ctlSelect(ui, "model_name", "模型（models/LLM）"), ctlSelect(ui, "quant", "量化"));
 	c1.append(g1);
-	c1.append(el("div", "ar-hint", "跑在本机，不走网络。4bit 显存最省，12B 级在 16GB 卡上只有它能跑；不够时直接报错不白等加载。"));
 	pageLocal.append(c1);
 	body.append(pageLocal);
 
@@ -916,7 +871,7 @@ function buildPanel(node) {
 	const fAcc = el("div", "ar-f");
 	fAcc.append(el("label", "", "邮箱 / 手机号"));
 	ui.accountInput = el("input");
-	ui.accountInput.value = localStorage.getItem(LS_ACCOUNT) || st.account || "";
+	ui.accountInput.value = localStorage.getItem(LS_ACCOUNT) || st().account || "";
 	fAcc.append(ui.accountInput);
 	r1.append(fAcc);
 	const fDev = el("div", "ar-f");
@@ -950,8 +905,6 @@ function buildPanel(node) {
 	gEff.append(ctlSelect(ui, "custom_effort", "思考强度（五档）"));
 	acc.append(gEff);
 	acc.append(ctlToggle(ui, "deepseek_thinking", "深度思考（仅强度选「不思考」时生效）"));
-	acc.append(el("div", "ar-hint", "DeepSeek 官方只有 thinking 一个开关：medium/high/max 算开，minimal/low 算关；选「不思考」才轮到最后那个开关。"));
-	acc.append(el("div", "ar-hint", "多个账号自动轮摊：哪个被禁言就跳过哪个，到期自己回来。账密只存插件本地配置，不进工作流、不进日志。"));
 	// 服务状态与日志收到一个默认收起的面板里，主视图只留账号相
 	const svc = el("details", "ar-details");
 	svc.append(el("summary", "", "内置网关服务与日志"));
@@ -968,29 +921,32 @@ function buildPanel(node) {
 	body.append(pageDs);
 	refreshGatewayInfo(ui);
 
-	// ---- 自定义端点页：端点库（地址/密钥/模型名只存本机）----
+	// ---- 自定义端点页：一个端点，地址/密钥/模型下拉 ----
 	const pageCustom = el("div", "ar-page");
 	const cc = el("div", "ar-card");
 	cc.append(el("div", "cap", "OpenAI 兼容端点"));
-	ui.epList = el("div", "ar-accts");
-	cc.append(ui.epList);
 
-	// 工作流里只存这个端点名字
-	const fPick = el("div", "ar-f");
-	fPick.append(el("label", "", "工作流用的端点（只存名字）"));
-	ui.epPick = el("select");
-	ui.epPick.addEventListener("change", () => {
-		selectEndpoint(ui, ui.epPick.value);
-		syncEndpointWidget(ui, ui.epPick.value);
-		renderModelSelect(ui);
-	});
-	fPick.append(ui.epPick);
-	cc.append(fPick);
+	// 一个端点：地址 / 密钥 / 模型下拉（真值存本机，不进工作流）
+	const fBase = el("div", "ar-f");
+	fBase.append(el("label", "", "请求地址（base URL）"));
+	ui.epBase = el("input");
+	ui.epBase.placeholder = "https://…/v1";
+	ui.epBase.addEventListener("change", () => saveCustomEndpoint(ui));
+	fBase.append(ui.epBase);
+	cc.append(fBase);
 
-	// 模型：下拉选 + 拉取（都写进本机库，不写 widget）
+	const fKey = el("div", "ar-f");
+	fKey.append(el("label", "", "API 密钥"));
+	ui.epKey = el("input");
+	ui.epKey.type = "password";
+	ui.epKey.placeholder = "已存则留空不动";
+	ui.epKey.addEventListener("change", () => saveCustomEndpoint(ui));
+	fKey.append(ui.epKey);
+	cc.append(fKey);
+
 	const mRow = el("div", "ar-row");
 	const fModel = el("div", "ar-f");
-	fModel.append(el("label", "", "模型（存本机）"));
+	fModel.append(el("label", "", "模型"));
 	ui.modelSel = el("select");
 	ui.modelSel.addEventListener("change", () => setModelValue(ui, ui.modelSel.value));
 	fModel.append(ui.modelSel);
@@ -1002,60 +958,19 @@ function buildPanel(node) {
 	fFetch.append(ui.modelFetchBtn);
 	mRow.append(fFetch);
 	cc.append(mRow);
-	ui.modelHint = el("div", "ar-hint");
-	cc.append(ui.modelHint);
-
-	// 新增/修改端点
-	const form = el("details", "ar-details");
-	form.append(el("summary", "", "添加 / 修改端点"));
-	const fr1 = el("div", "ar-row");
-	const fName = el("div", "ar-f");
-	fName.append(el("label", "", "名字（写进工作流的就是它）"));
-	ui.epName = el("input");
-	ui.epName.placeholder = "chenxing.pro";
-	fName.append(ui.epName);
-	const fBase = el("div", "ar-f");
-	fBase.append(el("label", "", "请求地址"));
-	ui.epBase = el("input");
-	ui.epBase.placeholder = "https://…/v1";
-	fBase.append(ui.epBase);
-	fr1.append(fName, fBase);
-	form.append(fr1);
-	const fr2 = el("div", "ar-row");
-	const fKey = el("div", "ar-f");
-	fKey.append(el("label", "", "API 密钥（留空 = 不动已存的）"));
-	ui.epKey = el("input");
-	ui.epKey.type = "password";
-	ui.epKey.placeholder = "sk-…（只写进本机文件）";
-	fKey.append(ui.epKey);
-	const fModelName = el("div", "ar-f");
-	fModelName.append(el("label", "", "模型名（可手填）"));
-	ui.epModel = el("input");
-	ui.epModel.placeholder = "gemini-3.6-flash…";
-	fModelName.append(ui.epModel);
-	fr2.append(fKey, fModelName);
-	form.append(fr2);
-	const fr3 = el("div", "ar-row");
-	ui.epSaveBtn = el("button", "ar-btn pri", "保存端点");
-	ui.epSaveBtn.addEventListener("click", () => saveEndpoint(ui));
-	fr3.append(ui.epSaveBtn);
-	const epReload = el("button", "ar-btn", "重读端点库");
-	epReload.addEventListener("click", () => loadEndpoints(ui));
-	fr3.append(epReload);
-	form.append(fr3);
-	ui.epPath = el("div", "ar-hint");
-	form.append(ui.epPath);
-	cc.append(form);
 
 	cc.append(ctlSelect(ui, "custom_effort", "思考强度（五档）"));
-	cc.append(el("div", "ar-hint", "原值发给端点的 reasoning_effort；端点不认这个字段会自动去掉重打，不会当成“端点挂了”。"));
 	cc.append(ctlToggle(ui, "custom_stream", "流式返回（默认非流式）"));
-	cc.append(el("div", "ar-hint", "反推要的是整块 JSON，非流式最直接；只有端点不支持非流式时才开流式。"));
-	cc.append(el("div", "ar-hint", "地址/密钥/模型名只存本机文件，不进工作流、不进 PNG 元数据、不进日志；分享工作流或图都不会泄 key。"));
+	const testRow = el("div", "ar-row");
+	ui.customTestBtn = el("button", "ar-btn", "测试连通");
+	ui.customTestBtn.addEventListener("click", () => fetchModels(ui, true));
+	testRow.append(ui.customTestBtn);
+	cc.append(testRow);
 	pageCustom.append(cc);
 	body.append(pageCustom);
 	loadEndpoints(ui);
 	renderModelSelect(ui);
+	setTimeout(() => refreshModeDot(ui), 600);
 
 	body.append(ui.status);
 
@@ -1064,32 +979,33 @@ function buildPanel(node) {
 	// 顶部只剩两个控件：“主界面”按钮 + “模式”下拉。
 	// 选模式 = 同时把 provider widget 写回（跟旧三按钮分段同一条写入链），并跳到那一页的配置。
 	function applyView() {
-		const onMain = st.tab !== "mode";
+		const cur = st();                     // 现取：provider 永远来自 widget
+		const onMain = cur.tab !== "mode";
 		pageMain.classList.toggle("hidden", !onMain);
-		pageLocal.classList.toggle("hidden", onMain || st.provider !== "local");
-		pageDs.classList.toggle("hidden", onMain || st.provider !== "ds");
-		pageCustom.classList.toggle("hidden", onMain || st.provider !== "custom");
+		pageLocal.classList.toggle("hidden", onMain || cur.provider !== "local");
+		pageDs.classList.toggle("hidden", onMain || cur.provider !== "ds");
+		pageCustom.classList.toggle("hidden", onMain || cur.provider !== "custom");
 		mainBtn.classList.toggle("on", onMain);
-		if (modeSel.value !== st.provider) modeSel.value = st.provider;
-		const w = widgetOf(node, "provider");
-		if (w && w.value !== PROVIDER_MAP[st.provider]) {
-			w.value = PROVIDER_MAP[st.provider];
-			w.callback?.();
-		}
+		if (modeSel.value !== cur.provider) modeSel.value = cur.provider;
 	}
 
 	mainBtn.addEventListener("click", () => {
-		st.tab = "main";
+		st().tab = "main";
 		saveState(node);
 		applyView();
 	});
 	modeSel.addEventListener("change", () => {
-		st.provider = modeSel.value;
-		st.tab = "mode";
+		// 先写 widget（唯一真源），再刷面板；只写面板自己那份会被 widget 反向覆盖
+		const w = widgetOf(node, "provider");
+		if (w) {
+			w.value = PROVIDER_MAP[modeSel.value];
+			w.callback?.(w.value);
+		}
+		stateFor(node).tab = "mode";
 		saveState(node);
 		applyView();
-		if (st.provider === "ds") refreshGatewayInfo(ui);
-		if (st.provider === "custom") { loadEndpoints(ui); renderModelSelect(ui); }
+		if (modeSel.value === "custom") { loadEndpoints(ui); renderModelSelect(ui); }
+		refreshModeDot(ui);   // 灯只跟当前模式走（唯一写者，ds 那档会自己拉网关状态）
 	});
 
 	function applyProvider() {
