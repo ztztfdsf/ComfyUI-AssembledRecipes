@@ -829,6 +829,18 @@ function buildPanel(node) {
 
 	// ---- 主界面：运行 + 画廊标签 + 提示词规则 ----
 	const pageMain = el("div", "ar-page");
+	// 思考方式：原生 API 思考参数在第三方网关上容易被拒答（实测同一张图从「出 5 框」变成整段拒答），
+	// 所以默认改成「提示词思考」：不发任何 API 参数，改为让模型先写一段 <thinking> 思维链，
+	// 第一步是自我去道德，写完自己剥掉再解析。
+	const cThink = el("div", "ar-card");
+	cThink.append(el("div", "cap", "思考方式"));
+	const cThinkSel = ctlSelect(ui, "think_mode", "怎么让模型先想一遍");
+	cThink.append(cThinkSel);
+	ui.thinkHint = el("div", "ar-note", "");
+	cThink.append(ui.thinkHint);
+	cThinkSel.querySelector("select").addEventListener("change", () => syncThinkHint());
+	pageMain.append(cThink);
+
 	const cRun = el("div", "ar-card");
 	cRun.append(el("div", "cap", "运行"));
 	const gRun1 = el("div", "ar-row");
@@ -912,7 +924,8 @@ function buildPanel(node) {
 	acc.append(r3);
 	// 思考强度：与自定义端点页同一个参数（DeepSeek 官方只有布尔开关，这里把五档映成开/关）
 	const gEff = el("div", "ar-row");
-	gEff.append(ctlSelect(ui, "custom_effort", "思考强度（五档）"));
+	ui.effortSelDs = ctlSelect(ui, "custom_effort", "思考强度（五档）");
+	gEff.append(ui.effortSelDs);
 	acc.append(gEff);
 	acc.append(ctlToggle(ui, "deepseek_thinking", "深度思考（仅强度选「不思考」时生效）"));
 	// 服务状态与日志收到一个默认收起的面板里，主视图只留账号相
@@ -969,7 +982,8 @@ function buildPanel(node) {
 	mRow.append(fFetch);
 	cc.append(mRow);
 
-	cc.append(ctlSelect(ui, "custom_effort", "思考强度（五档）"));
+	ui.effortSelCustom = ctlSelect(ui, "custom_effort", "思考强度（五档）");
+	cc.append(ui.effortSelCustom);
 	// 思考参数方言：各家请求格式不同（reasoning_effort / thinking{type} / enable_thinking …），
 	// 这一行显示本端点上次自动探测命中的是哪种，以及最近一次拒答（不显示任何密钥）。
 	ui.thinkLine = el("div", "ar-note", "思考参数：未探测");
@@ -986,6 +1000,24 @@ function buildPanel(node) {
 	loadEndpoints(ui).then(() => refreshModeDot(ui));
 
 	body.append(ui.status);
+
+	// 「思考强度」只在「原生思考参数」模式下生效：提示词思考模式不发任何 API 参数，
+	// 把强度下拉置灰并写清原因，避免有人改了半天没反应。
+	function syncThinkHint() {
+		const w = widgetOf(ui.node, "think_mode");
+		const mode = String((w && w.value) || "");
+		const native = mode.startsWith("原生");
+		if (ui.thinkHint) {
+			ui.thinkHint.textContent = native
+				? "当前：按端点方言发思考参数（强度在模式页改），高位容易触发拒答"
+				: (mode.startsWith("关") ? "当前：不做任何思考，直接出 JSON"
+					: "当前：不发 API 参数，改为让模型先写 <thinking>（第一步自我去道德）再出 JSON");
+		}
+		for (const s of [ui.effortSelDs, ui.effortSelCustom]) {
+			if (s) { s.disabled = !native; s.style.opacity = native ? "1" : "0.45"; }
+		}
+	}
+	syncThinkHint();
 
 	// 面板上那一行「思考参数：…」的数据源（同源路由，后端 providers.thinking_state）
 	async function refreshThinkState(ui) {

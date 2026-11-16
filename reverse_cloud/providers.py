@@ -337,6 +337,36 @@ def dialect_candidates(base_url: str, model: str) -> list:
     return [d for d in order if d in DIALECTS]
 
 
+_THINK_OPEN_RE = re.compile(r"<\s*(thinking|think|reasoning|思考)\s*>", re.I)
+_THINK_CLOSE_RE = re.compile(r"<\s*/\s*(thinking|think|reasoning|思考)\s*>", re.I)
+
+
+def strip_thinking(text) -> str:
+    """剥掉提示词思考块（<thinking>…</thinking>），只留正文。
+
+    为什么要有它：我们让模型先写一段自我去道德的思维链再吐 JSON（原生 reasoning 参数在
+    第三方网关上会被拒答），那段思考文本不能进 JSON 解析，否则永远抠不出数组。
+    没有闭合标签时退化为「从开标签一直丢到第一个 { 或 [」——被 max_new_tokens 截断的
+    情况实际会遇到。
+    """
+    t = coerce_text(text)
+    if not t.strip():
+        return t
+    for _ in range(6):  # 正常只有一块，防模型写多段
+        m = _THINK_OPEN_RE.search(t)
+        if not m:
+            break
+        close = _THINK_CLOSE_RE.search(t, m.end())
+        if close:
+            t = t[:m.start()] + t[close.end():]
+            continue
+        cand = [i for i in (t.find("{", m.end()), t.find("[", m.end())) if i >= 0]
+        t = t[:m.start()] + (t[min(cand):] if cand else "")
+        break
+    t = _THINK_CLOSE_RE.sub("", t)
+    return t.strip()
+
+
 def _openai_chat(base_url: str, api_key: str, model: str, system: str, user_text: str,
                  pil, temperature: float = 1.0, timeout: float = 300.0,
                  data_url: str | None = None, stream: bool = False,
@@ -582,7 +612,7 @@ def parse_layout(text: str):
        · 旧版/模型偷懒：裸数组 [...]，此时 summary 为空串
     解析不出来返回 None。不做字段校验（校验在 check_layout）。
     """
-    raw = coerce_text(text).strip()
+    raw = strip_thinking(text)
     if not raw:
         return None
     # 剥 markdown 围栏
@@ -632,7 +662,7 @@ def check_layout(text: str):
     （而不是把一堆废话交给下游清洗节点静默变空布局）；note 是「修好了什么」的说明，
     要打印出来——修过的东西不能悄悄修。
     """
-    raw = coerce_text(text).strip()
+    raw = strip_thinking(text)
     if not raw:
         return None, "模型返回空正文", ""
     parsed = parse_layout(raw)
