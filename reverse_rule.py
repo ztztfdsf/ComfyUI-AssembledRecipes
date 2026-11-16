@@ -120,7 +120,7 @@ LAYOUT_RULE = r"""# 角色
   字号层级、对齐方式、字体颜色与间距写进 desc。
 - 竖排还是横排要写进 desc（vertical Chinese text / horizontal text）。
 - 气泡必须写明形状与归属，四种情况各用对应写法，不要笼统写 comic speech bubble：
-  1. 画面内某个可见角色开口说话：rounded oval comic speech bubble，写明尾巴在该框的哪条边、
+  1. 画面内某个可见角色开口说话：soft-edged oval bubble，写明尾巴在该框的哪条边、
      笔直指向谁，例如 with a pointer tail on its bottom edge pointing straight DOWN to Character 1's head。
      气泡框要贴近说话人自己的头顶上方或左右肩侧，不要悬在别人的脑门正上方。
   2. 画面外的第一人称视角说话或内心吐槽：tail-less oval thought bubble，并明确写
