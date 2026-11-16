@@ -95,6 +95,14 @@ def list_models(base_url: str, api_key: str = "", timeout: float = 30.0) -> list
     return sorted(set(out))
 
 
+def _looks_like_rejected_effort(text: str) -> bool:
+    """端点拒接 reasoning_effort 的常见回词（不少兼容层只认 minimal/low/medium/high）。"""
+    t = (text or "").lower()
+    return ("reasoning_effort" in t or "reasoning" in t) and any(
+        k in t for k in ("invalid", "unknown", "unsupported", "not supported", "extra inputs",
+                        "unexpected", "unrecognized", "not permitted", "not allowed", "invalid value"))
+
+
 def _openai_chat(base_url: str, api_key: str, model: str, system: str, user_text: str,
                  pil, temperature: float = 1.0, timeout: float = 300.0,
                  data_url: str | None = None, stream: bool = False,
@@ -121,6 +129,13 @@ def _openai_chat(base_url: str, api_key: str, model: str, system: str, user_text
     with _client(url, timeout) as cli:
         if not stream:
             r = cli.post(url, json=body, headers=headers)
+            if r.status_code != 200:
+                # 端点不认 reasoning_effort → 去掉它再打一次，不拿这个当成“端点挂了”
+                if "reasoning_effort" in body and _looks_like_rejected_effort(r.text):
+                    body.pop("reasoning_effort", None)
+                    print("[AssembledRecipes] 端点不认 reasoning_effort=%s，已去掉该字段重试（HTTP %s）"
+                          % (effort, r.status_code), flush=True)
+                    r = cli.post(url, json=body, headers=headers)
             if r.status_code != 200:
                 raise ProviderError(f"OpenAI 端点 HTTP {r.status_code}: {r.text[:300]}")
             try:
@@ -181,6 +196,18 @@ def run_caption(provider: str, pil, system_rule: str, user_text: str,
         return _openai_chat(openai_base, openai_key, openai_model, system_rule, user_text, pil,
                             stream=stream, effort=effort)
     raise ProviderError(f"未知 provider: {provider}")
+
+
+def effort_to_thinking(effort: str, default: bool = True) -> bool:
+    """五档思考强度 → DeepSeek 的布尔 thinking。
+
+    DeepSeek 官方只有 thinking_enabled 一个开关，没有强度档位，所以这里收敛：
+    medium/high/max 算开，minimal/low 算关；「不思考」/空 = 不覆盖，回落到调用方的默认值。
+    """
+    eff = str(effort or "").strip().lower()
+    if eff in ("", "不思考", "none", "auto"):
+        return bool(default)
+    return eff in ("medium", "high", "max")
 
 
 def extract_json_array(text: str):

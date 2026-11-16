@@ -1317,6 +1317,19 @@ def _ds_gateway():
 
 
 # 规则要点：限死框数（防过度分割）、禁止把画廊 tag 逐条变框、desc 120~220 词、坐标用模型原生的 xyxy（清洗节点统一转 yxyx）
+def _effort_to_thinking(effort, default=True):
+    """五档强度 → DeepSeek 布尔 thinking（规则只住在 providers.effort_to_thinking 一处）。"""
+    try:
+        from .reverse_cloud import providers
+    except ImportError:
+        import importlib as _il, sys as _sys, os as _os
+        _pd = _os.path.dirname(_os.path.abspath(__file__))
+        if _pd not in _sys.path:
+            _sys.path.insert(0, _pd)
+        providers = _il.import_module("reverse_cloud.providers")
+    return providers.effort_to_thinking(effort, default)
+
+
 def _cloud_caption(kind, pil, rule, user_text, base="", key="", model="", thinking=True,
                    stream=False, effort=""):
     """云端反推统一入口（延迟导入，不依赖网络库也能加载节点）。
@@ -1477,10 +1490,15 @@ class ReverseLayoutCaption:
                 "openai_base": ("STRING", {"default": "", "tooltip": "仅自定义端点模式用：请求地址，如 https://api.deepseek.com 或 https://api.openai.com/v1（自动补全 /v1/chat/completions）"}),
                 "openai_key": ("STRING", {"default": "", "tooltip": "仅自定义端点模式用：Bearer 密钥（也可用环境变量 ASSEMBLED_OPENAI_KEY）"}),
                 "openai_model": ("STRING", {"default": "deepseek-v4.1-flash", "tooltip": "仅自定义端点模式用的模型名（内置 DeepSeek 网关自动选自已在用的那个）"}),
-                "deepseek_thinking": ("BOOLEAN", {"default": True, "tooltip": "云端模式：开思考（更准但更慢；关掉快 30-50%）"}),
+                "deepseek_thinking": ("BOOLEAN", {"default": True, "tooltip": "云端模式的思考开关（DeepSeek 官方只有这一个布尔）。强度档位见「思考强度」：选了档位就以它为准，选「不思考」才轮到这个开关"}),
                 # ---- 自定义端点专用（继续往后追加，不能插中间）----
                 "custom_stream": ("BOOLEAN", {"default": False, "tooltip": "仅自定义端点：流式逐字返回。默认非流式—反推要的是整块 JSON，流式只会多一层拼接；只有端点不支持非流式时才开"}),
-                "custom_effort": (["不思考", "low", "medium", "high"], {"default": "不思考", "tooltip": "仅自定义端点：思考强度，发给端点的 reasoning_effort（o 系列 / 支持推理的网关认这个字段）。选了强度就不再往模型名上拼 -nothinking"}),
+                "custom_effort": (["不思考", "minimal", "low", "medium", "high", "max"],
+                                  {"default": "不思考",
+                                   "tooltip": "思考强度五档（minimal/low/medium/high/max）+ 不思考，两个云端通道共用："
+                                             "自定义端点→原值发 reasoning_effort（端点不认该字段会自动去掉重试）；"
+                                             "DeepSeek 云端→官方只有布尔开关，medium/high/max 算开、minimal/low 算关、"
+                                             "不思考=不覆盖，回落到「深度思考」那个开关"}),
             },
         }
 
@@ -1745,9 +1763,12 @@ class ReverseLayoutCaption:
             try:
                 pil = self._image_to_pil(image, max_side=1024, index=batch_index)
                 if provider_ds:
+                    # DeepSeek 官方只有 thinking 一个开关（布尔），没有强度档：
+                    # 强度选了 medium/high/max 就算开，minimal/low 就算关；
+                    # 选「不思考」代不覆盖，回落到 deepseek_thinking 开关
+                    think = _effort_to_thinking(custom_effort, bool(deepseek_thinking))
                     # 内置纯 Python 网关：图片上传 + DeepSeek 补全（进程内）
-                    text_out = _cloud_caption(provider, pil, rule, up_all,
-                                              thinking=bool(deepseek_thinking))
+                    text_out = _cloud_caption(provider, pil, rule, up_all, thinking=think)
                 else:
                     # 思考强度优先：选了强度就把 reasoning_effort 发给端点，不再玩模型名后缀；
                     # 没选强度时沿用旧行为（关掉思考就给模型名拼 -nothinking，内置网关那套命名）

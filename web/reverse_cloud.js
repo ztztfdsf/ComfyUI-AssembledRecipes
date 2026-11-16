@@ -286,7 +286,9 @@ function ctlText(ui, name, labelText, { multiline = false, placeholder = "" } = 
 	input.value = w?.value ?? "";
 	input.addEventListener("change", () => {
 		if (w) { w.value = input.value; w.callback?.(input.value); saveState(node); }
+		syncBinds(ui, name, input);
 	});
+	bind(ui, name, input, () => w?.value ?? "");
 	c.append(input);
 	return c;
 }
@@ -306,7 +308,9 @@ function ctlNum(ui, name, labelText, { min = 0, max = 999999 } = {}) {
 		v = Math.min(max, Math.max(min, v));
 		input.value = String(v);
 		if (w) { w.value = v; w.callback?.(v); saveState(node); }
+		syncBinds(ui, name, input);
 	});
+	bind(ui, name, input, () => w?.value ?? 0);
 	c.append(input);
 	return c;
 }
@@ -325,9 +329,31 @@ function ctlSelect(ui, name, labelText) {
 	sel.value = w?.value ?? "";
 	sel.addEventListener("change", () => {
 		if (w) { w.value = sel.value; w.callback?.(sel.value); saveState(node); }
+		syncBinds(ui, name, sel);   // 同一个参数可能在两页都露（比如思考强度）
 	});
+	bind(ui, name, sel, () => w?.value ?? "");
 	c.append(sel);
 	return c;
+}
+
+// 同一个 widget 的多个控件互相同步（谁改了就刷其他几个）
+const bindKey = (name, el2) => name + "::" + el2.dataset.arb;
+
+function bind(ui, name, elem, read) {
+	ui.binds ||= {};
+	elem.dataset.arb = String((ui.bindSeq = (ui.bindSeq || 0) + 1));
+	ui.binds[bindKey(name, elem)] = { name, elem, read };
+}
+
+function syncBinds(ui, name, from) {
+	for (const key of Object.keys(ui.binds || {})) {
+		const b = ui.binds[key];
+		if (!b || b.name !== name || b.elem === from) continue;
+		const v = b.read();
+		if (b.elem.tagName === "SELECT") b.elem.value = v;
+		else if (b.elem.tagName === "INPUT" || b.elem.tagName === "TEXTAREA") b.elem.value = v;
+		else if (b.elem.classList) b.elem.classList.toggle("on", !!v);
+	}
 }
 
 function ctlToggle(ui, name, labelText) {
@@ -340,7 +366,9 @@ function ctlToggle(ui, name, labelText) {
 		const v = !t.classList.contains("on");
 		t.classList.toggle("on", v);
 		if (w) { w.value = v; w.callback?.(v); saveState(node); }
+		syncBinds(ui, name, t);
 	});
+	bind(ui, name, t, () => !!w?.value);
 	row.append(t);
 	return row;
 }
@@ -799,6 +827,12 @@ function buildPanel(node) {
 	ui.testBtn.addEventListener("click", () => testAccount(ui, ""));
 	r3.append(ui.testBtn);
 	acc.append(r3);
+	// 思考强度：与自定义端点页同一个参数（DeepSeek 官方只有布尔开关，这里把五档映成开/关）
+	const gEff = el("div", "ar-row");
+	gEff.append(ctlSelect(ui, "custom_effort", "思考强度（五档）"));
+	acc.append(gEff);
+	acc.append(ctlToggle(ui, "deepseek_thinking", "深度思考（仅强度选「不思考」时生效）"));
+	acc.append(el("div", "ar-hint", "DeepSeek 官方只有 thinking 一个开关：medium/high/max 算开，minimal/low 算关；选「不思考」才轮到最后那个开关。"));
 	acc.append(el("div", "ar-hint", "多个账号自动轮摊：哪个被禁言就跳过哪个，到期自己回来。账密只存插件本地配置，不进工作流、不进日志。"));
 	// 服务状态与日志收到一个默认收起的面板里，主视图只留账号相
 	const svc = el("details", "ar-details");
@@ -845,7 +879,8 @@ function buildPanel(node) {
 	mManual.append(el("summary", "", "手填模型名（列表里没有时用）"));
 	mManual.append(ctlText(ui, "openai_model", "模型名", { placeholder: "deepseek-v4.1-flash" }));
 	cc.append(mManual);
-	cc.append(ctlSelect(ui, "custom_effort", "思考强度 reasoning_effort"));
+	cc.append(ctlSelect(ui, "custom_effort", "思考强度（五档）"));
+	cc.append(el("div", "ar-hint", "原值发给端点的 reasoning_effort；端点不认这个字段会自动去掉重打，不会当成“端点挂了”。"));
 	cc.append(ctlToggle(ui, "custom_stream", "流式返回（默认非流式）"));
 	cc.append(el("div", "ar-hint", "反推要的是整块 JSON，非流式最直接；只有端点不支持非流式时才开流式"));
 	pageCustom.append(cc);

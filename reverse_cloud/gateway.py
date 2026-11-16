@@ -29,6 +29,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import direct
+from . import providers  # providers 只在函数内懒导入 gateway，不成环
 
 PORT_DEFAULT = 5812
 MODEL_MAIN = "deepseek-v4.1-flash"
@@ -380,12 +381,30 @@ def _model_flags(model: str):
     return MODEL_MAIN, True, False
 
 
+# reasoning_effort 的五档→DeepSeek 官方只有一个 thinking 开关（布尔），所以这里收敛；
+# 规则只住在 providers.effort_to_thinking 一处，节点与网关都用它。
+
+
+def _flags_from_body(body: dict):
+    """模型名后缀 + reasoning_effort → (model, thinking, search)。
+
+    effort 优先于模型名后缀：显式选了强度就按强度说话。
+    """
+    model, thinking, search = _model_flags(body.get("model"))
+    eff = str(body.get("reasoning_effort") or "").strip().lower()
+    if eff in ("", "auto"):
+        return model, thinking, search
+    if eff not in ("minimal", "low", "medium", "high", "max", "none", "off"):
+        raise direct.DeepSeekError("reasoning_effort 不认的值：%r（可用：minimal/low/medium/high/max）" % eff)
+    return model, providers.effort_to_thinking(eff, default=thinking), search
+
+
 def run_completion(body: dict) -> dict:
     """非流式：一次补全，返回 OpenAI 形状。"""
     prompt, images = _extract_prompt_and_images(body)
     if not prompt:
         raise direct.DeepSeekError("messages 里没有文本内容")
-    model, thinking, search = _model_flags(body.get("model"))
+    model, thinking, search = _flags_from_body(body)
     def job(client, acct):
         t0 = time.time()
         file_ids = []
@@ -416,7 +435,7 @@ def run_completion(body: dict) -> dict:
 def stream_completion(body: dict):
     """流式：按 OpenAI SSE 逐块吐字（上游本身就是逐 token 推的）。"""
     prompt, images = _extract_prompt_and_images(body)
-    model, thinking, search = _model_flags(body.get("model"))
+    model, thinking, search = _flags_from_body(body)
     box = {"done": False, "err": None, "text": []}
     holder = {}
 
