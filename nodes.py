@@ -1317,7 +1317,8 @@ def _ds_gateway():
 
 
 # 规则要点：限死框数（防过度分割）、禁止把画廊 tag 逐条变框、desc 120~220 词、坐标用模型原生的 xyxy（清洗节点统一转 yxyx）
-def _cloud_caption(kind, pil, rule, user_text, base="", key="", model="", thinking=True):
+def _cloud_caption(kind, pil, rule, user_text, base="", key="", model="", thinking=True,
+                   stream=False, effort=""):
     """云端反推统一入口（延迟导入，不依赖网络库也能加载节点）。
 
     kind 含 DeepSeek → 走内置纯 Python 网关（进程内，图片走官方 file 通道）；
@@ -1336,7 +1337,7 @@ def _cloud_caption(kind, pil, rule, user_text, base="", key="", model="", thinki
     env_key = os.environ.get("ASSEMBLED_OPENAI_KEY", "")
     return providers.run_caption("openai", pil, rule, user_text,
                                  openai_base=base, openai_key=key or env_key,
-                                 openai_model=model)
+                                 openai_model=model, stream=bool(stream), effort=effort or "")
 
 
 _LAYOUT_RULE_DEFAULT = (
@@ -1477,6 +1478,9 @@ class ReverseLayoutCaption:
                 "openai_key": ("STRING", {"default": "", "tooltip": "仅自定义端点模式用：Bearer 密钥（也可用环境变量 ASSEMBLED_OPENAI_KEY）"}),
                 "openai_model": ("STRING", {"default": "deepseek-v4.1-flash", "tooltip": "仅自定义端点模式用的模型名（内置 DeepSeek 网关自动选自已在用的那个）"}),
                 "deepseek_thinking": ("BOOLEAN", {"default": True, "tooltip": "云端模式：开思考（更准但更慢；关掉快 30-50%）"}),
+                # ---- 自定义端点专用（继续往后追加，不能插中间）----
+                "custom_stream": ("BOOLEAN", {"default": False, "tooltip": "仅自定义端点：流式逐字返回。默认非流式—反推要的是整块 JSON，流式只会多一层拼接；只有端点不支持非流式时才开"}),
+                "custom_effort": (["不思考", "low", "medium", "high"], {"default": "不思考", "tooltip": "仅自定义端点：思考强度，发给端点的 reasoning_effort（o 系列 / 支持推理的网关认这个字段）。选了强度就不再往模型名上拼 -nothinking"}),
             },
         }
 
@@ -1727,7 +1731,8 @@ class ReverseLayoutCaption:
     def caption(self, image, rule, user_prompt, provider="本地模型（transformers）", model_name=None,
                 max_new_tokens=4096, pre_clear=True, offload_after=True,
                 openai_base="", openai_key="", openai_model="deepseek-v4.1-flash", deepseek_thinking=True,
-                quant="4bit (NF4，显存最省)", tag_mode="全部（推荐 12B 级大模型）", batch_index=0):
+                quant="4bit (NF4，显存最省)", tag_mode="全部（推荐 12B 级大模型）", batch_index=0,
+                custom_stream=False, custom_effort="不思考"):
         import torch
         provider_local = str(provider).startswith("本地")
         provider_ds = "DeepSeek" in str(provider)
@@ -1744,11 +1749,15 @@ class ReverseLayoutCaption:
                     text_out = _cloud_caption(provider, pil, rule, up_all,
                                               thinking=bool(deepseek_thinking))
                 else:
+                    # 思考强度优先：选了强度就把 reasoning_effort 发给端点，不再玩模型名后缀；
+                    # 没选强度时沿用旧行为（关掉思考就给模型名拼 -nothinking，内置网关那套命名）
+                    effort = "" if str(custom_effort or "") in ("", "不思考") else str(custom_effort)
                     model_use = openai_model
-                    if not deepseek_thinking and "-nothinking" not in model_use:
+                    if not effort and not deepseek_thinking and "-nothinking" not in model_use:
                         model_use = model_use.replace("-search", "") + "-nothinking"
                     text_out = _cloud_caption(provider, pil, rule, up_all,
-                                              base=openai_base, key=openai_key, model=model_use)
+                                              base=openai_base, key=openai_key, model=model_use,
+                                              stream=bool(custom_stream), effort=effort)
             except Exception as e:
                 raise RuntimeError(f"云端反推[{provider}] 失败: {e}") from e
             try:

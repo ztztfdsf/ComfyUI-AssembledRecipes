@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+from urllib.parse import urlsplit
 
 
 class ProviderError(RuntimeError):
@@ -36,16 +37,71 @@ def _pil_to_data_url(pil, max_side=1024, fmt="JPEG", quality=90) -> str:
     return f"data:image/{fmt.lower()};base64,{b64}"
 
 
+def _endpoint(base_url: str, tail: str) -> str:
+    """把用户填的 base 拼成具体端点（允许已经写了完整路径）。"""
+    url = (base_url or "").strip().rstrip("/")
+    if not url:
+        raise ProviderError("OpenAI 自定义模式需要填请求地址")
+    if url.endswith(tail):
+        return url
+    if url.endswith("/v1"):
+        return url + "/" + tail
+    return url + "/v1/" + tail
+
+
+def _client(url: str, timeout: float):
+    """建 httpx 客户端。
+
+    对外端点：一律走代理，检不到直接报错（绝不裸走真实出口 IP）。
+    本地端点（127.0.0.1 / localhost / ::1）：不走代理——它根本不出网卡，
+    套上机场反而会被它拒接（很多人把自定义端点填成本机 LM Studio / llama.cpp）。
+    """
+    import httpx
+    try:
+        from . import direct
+    except ImportError:
+        import direct  # type: ignore
+    host = (urlsplit(url).hostname or "").lower()
+    local = host in ("127.0.0.1", "localhost", "::1") or host.startswith("127.")
+    proxy = None if local else direct.detect_proxy()
+    return httpx.Client(proxy=proxy, timeout=timeout, follow_redirects=True)
+
+
+def list_models(base_url: str, api_key: str = "", timeout: float = 30.0) -> list:
+    """GET {base}/models → 模型 id 列表（面板的「拉取模型列表」用）。"""
+    url = _endpoint(base_url, "models")
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    with _client(url, timeout) as cli:
+        r = cli.get(url, headers=headers)
+    if r.status_code != 200:
+        raise ProviderError(f"拉模型列表 HTTP {r.status_code}: {r.text[:240]}")
+    try:
+        data = r.json()
+    except ValueError:
+        raise ProviderError(f"模型列表不是 JSON: {r.text[:200]}")
+    rows = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        raise ProviderError(f"模型列表形状不认识: {json.dumps(data, ensure_ascii=False)[:200]}")
+    out = []
+    for row in rows:
+        if isinstance(row, str):
+            out.append(row)
+        elif isinstance(row, dict):
+            mid = row.get("id") or row.get("name") or row.get("model")
+            if mid:
+                out.append(str(mid))
+    return sorted(set(out))
+
+
 def _openai_chat(base_url: str, api_key: str, model: str, system: str, user_text: str,
                  pil, temperature: float = 1.0, timeout: float = 300.0,
-                 data_url: str | None = None) -> str:
-    import httpx
-    url = base_url.rstrip("/")
-    if not url.endswith("/chat/completions"):
-        if url.endswith("/v1"):
-            url += "/chat/completions"
-        else:
-            url += "/v1/chat/completions"
+                 data_url: str | None = None, stream: bool = False,
+                 effort: str = "") -> str:
+    """标准 OpenAI 视觉补全。默认非流式（反推要整块 JSON，流式只会多一层拼接）；
+    effort 非空时带 reasoning_effort（o系列 / 部分网关认这个字段）。"""
+    url = _endpoint(base_url, "chat/completions")
     content: list = [{"type": "text", "text": user_text}]
     if pil is not None:
         content.insert(0, {"type": "image_url",
@@ -55,25 +111,56 @@ def _openai_chat(base_url: str, api_key: str, model: str, system: str, user_text
         "messages": ([{"role": "system", "content": system}] if system else [])
         + [{"role": "user", "content": content}],
         "temperature": temperature,
-        "stream": False,
+        "stream": bool(stream),
     }
+    if effort and effort != "不思考":
+        body["reasoning_effort"] = effort
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    r = httpx.post(url, json=body, headers=headers, timeout=timeout)
-    if r.status_code != 200:
-        raise ProviderError(f"OpenAI 端点 HTTP {r.status_code}: {r.text[:300]}")
-    try:
-        return r.json()["choices"][0]["message"]["content"] or ""
-    except Exception as e:
-        raise ProviderError(f"OpenAI 响应解析失败: {e} :: {r.text[:300]}")
+    with _client(url, timeout) as cli:
+        if not stream:
+            r = cli.post(url, json=body, headers=headers)
+            if r.status_code != 200:
+                raise ProviderError(f"OpenAI 端点 HTTP {r.status_code}: {r.text[:300]}")
+            try:
+                return r.json()["choices"][0]["message"]["content"] or ""
+            except Exception as e:
+                raise ProviderError(f"OpenAI 响应解析失败: {e} :: {r.text[:300]}")
+        # 流式：逐行拼 delta（部分网关会额外吏 reasoning_content，不能当正文）
+        chunks, bad = [], 0
+        with cli.stream("POST", url, json=body, headers=headers) as r:
+            if r.status_code != 200:
+                raw = r.read()
+                raise ProviderError(f"OpenAI 端点 HTTP {r.status_code}: {raw[:300]}")
+            for line in r.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(payload)
+                except ValueError:
+                    bad += 1
+                    continue
+                for ch in obj.get("choices") or []:
+                    delta = ch.get("delta") or {}
+                    piece = delta.get("content") or ch.get("text") or ""
+                    if piece:
+                        chunks.append(piece)
+        text = "".join(chunks)
+        if not text:
+            raise ProviderError(f"流式没拿到正文（{bad} 行解不进去）——这个端点可能不支持 stream，改回非流式")
+        return text
 
 
 # ---------------------------------------------------------------- 统一入口
 
 def run_caption(provider: str, pil, system_rule: str, user_text: str,
                 local_runner=None, openai_base: str = "", openai_key: str = "",
-                openai_model: str = "", thinking: bool = True) -> str:
+                openai_model: str = "", thinking: bool = True,
+                stream: bool = False, effort: str = "") -> str:
     """provider: local / deepseek / openai。
 
     local:    调 local_runner(pil, system_rule, user_text)（节点里现有的 transformers 路径）
@@ -91,9 +178,8 @@ def run_caption(provider: str, pil, system_rule: str, user_text: str,
             import gateway  # type: ignore
         return gateway.caption(pil, system_rule, user_text, thinking=thinking)
     if provider == "openai":
-        if not openai_base:
-            raise ProviderError("OpenAI 自定义模式需要填请求地址")
-        return _openai_chat(openai_base, openai_key, openai_model, system_rule, user_text, pil)
+        return _openai_chat(openai_base, openai_key, openai_model, system_rule, user_text, pil,
+                            stream=stream, effort=effort)
     raise ProviderError(f"未知 provider: {provider}")
 
 

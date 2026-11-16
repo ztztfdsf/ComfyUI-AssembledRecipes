@@ -644,6 +644,27 @@ def unbind(email: str = "") -> dict:
     return {"ok": True, "accounts": len(left)}
 
 
+def fetch_models(body: dict) -> dict:
+    """面板「拉取模型列表」：GET {base}/models（走代理，检不到代理直接报错）。"""
+    base = str((body or {}).get("base") or "").strip()
+    key = str((body or {}).get("key") or "").strip()
+    if not base:
+        return {"ok": False, "error": "请求地址是空的"}
+    try:
+        from . import providers
+    except ImportError:
+        import providers  # type: ignore
+    t0 = time.time()
+    try:
+        models = providers.list_models(base, key)
+    except Exception as e:
+        _log("拉模型列表失败 %s: %s" % (base, e))
+        return {"ok": False, "error": str(e)[:400], "base": base}
+    ms = round((time.time() - t0) * 1000.0, 1)
+    _log("拉模型列表 %s → %d 个（%dms）" % (base, len(models), ms))
+    return {"ok": True, "models": models, "ms": ms, "base": base}
+
+
 def test_connectivity(email: str = "") -> dict:
     """测一个账号（不填就用池里第一个可用的）。"""
     t0 = time.time()
@@ -769,6 +790,15 @@ def register_routes():
         email = str((body or {}).get("email") or "").strip()
         fn = (lambda: unbind(email)) if email else stop_and_unbind
         out = await asyncio.get_event_loop().run_in_executor(None, fn)
+        return aiohttp.web.json_response(out, dumps=dumps)
+
+    @routes.post("/assembled-recipes/ds/models")
+    async def _models(request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        out = await asyncio.get_event_loop().run_in_executor(None, fetch_models, body)
         return aiohttp.web.json_response(out, dumps=dumps)
 
     @routes.post("/assembled-recipes/ds/service")

@@ -19,6 +19,7 @@ const LS_PASSWORD = "arReverseDeepseekPassword";
 const LS_ACCOUNT = "arReverseDeepseekAccount";
 const LS_DEVICE_ID = "arReverseDeepseekDeviceId";
 const DS_API = "/assembled-recipes/ds"; // 内置网关的控制面（同源，走 ComfyUI 自已在的端口）
+const LS_MODELS = "arReverseOpenaiModels:"; // 自定义端点拉到的模型列表（按 base 分开缓存）
 
 const STYLE_ID = "ar-reverse-cloud-css";
 const CSS = `
@@ -27,106 +28,146 @@ const CSS = `
  *   min-height:0 + grid minmax(0,1fr) 让滚动区可以小于内容高
  *   content-visibility + contain-intrinsic-size 切断「内容高 → 容器高」的测量反馈 */
 .dom-widget:has(> .arshell) { pointer-events: none !important; }
-.arshell { width: 100%; height: 100%; min-width: 0; min-height: 0;
+
+/* ===== 设计变量（极简：一根主色 + 三级灰度 + 1px 发丝线，不用卡片盒）===== */
+.arshell {
+  --ar-fg: var(--fg-color, #dcdcde);
+  --ar-dim: rgba(220, 220, 226, .58);
+  --ar-faint: rgba(220, 220, 226, .38);
+  --ar-line: rgba(255, 255, 255, .10);
+  --ar-line-soft: rgba(255, 255, 255, .055);
+  --ar-accent: #6f9bff;
+  --ar-ok: #58c176;
+  --ar-warn: #dcb657;
+  --ar-bad: #e86b6b;
+  width: 100%; height: 100%; min-width: 0; min-height: 0;
   display: grid; grid-template-rows: minmax(0, 1fr); overflow: hidden;
   box-sizing: border-box; pointer-events: auto;
-  font: 12px/1.5 system-ui, sans-serif; color: var(--fg-color, #dcdcde);
-  background: var(--comfy-input-bg, #2b2b30);
-  content-visibility: auto; contain-intrinsic-size: 430px 560px; }
+  font: 12px/1.55 -apple-system, "Segoe UI", system-ui, "Microsoft YaHei", sans-serif;
+  color: var(--ar-fg); background: var(--comfy-input-bg, #2b2b30);
+  content-visibility: auto; contain-intrinsic-size: 430px 560px;
+  -webkit-font-smoothing: antialiased; }
 .arbody { min-height: 0; overflow-y: auto; overflow-x: hidden;
-  padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 12px; }
-.arbody::-webkit-scrollbar { width: 8px; }
-.arbody::-webkit-scrollbar-thumb { background: #444a; border-radius: 4px; }
+  padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 14px; }
+.arbody::-webkit-scrollbar { width: 6px; }
+.arbody::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 3px; }
+.arbody::-webkit-scrollbar-track { background: transparent; }
 .arshell.is-resizing, .arshell.is-resizing * { pointer-events: none !important; user-select: none !important; }
 
-/* 顶栏 */
-.ar-head { display: flex; align-items: center; gap: 10px; }
-.ar-head .t { font-weight: 700; font-size: 12.5px; letter-spacing: .5px; }
-.ar-dot { width: 9px; height: 9px; border-radius: 50%; background: #6a6a72; flex: none; }
-.ar-dot.ok { background: #4fc46a; box-shadow: 0 0 8px #4fc46a77; }
-.ar-dot.err { background: #e05555; box-shadow: 0 0 8px #e0555577; }
-.ar-dot.busy { background: #e0b855; animation: arPulse 1s infinite; }
-@keyframes arPulse { 50% { opacity: .35; } }
+/* 顶栏：只留一个标题 + 一个状态点 */
+.ar-head { display: flex; align-items: center; gap: 8px; }
+.ar-head .t { font-weight: 600; font-size: 12px; letter-spacing: .04em; }
+.ar-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ar-faint); flex: none; }
+.ar-dot.ok { background: var(--ar-ok); }
+.ar-dot.err { background: var(--ar-bad); }
+.ar-dot.busy { background: var(--ar-warn); animation: arPulse 1.1s ease-in-out infinite; }
+@keyframes arPulse { 50% { opacity: .3; } }
 .ar-head .sp { flex: 1; }
 
-/* 分段选择 */
-.ar-seg { display: flex; gap: 4px; background: rgba(0,0,0,.28); padding: 3px; border-radius: 9px; }
-.ar-seg button { flex: 1; padding: 7px 6px; border: none; border-radius: 7px;
-  background: transparent; color: var(--fg-color, #bbb); font: 11.5px system-ui;
-  cursor: pointer; transition: background .12s, color .12s; white-space: nowrap; }
-.ar-seg button.on { background: #3f66cc; color: #fff; font-weight: 600; }
-.ar-seg button:hover:not(.on) { background: rgba(255,255,255,.07); }
+/* 顶部导航：主界面（文字页签）+ 模式下拉，下面一条发丝线 */
+.ar-seg { display: flex; align-items: center; gap: 14px;
+  border-bottom: 1px solid var(--ar-line); padding-bottom: 9px; }
+.ar-seg button { position: relative; flex: none; padding: 2px 0 8px; border: none;
+  background: transparent; color: var(--ar-faint); font: 500 12px/1.2 inherit;
+  cursor: pointer; transition: color .14s; white-space: nowrap; }
+.ar-seg button.on { color: var(--ar-fg); font-weight: 600; }
+.ar-seg button:hover { color: var(--ar-fg); }
+/* 选中页签在发丝线上压一小段主色 */
+.ar-seg button.on::after { content: ""; position: absolute; left: 0; right: 0; bottom: -10px;
+  height: 2px; background: var(--ar-accent); border-radius: 1px; }
 
-/* 分区卡片 */
+.ar-modesel { flex: 1; display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
+.ar-modesel .lbl { font-size: 10.5px; color: var(--ar-faint); letter-spacing: .04em; white-space: nowrap; }
+.ar-modesel select { background: transparent; border: none; color: var(--ar-fg);
+  font: 600 12px inherit; padding: 2px 15px 2px 4px; cursor: pointer; outline: none;
+  appearance: none; -webkit-appearance: none; text-align: right; text-align-last: right; max-width: 62%;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='9' height='6'><path d='M1 1l3.5 3.5L8 1' stroke='%238a8a92' fill='none' stroke-width='1.3' stroke-linecap='round'/></svg>");
+  background-repeat: no-repeat; background-position: right 2px center; }
+.ar-modesel select option { background: #2b2b33; color: #e6e6ee; font-weight: 400; }
+
+/* 手风琴（规则） */
+.ar-details { margin-top: 2px; }
+.ar-details summary { font-size: 10.5px; opacity: .45; cursor: pointer; letter-spacing: .04em; }
+.ar-details summary:hover { opacity: .75; }
+.ar-details .ar-f { margin-top: 8px; }
+
+/* 分区：不再用盒子，靠小标题 + 发丝线分隔 */
 details.ar-card>summary { list-style: none; }
 details.ar-card>summary::-webkit-details-marker { display: none; }
-details.ar-card[open]>summary { margin-bottom: 6px; }
+details.ar-card[open]>summary { margin-bottom: 8px; }
 
-.ar-card { border: 1px solid rgba(255,255,255,.09); border-radius: 10px;
-  background: rgba(255,255,255,.025); padding: 12px 14px; display: flex;
-  flex-direction: column; gap: 10px; }
-.ar-card>.cap { font-size: 10.5px; font-weight: 700; letter-spacing: 1px;
-  text-transform: uppercase; opacity: .5; margin-bottom: 2px; }
+.ar-card { display: flex; flex-direction: column; gap: 11px; }
+.ar-card + .ar-card { border-top: 1px solid var(--ar-line-soft); padding-top: 13px; }
+.ar-card>.cap { font-size: 10px; font-weight: 600; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--ar-faint); }
 
-/* 表单行 */
-.ar-row { display: flex; gap: 10px; }
+/* 表单 */
+.ar-row { display: flex; gap: 12px; }
 .ar-row>* { flex: 1; min-width: 0; }
-.ar-f { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.ar-f>label { font-size: 10.5px; opacity: .55; }
+.ar-f { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.ar-f>label { font-size: 10.5px; color: var(--ar-dim); letter-spacing: .02em; }
 .ar-f input, .ar-f select, .ar-f textarea {
-  background: rgba(0,0,0,.3); border: 1px solid rgba(255,255,255,.12);
-  border-radius: 7px; padding: 7px 10px; color: var(--fg-color, #ddd);
-  font: 12px system-ui; width: 100%; box-sizing: border-box; }
-.ar-f textarea { resize: vertical; min-height: 58px; line-height: 1.45; }
+  background: transparent; border: none; border-bottom: 1px solid var(--ar-line);
+  border-radius: 0; padding: 5px 1px; color: var(--ar-fg);
+  font: 12px inherit; width: 100%; box-sizing: border-box; transition: border-color .14s; }
+.ar-f input::placeholder, .ar-f textarea::placeholder { color: rgba(220,220,226,.26); }
+.ar-f textarea { resize: vertical; min-height: 58px; line-height: 1.5; }
+.ar-f input:hover, .ar-f select:hover, .ar-f textarea:hover { border-color: rgba(255,255,255,.22); }
 .ar-f input:focus, .ar-f select:focus, .ar-f textarea:focus {
-  outline: none; border-color: #3f66cc; }
-.ar-f input[type=number]::-webkit-inner-spin-button { opacity: .4; }
+  outline: none; border-color: var(--ar-accent); }
+.ar-f select { cursor: pointer; appearance: none; -webkit-appearance: none; padding-right: 17px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='9' height='6'><path d='M1 1l3.5 3.5L8 1' stroke='%238a8a92' fill='none' stroke-width='1.3' stroke-linecap='round'/></svg>");
+  background-repeat: no-repeat; background-position: right 1px center; }
+.ar-f input[type=number]::-webkit-inner-spin-button { opacity: .3; }
 
-/* 开关行 */
-.ar-sw { display: flex; align-items: center; justify-content: space-between;
-  padding: 3px 0; }
-.ar-sw .lab { font-size: 12px; opacity: .85; }
-.ar-tg { width: 38px; height: 20px; border-radius: 10px; background: rgba(255,255,255,.14);
-  position: relative; cursor: pointer; flex: none; transition: background .15s; }
-.ar-tg.on { background: #3f66cc; }
-.ar-tg::after { content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px;
-  border-radius: 50%; background: #e8e8ea; transition: left .15s; }
-.ar-tg.on::after { left: 21px; }
+/* 开关：细线条版 */
+.ar-sw { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.ar-sw .lab { font-size: 11.5px; color: var(--ar-dim); }
+.ar-tg { width: 30px; height: 16px; border-radius: 8px; background: rgba(255,255,255,.13);
+  position: relative; cursor: pointer; flex: none; transition: background .16s; }
+.ar-tg.on { background: var(--ar-accent); }
+.ar-tg::after { content: ""; position: absolute; top: 3px; left: 3px; width: 10px; height: 10px;
+  border-radius: 50%; background: #eceef3; transition: left .16s; }
+.ar-tg.on::after { left: 17px; }
 
-/* 按钮 */
-.ar-btn { padding: 7px 16px; border: 1px solid rgba(255,255,255,.14); border-radius: 7px;
-  background: rgba(255,255,255,.06); color: var(--fg-color, #ddd);
-  font: 12px system-ui; cursor: pointer; white-space: nowrap; transition: filter .12s; }
-.ar-btn:hover { filter: brightness(1.25); }
-.ar-btn:disabled { opacity: .4; cursor: default; }
-.ar-btn.pri { background: #3f66cc; border-color: #5580e0; color: #fff; font-weight: 600; }
+/* 按钮：默认就是文字按钮，主按钮一层淡底 */
+.ar-btn { padding: 6px 14px; border: 1px solid var(--ar-line); border-radius: 6px;
+  background: transparent; color: var(--ar-dim);
+  font: 500 11.5px inherit; cursor: pointer; white-space: nowrap; transition: color .14s, border-color .14s; }
+.ar-btn:hover { color: var(--ar-fg); border-color: rgba(255,255,255,.28); }
+.ar-btn:disabled { opacity: .35; cursor: default; }
+.ar-btn.pri { background: rgba(111,155,255,.14); border-color: rgba(111,155,255,.42);
+  color: var(--ar-accent); font-weight: 600; }
+.ar-btn.pri:hover { background: rgba(111,155,255,.22); color: #9dbaff; }
 
-/* 状态行 */
-.ar-hint { font-size: 10.5px; opacity: .62; margin: 4px 0 2px; word-break: break-all; }
-.ar-logs { font-size: 10px; line-height: 1.45; margin: 4px 0 0; padding: 6px 8px; max-height: 96px;
-  overflow: auto; background: rgba(0,0,0,.28); border-radius: 6px; color: #cfd6e4;
-  white-space: pre-wrap; word-break: break-all; font-family: Consolas, Menlo, monospace; }
-.ar-status { font-size: 11.5px; min-height: 16px; word-break: break-all; opacity: .9; }
-.ar-status.ok { color: #7bd88a; }
-.ar-status.err { color: #ff7373; }
+/* 辅助文字 / 日志 / 状态 */
+.ar-hint { font-size: 10.5px; line-height: 1.5; color: var(--ar-faint); word-break: break-all; }
+.ar-logs { font-size: 10px; line-height: 1.5; margin: 2px 0 0; padding: 7px 9px; max-height: 88px;
+  overflow: auto; background: rgba(0,0,0,.22); border-radius: 5px; color: var(--ar-dim);
+  white-space: pre-wrap; word-break: break-all; font-family: "Cascadia Mono", Consolas, Menlo, monospace; }
+.ar-status { font-size: 11px; min-height: 15px; word-break: break-all; color: var(--ar-dim); }
+.ar-status.ok { color: var(--ar-ok); }
+.ar-status.err { color: var(--ar-bad); }
 
-/* 账号池列表 */
-.ar-accts { display: flex; flex-direction: column; gap: 4px; margin: 2px 0 6px; }
-.ar-acct { display: grid; grid-template-columns: auto 1fr auto auto; gap: 6px; align-items: center;
-  padding: 4px 6px; background: rgba(255,255,255,.045); border-radius: 6px; font-size: 11px; }
-.ar-badge { font-size: 10px; padding: 1px 6px; border-radius: 999px; white-space: nowrap;
-  background: rgba(255,255,255,.10); color: #d8dee9; }
-.ar-badge.ok { background: rgba(96,190,110,.20); color: #86e08f; }
-.ar-badge.err { background: rgba(220,90,90,.22); color: #ff9090; }
-.ar-badge.busy { background: rgba(220,180,70,.20); color: #f0cf7a; }
-.ar-mail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .95; }
-.ar-meta { grid-column: 1 / -1; font-size: 10px; opacity: .55; margin: -2px 0 0 2px; }
-.ar-acct .ar-mini { font-size: 10px; padding: 2px 7px; border-radius: 5px; border: 1px solid rgba(255,255,255,.16);
-  background: rgba(255,255,255,.06); color: inherit; cursor: pointer; }
-.ar-acct .ar-mini:hover { filter: brightness(1.3); }
-.ar-acct .ar-mini.danger { border-color: rgba(220,90,90,.45); color: #ff9090; }
+/* 账号池：行式列表（无盒），靠发丝线分组 */
+.ar-accts { display: flex; flex-direction: column; gap: 0; margin: 0 0 2px; }
+.ar-acct { display: grid; grid-template-columns: auto 1fr auto auto; gap: 3px 8px; align-items: center;
+  padding: 7px 0; border-bottom: 1px solid var(--ar-line-soft); font-size: 11.5px; }
+.ar-acct:last-of-type { border-bottom: none; }
+.ar-badge { font-size: 10px; letter-spacing: .02em; white-space: nowrap; color: var(--ar-faint);
+  background: transparent; padding: 0; display: inline-flex; align-items: center; gap: 4px; }
+.ar-badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.ar-badge.ok { color: var(--ar-ok); }
+.ar-badge.err { color: var(--ar-bad); }
+.ar-badge.busy { color: var(--ar-warn); }
+.ar-mail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ar-fg); }
+.ar-meta { grid-column: 1 / -1; font-size: 10px; color: var(--ar-faint); margin: -1px 0 0 13px; }
+.ar-acct .ar-mini { font-size: 10.5px; padding: 2px 0; border: none; border-radius: 0;
+  background: transparent; color: var(--ar-faint); cursor: pointer; text-decoration: none; }
+.ar-acct .ar-mini:hover { color: var(--ar-fg); filter: none; }
+.ar-acct .ar-mini.danger:hover { color: var(--ar-bad); }
 
-.ar-page { display: flex; flex-direction: column; gap: 12px; }
+.ar-page { display: flex; flex-direction: column; gap: 14px; }
 .ar-page.hidden { display: none; }
 `;
 
@@ -147,8 +188,31 @@ function el(tag, cls, text) {
 
 function stateFor(node) {
 	node.properties ||= {};
-	node.properties[PROP] ||= { provider: "local", lastResult: null, account: "" };
-	return node.properties[PROP];
+	node.properties[PROP] ||= { provider: "", tab: "main", lastResult: null, account: "" };
+	const st = node.properties[PROP];
+	// provider 的真源是 widget（旧工作流里就存着它）：面板自己记的只是上次看的是哪页
+	const fromWidget = providerKeyOf(node);
+	if (!st.provider || st.provider === "local") st.provider = fromWidget || st.provider || "local";
+	return st;
+}
+
+const PROVIDER_LABEL_TO_KEY = {
+	"本地模型（transformers）": "local",
+	"DeepSeek 云端（内置网关）": "ds",
+	"自定义 OpenAI 兼容端点": "custom",
+};
+
+// 从 widget 反推模式 key：不能拿面板默认值去盖掉工作流里已存的 provider
+function providerKeyOf(node) {
+	const w = widgetOf(node, "provider");
+	if (!w) return "";
+	const key = PROVIDER_LABEL_TO_KEY[String(w.value)];
+	if (key) return key;
+	const text = String(w.value || "");
+	if (text.startsWith("本地")) return "local";
+	if (text.includes("DeepSeek")) return "ds";
+	if (text.includes("OpenAI")) return "custom";
+	return "";
 }
 
 function saveState(node) {
@@ -461,6 +525,91 @@ async function toggleService(ui) {
 	}
 }
 
+// ================= 自定义端点：模型列表 =================
+
+// 拉到的列表按 base URL 分开缓在 localStorage（不进工作流文件）
+function cachedModels(base) {
+	if (!base) return [];
+	try {
+		const raw = JSON.parse(localStorage.getItem(LS_MODELS + base) || "[]");
+		return Array.isArray(raw) ? raw.filter((x) => typeof x === "string") : [];
+	} catch (e) {
+		return [];
+	}
+}
+
+function renderModelSelect(ui) {
+	const node = ui.node;
+	const w = widgetOf(node, "openai_model");
+	const baseW = widgetOf(node, "openai_base");
+	const base = String(baseW?.value || "").trim();
+	const cur = String(w?.value ?? "");
+	const sel = ui.modelSel;
+	if (!sel) return;
+	const names = cachedModels(base);
+	// 当前值不在列表里（手填的 / 列表还没拉）也要能显示，不能静默丢
+	const opts = cur && !names.includes(cur) ? [cur, ...names] : names;
+	sel.textContent = "";
+	if (!opts.length) {
+		sel.append(el("option", "", "（还没拉取列表）"));
+		sel.disabled = true;
+	} else {
+		sel.disabled = false;
+		for (const nm of opts) sel.append(el("option", "", nm));
+	}
+	sel.value = cur || (opts[0] || "");
+	if (ui.modelHint) {
+		ui.modelHint.textContent = opts.length
+			? `当前 ${cur || opts[0]} · 下拉里 ${opts.length} 个可选${names.length ? "" : "（只有手填值，点拉取可补全）"}`
+			: "点「拉取模型列表」从端点 GET /models 取模型；也可以展开下面手填。";
+	}
+}
+
+function setModelValue(ui, value) {
+	const w = widgetOf(ui.node, "openai_model");
+	if (!w) return;
+	w.value = value;
+	w.callback?.(value);
+	saveState(ui.node);
+	renderModelSelect(ui);
+	setStatus(ui, "ok", "模型已选：" + value);
+}
+
+async function fetchModels(ui) {
+	const base = String(widgetOf(ui.node, "openai_base")?.value || "").trim();
+	const key = String(widgetOf(ui.node, "openai_key")?.value || "").trim();
+	if (!base) {
+		setStatus(ui, "err", "先填请求地址");
+		return;
+	}
+	ui.modelFetchBtn.disabled = true;
+	setStatus(ui, "", `正在 GET ${base}/models …`);
+	try {
+		const data = await jsonFetch(`${DS_API}/models`, {
+			method: "POST",
+			body: JSON.stringify({ base, key }),
+		});
+		if (data.ok) {
+			localStorage.setItem(LS_MODELS + base, JSON.stringify(data.models || []));
+			setStatus(ui, "ok", `拿到 ${(data.models || []).length} 个模型（${data.ms}ms）`);
+			// 当前模型名不在列表里时自动选第一个，免得带着个端点不认的名字跑
+			const w = widgetOf(ui.node, "openai_model");
+			const cur = String(w?.value || "");
+			if ((data.models || []).length && !data.models.includes(cur)) {
+				setModelValue(ui, data.models[0]);
+				setStatus(ui, "ok", `拿到 ${data.models.length} 个模型（${data.ms}ms），已选 ${data.models[0]}`);
+			}
+		} else {
+			setStatus(ui, "err", "拉取失败：" + (data.error || "未知错"));
+		}
+	} catch (e) {
+		setStatus(ui, "err", "拉取失败：" + (e.message || e));
+	} finally {
+		ui.modelFetchBtn.disabled = false;
+		renderModelSelect(ui);
+	}
+}
+
 // ================= 结果可视化 =================
 
 function apiUrl(item) {
@@ -553,56 +702,69 @@ function buildPanel(node) {
 	head.append(ui.dot, el("span", "sp"));
 	body.append(head);
 
-	// ---- provider 分段 ----
-	const seg = el("div", "ar-seg");
-	const segBtns = [];
-	const options = [["local", "本地模型"], ["ds", "DeepSeek 云端"], ["custom", "自定义端点"]];
-	for (const [key, label] of options) {
-		const b = el("button", st.provider === key ? "on" : "", label);
-		b.addEventListener("click", () => {
-			st.provider = key;
-			saveState(node);
-			segBtns.forEach((x) => x.classList.remove("on"));
-			b.classList.add("on");
-			applyProvider();
-		});
-		segBtns.push(b);
-		seg.append(b);
+	// ---- 顶部：两个控件（主界面 + 模式下拉），不再三个分段按钮 ----
+	const MODES = [["local", "本地模型"], ["ds", "DeepSeek 云端"], ["custom", "自定义端点"]];
+	const bar = el("div", "ar-seg");
+	const mainBtn = el("button", st.tab === "mode" ? "" : "on", "主界面");
+	mainBtn.title = "运行 / 画廊标签 / 提示词规则";
+	bar.append(mainBtn);
+	const modeWrap = el("div", "ar-modesel");
+	modeWrap.append(el("span", "lbl", "模式"));
+	const modeSel = el("select");
+	for (const [key, label] of MODES) {
+		const o = el("option", "", label);
+		o.value = key;
+		modeSel.append(o);
 	}
-	body.append(seg);
+	modeSel.value = st.provider;
+	modeWrap.append(modeSel);
+	bar.append(modeWrap);
+	body.append(bar);
 
-	// ---- 本地页 ----
+	// 状态行放在页面外面：不管当前看哪一页都看得到反馈
+	ui.status = el("div", "ar-status");
+
+	// ---- 主界面：运行 + 画廊标签 + 提示词规则 ----
+	const pageMain = el("div", "ar-page");
+	const cRun = el("div", "ar-card");
+	cRun.append(el("div", "cap", "运行"));
+	const gRun1 = el("div", "ar-row");
+	gRun1.append(ctlNum(ui, "max_new_tokens", "最大生成长度", { min: 64, max: 65536 }),
+		ctlNum(ui, "batch_index", "多图时取第几张", { min: 0, max: 64 }));
+	cRun.append(gRun1);
+	cRun.append(ctlToggle(ui, "pre_clear", "反推前清场（腾显存）"));
+	cRun.append(ctlToggle(ui, "offload_after", "结束后卸载模型"));
+	pageMain.append(cRun);
+
+	const cTag = el("div", "ar-card");
+	cTag.append(el("div", "cap", "画廊标签"));
+	cTag.append(ctlSelect(ui, "tag_mode", "喂给模型多少标签"));
+	cTag.append(el("div", "ar-hint", "全部：画质/装束细节更准。精简：只给开头几个作品/角色名，防小模型“看到多少 tag 就框多少个”。"));
+	pageMain.append(cTag);
+
+	const c3 = el("details", "ar-card");
+	const sum = el("summary", "", "提示词规则 rule");
+	sum.style.cursor = "pointer";
+	c3.append(sum);
+	c3.append(ctlText(ui, "rule", "布局规则（框选 / 前后关系 / 输出格式）", { multiline: true }));
+	pageMain.append(c3);
+	body.append(pageMain);
+
+	// ---- 本地模型页（只留模型相关）----
 	const pageLocal = el("div", "ar-page");
 	const c1 = el("div", "ar-card");
 	c1.append(el("div", "cap", "本地模型"));
 	const g1 = el("div", "ar-row");
 	g1.append(ctlSelect(ui, "model_name", "模型（models/LLM）"), ctlSelect(ui, "quant", "量化"));
 	c1.append(g1);
-	const g2 = el("div", "ar-row");
-	g2.append(ctlNum(ui, "max_new_tokens", "最大生成长度", { min: 64, max: 65536 }), ctlNum(ui, "batch_index", "batch_index", { min: 0, max: 64 }));
-	c1.append(g2);
+	c1.append(el("div", "ar-hint", "跑在本机，不走网络。4bit 显存最省，12B 级在 16GB 卡上只有它能跑；不够时直接报错不白等加载。"));
 	pageLocal.append(c1);
-
-	const c2 = el("div", "ar-card");
-	c2.append(el("div", "cap", "运行"));
-	c2.append(ctlToggle(ui, "pre_clear", "反推前清场（腾显存）"));
-	c2.append(ctlToggle(ui, "offload_after", "结束后卸载模型"));
-	const g3 = el("div", "ar-row");
-	g3.append(ctlSelect(ui, "tag_mode", "画廊标签模式"));
-	pageLocal.append(c2, g3);
-
-	const c3 = el("details", "ar-card");
-	const sum = el("summary", "cap", "规则提示词 rule（点开编辑）");
-	sum.style.cursor = "pointer";
-	c3.append(sum);
-	c3.append(ctlText(ui, "rule", "布局规则（框选 / 前后关系 / 输出格式）", { multiline: true }));
-	pageLocal.append(c3);
 	body.append(pageLocal);
 
 	// ---- 云端页 ----
 	const pageDs = el("div", "ar-page");
 	const acc = el("div", "ar-card");
-	acc.append(el("div", "cap", "DeepSeek 账号池（多个账号自动轮巡；账密存插件本地配置，不进日志也不进工作流文件）"));
+	acc.append(el("div", "cap", "DeepSeek 账号池"));
 	ui.acctList = el("div", "ar-accts");
 	acc.append(ui.acctList);
 	const r1 = el("div", "ar-row");
@@ -636,17 +798,20 @@ function buildPanel(node) {
 	ui.testBtn = el("button", "ar-btn", "试跑可用账号");
 	ui.testBtn.addEventListener("click", () => testAccount(ui, ""));
 	r3.append(ui.testBtn);
+	acc.append(r3);
+	acc.append(el("div", "ar-hint", "多个账号自动轮摊：哪个被禁言就跳过哪个，到期自己回来。账密只存插件本地配置，不进工作流、不进日志。"));
+	// 服务状态与日志收到一个默认收起的面板里，主视图只留账号相
+	const svc = el("details", "ar-details");
+	svc.append(el("summary", "", "内置网关服务与日志"));
 	ui.svcBtn = el("button", "ar-btn", "服务状态待读");
 	ui.svcBtn.addEventListener("click", () => toggleService(ui));
-	r3.append(ui.svcBtn);
-	acc.append(r3);
+	svc.append(ui.svcBtn);
 	ui.svcLine = el("div", "ar-hint");
 	ui.svcLine.textContent = "正在读内置网关状态…";
-	acc.append(ui.svcLine);
+	svc.append(ui.svcLine);
 	ui.svcLogs = el("pre", "ar-logs");
-	acc.append(ui.svcLogs);
-	ui.status = el("div", "ar-status");
-	acc.append(ui.status);
+	svc.append(ui.svcLogs);
+	acc.append(svc);
 	pageDs.append(acc);
 	body.append(pageDs);
 	refreshGatewayInfo(ui);
@@ -655,19 +820,52 @@ function buildPanel(node) {
 	const pageCustom = el("div", "ar-page");
 	const cc = el("div", "ar-card");
 	cc.append(el("div", "cap", "OpenAI 兼容端点"));
-	cc.append(ctlText(ui, "openai_base", "请求地址（base URL）", { placeholder: "https://api.deepseek.com" }));
+	const baseCtl = ctlText(ui, "openai_base", "请求地址（base URL）", { placeholder: "https://api.deepseek.com" });
+	// 地址一改，模型列表缓存就是另一个端点的了 → 重画下拉
+	baseCtl.querySelector("input").addEventListener("change", () => renderModelSelect(ui));
+	cc.append(baseCtl);
 	cc.append(ctlText(ui, "openai_key", "API 密钥", { placeholder: "sk-..." }));
-	cc.append(ctlText(ui, "openai_model", "模型名", { placeholder: "deepseek-v4.1-flash" }));
-	cc.append(ctlToggle(ui, "deepseek_thinking", "深度思考（关了更快）"));
+	const mRow = el("div", "ar-row");
+	const fModel = el("div", "ar-f");
+	fModel.append(el("label", "", "模型（下拉选）"));
+	ui.modelSel = el("select");
+	ui.modelSel.addEventListener("change", () => setModelValue(ui, ui.modelSel.value));
+	fModel.append(ui.modelSel);
+	mRow.append(fModel);
+	const fFetch = el("div", "ar-f ar-fbtn");
+	fFetch.append(el("label", "", "　"));
+	ui.modelFetchBtn = el("button", "ar-btn", "拉取模型列表");
+	ui.modelFetchBtn.addEventListener("click", () => fetchModels(ui));
+	fFetch.append(ui.modelFetchBtn);
+	mRow.append(fFetch);
+	cc.append(mRow);
+	ui.modelHint = el("div", "ar-hint");
+	cc.append(ui.modelHint);
+	const mManual = el("details", "ar-details");
+	mManual.append(el("summary", "", "手填模型名（列表里没有时用）"));
+	mManual.append(ctlText(ui, "openai_model", "模型名", { placeholder: "deepseek-v4.1-flash" }));
+	cc.append(mManual);
+	cc.append(ctlSelect(ui, "custom_effort", "思考强度 reasoning_effort"));
+	cc.append(ctlToggle(ui, "custom_stream", "流式返回（默认非流式）"));
+	cc.append(el("div", "ar-hint", "反推要的是整块 JSON，非流式最直接；只有端点不支持非流式时才开流式"));
 	pageCustom.append(cc);
 	body.append(pageCustom);
+	renderModelSelect(ui);
+
+	body.append(ui.status);
 
 	const PROVIDER_MAP = { local: "本地模型（transformers）", ds: "DeepSeek 云端（内置网关）", custom: "自定义 OpenAI 兼容端点" };
 
-	function applyProvider() {
-		pageLocal.classList.toggle("hidden", st.provider !== "local");
-		pageDs.classList.toggle("hidden", st.provider !== "ds");
-		pageCustom.classList.toggle("hidden", st.provider !== "custom");
+	// 顶部只剩两个控件：“主界面”按钮 + “模式”下拉。
+	// 选模式 = 同时把 provider widget 写回（跟旧三按钮分段同一条写入链），并跳到那一页的配置。
+	function applyView() {
+		const onMain = st.tab !== "mode";
+		pageMain.classList.toggle("hidden", !onMain);
+		pageLocal.classList.toggle("hidden", onMain || st.provider !== "local");
+		pageDs.classList.toggle("hidden", onMain || st.provider !== "ds");
+		pageCustom.classList.toggle("hidden", onMain || st.provider !== "custom");
+		mainBtn.classList.toggle("on", onMain);
+		if (modeSel.value !== st.provider) modeSel.value = st.provider;
 		const w = widgetOf(node, "provider");
 		if (w && w.value !== PROVIDER_MAP[st.provider]) {
 			w.value = PROVIDER_MAP[st.provider];
@@ -675,11 +873,30 @@ function buildPanel(node) {
 		}
 	}
 
+	mainBtn.addEventListener("click", () => {
+		st.tab = "main";
+		saveState(node);
+		applyView();
+	});
+	modeSel.addEventListener("change", () => {
+		st.provider = modeSel.value;
+		st.tab = "mode";
+		saveState(node);
+		applyView();
+		if (st.provider === "ds") refreshGatewayInfo(ui);
+		if (st.provider === "custom") renderModelSelect(ui);
+	});
+
+	function applyProvider() {
+		applyView();
+	}
+
 	// 节点尺寸完全由用户拖动（同画廊节点）；面板 height:100% 跟随，内容内部滚动
 	ui.resize = () => {};
 	ui.applyProvider = applyProvider;
+	ui.applyView = applyView;
 
-	applyProvider();
+	applyView();
 	return ui;
 }
 
@@ -699,6 +916,14 @@ app.registerExtension({
 		nodeType.prototype.onConfigure = function () {
 			const r = origConfigure?.apply(this, arguments);
 			hideNatives(this);
+			// 工作流里的 provider 优先：面板状态跟着它走，别让加载把模式重置成本地
+			const key = providerKeyOf(this);
+			const ui = ui_map.get(this);
+			if (key && ui) {
+				const st = stateFor(this);
+				if (st.provider !== key) st.provider = key;
+				ui.applyView?.();
+			}
 			// 旧工作流里存的尺寸是原生 widget 时代留下的（过高/过矮都不适用），收敛到可用区间；
 			// 区间内的尺寸尊重用户自己的拖动结果
 			if (this.size[1] < 500 || this.size[1] > DEFAULT_SIZE[1] + 240) {
