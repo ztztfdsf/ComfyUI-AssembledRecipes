@@ -29,6 +29,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import direct
+from . import endpoints
 from . import providers  # providers 只在函数内懒导入 gateway，不成环
 
 PORT_DEFAULT = 5812
@@ -664,15 +665,21 @@ def unbind(email: str = "") -> dict:
 
 
 def fetch_models(body: dict) -> dict:
-    """面板「拉取模型列表」：GET {base}/models（走代理，检不到代理直接报错）。"""
-    base = str((body or {}).get("base") or "").strip()
-    key = str((body or {}).get("key") or "").strip()
+    """面板「拉取模型列表」：给了端点名就从本地库取 base/key（密钥不出本机），
+    没给名字才用直传的 base/key。"""
+    body = body or {}
+    name = str(body.get("endpoint") or "").strip()
+    if name:
+        try:
+            row = endpoints.resolve(name)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:400]}
+        base, key = row["base"], row.get("key") or ""
+    else:
+        base = str(body.get("base") or "").strip()
+        key = str(body.get("key") or "").strip()
     if not base:
         return {"ok": False, "error": "请求地址是空的"}
-    try:
-        from . import providers
-    except ImportError:
-        import providers  # type: ignore
     t0 = time.time()
     try:
         models = providers.list_models(base, key)
@@ -680,8 +687,43 @@ def fetch_models(body: dict) -> dict:
         _log("拉模型列表失败 %s: %s" % (base, e))
         return {"ok": False, "error": str(e)[:400], "base": base}
     ms = round((time.time() - t0) * 1000.0, 1)
+    if name:
+        endpoints.cache_models(name, models)
     _log("拉模型列表 %s → %d 个（%dms）" % (base, len(models), ms))
-    return {"ok": True, "models": models, "ms": ms, "base": base}
+    return {"ok": True, "models": models, "ms": ms, "base": base, "endpoint": name}
+
+
+def endpoints_api(body: dict) -> dict:
+    """端点库的增删改查（面板用）。返回体永远不回显密钥。"""
+    body = body or {}
+    act = str(body.get("action") or "list")
+    name = str(body.get("name") or "").strip()
+    if act == "list":
+        return {"ok": True, **endpoints.public_view()}
+    if act == "save":
+        if not name:
+            return {"ok": False, "error": "端点名字不能空"}
+        try:
+            row = endpoints.upsert(name, base=str(body.get("base") or ""),
+                                   key=(None if body.get("key") in (None, "") else str(body.get("key"))),
+                                   model=str(body.get("model") or ""))
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:300]}
+        _log("端点已保存 %s（base=%s，密钥%s）" %
+              (name, row["base"],
+               "已更新" if body.get("key") else ("沿用旧的" if row.get("key") else "没填")))
+        return {"ok": True, **endpoints.public_view()}
+    if act == "select":
+        if not endpoints.set_current(name):
+            return {"ok": False, "error": "找不到端点 %s" % name}
+        _log("当前端点 → %s" % name)
+        return {"ok": True, **endpoints.public_view()}
+    if act == "delete":
+        if not endpoints.remove(name):
+            return {"ok": False, "error": "找不到端点 %s" % name}
+        _log("已删除端点 %s" % name)
+        return {"ok": True, **endpoints.public_view()}
+    return {"ok": False, "error": "未知 action: %s" % act}
 
 
 def test_connectivity(email: str = "") -> dict:
@@ -818,6 +860,15 @@ def register_routes():
         except Exception:
             body = {}
         out = await asyncio.get_event_loop().run_in_executor(None, fetch_models, body)
+        return aiohttp.web.json_response(out, dumps=dumps)
+
+    @routes.post("/assembled-recipes/ds/endpoints")
+    async def _endpoints(request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        out = await asyncio.get_event_loop().run_in_executor(None, endpoints_api, body)
         return aiohttp.web.json_response(out, dumps=dumps)
 
     @routes.post("/assembled-recipes/ds/service")

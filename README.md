@@ -110,16 +110,41 @@ git clone https://github.com/ztztfdsf/ComfyUI-AssembledRecipes
 | 主界面 | 运行（最大生成长度 / 多图取第几张 / 反推前清场 / 结束后卸载）· 画廊标签（喂多少 tag）· 提示词规则 rule（默认收起） |
 | 本地模型 | 模型（`models/LLM`）+ 量化 |
 | DeepSeek 云端 | 账号池列表（禁言/限流/可用徒章 + 单行试跑/移除）、添加账号表单、**思考强度（五档）**、内置网关服务与日志（默认收起） |
-| 自定义端点 | 请求地址、API 密钥、**模型下拉 + 拉取模型列表**、手填模型名（收起）、**思考强度（五档）**、**流式开关（默认非流式）** |
+| 自定义端点 | **本地端点库**（名字/在用徒章/地址/模型/密钥是否已存 + 切到这个/删除）、工作流用的端点下拉、模型下拉 + 拉取模型列表、思考强度、流式开关 |
+
+### 凭据不落工作流、不落图（重要）
+
+以前 `openai_base` / `openai_key` / `openai_model` 是节点的普通 widget，于是它们会：
+
+1. 跟着工作流存进 `user/default/workflows/*.json`；
+2. **被 ComfyUI 写进每张出图 PNG 的 `workflow` 元数据**——把图发给别人就是发 key；
+3. 进 `/history` 与队列存档。
+
+现在这三个 widget 删掉了，换成一个 `endpoint`（只存端点**名字**）；地址/密钥/模型名存在本机：
+
+```
+<ComfyUI>/user/AssembledRecipes/openai_endpoints.json
+  {"endpoints": [{"name": "chenxing.pro", "base": "https://…", "key": "sk-…", "model": "…", "models": […]}],
+   "current": "chenxing.pro"}
+```
+
+- 工作流、PNG 元数据、`/history`、日志里**只会出现名字**；面板与同源路由的回显也只有
+  `has_key` 与前 4 位提示，绝不把密钥往浏览器送。
+- 运行时报错会列出本机可用端点名（「找不到端点 X；本机可用：…」）。
+- 面板改密钥时留空 = 不动已存的那把（所以回显不需要把真值读出来）。
+- DeepSeek 账密 + device_id 同样只存 `user/AssembledRecipes/ds_gateway.json`；
+  旧版曾把它们缓在浏览器 localStorage，现在启动一开机就抹掉那几个键。
+- 验收脚本：`G:\工具等其他文件存放处\ds_probe\leak_test.py`（打一枪后扫 PNG 元数据 /
+  全盘文件 / 日志，除本地端点库外必须 0 命中）。
 
 视觉：一根主色 + 三级灰度 + 1px 发丝线，没有卡片盒；输入框只有下划线，开关细线条，
 次要信息（服务日志、手填模型、规则）一律收进 `details`。
 
 ### 自定义 OpenAI 兼容端点
 
-- **拉模型列表**：`GET {base}/models`（面板同源路由 `/assembled-recipes/ds/models`），
-  结果按 base URL 缓在 localStorage；下拉里永远包含当前值（即使是手填的），
-  拉到的列表若不认当前模型名会自动选第一个。
+- **拉模型列表**：`GET {base}/models`（面板同源路由 `/assembled-recipes/ds/models`）。
+  面板只传**端点名**，后端从本地库取 base/密钥（密钥不过浏览器）；结果缓存回本地库，
+  下拉永远包含当前值，拉到的列表不认当前模型名时自动选第一个。
 - **默认非流式**：反推要的是整块 JSON，流式只会多一层拼接。开了流式就逐帧拼 `delta.content`，
   `reasoning_content`（推理）不会混进正文；若端点声称流式却一帧正文都不给，直接报错提示改回非流式。
 - **思考强度（五档）**：`不思考 / minimal / low / medium / high / max`，**两个云端通道共用一个参数**：
@@ -137,6 +162,8 @@ git clone https://github.com/ztztfdsf/ComfyUI-AssembledRecipes
 反推节点的 `provider = DeepSeek 云端（内置网关）` 用的是插件自带的纯 Python 客户端
 （`reverse_cloud/direct.py` + `pow.py`），**不需要 ds2api.exe、不需要任何 Go/Rust 网关**，
 依赖只有 `httpx / numpy / cryptography`（ComfyUI 环境里本来就有）。
+
+同源控制面：`/assembled-recipes/ds/{status,bind,test,unbind,service,models,endpoints}`（全部只监听本机）。
 
 协议（逐条本机实弹验过）：
 

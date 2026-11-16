@@ -1317,6 +1317,38 @@ def _ds_gateway():
 
 
 # 规则要点：限死框数（防过度分割）、禁止把画廊 tag 逐条变框、desc 120~220 词、坐标用模型原生的 xyxy（清洗节点统一转 yxyx）
+def _endpoint_library():
+    """本机端点库（懒导入，没装依赖也能加载节点）。"""
+    try:
+        from .reverse_cloud import endpoints
+    except ImportError:
+        import importlib as _il, sys as _sys, os as _os
+        _pd = _os.path.dirname(_os.path.abspath(__file__))
+        if _pd not in _sys.path:
+            _sys.path.insert(0, _pd)
+        endpoints = _il.import_module("reverse_cloud.endpoints")
+    return endpoints
+
+
+def _endpoint_names() -> list:
+    try:
+        names = _endpoint_library().names()
+    except Exception:
+        names = []
+    return names or ["（本机还没添加端点）"]
+
+
+def _endpoint_default() -> str:
+    try:
+        lib = _endpoint_library()
+        cur = lib.current_name()
+        if cur and cur in lib.names():
+            return cur
+        return (lib.names() or [""])[0]
+    except Exception:
+        return ""
+
+
 def _effort_to_thinking(effort, default=True):
     """五档强度 → DeepSeek 布尔 thinking（规则只住在 providers.effort_to_thinking 一处）。"""
     try:
@@ -1330,12 +1362,12 @@ def _effort_to_thinking(effort, default=True):
     return providers.effort_to_thinking(effort, default)
 
 
-def _cloud_caption(kind, pil, rule, user_text, base="", key="", model="", thinking=True,
-                   stream=False, effort=""):
+def _cloud_caption(kind, pil, rule, user_text, thinking=True,
+                   stream=False, effort="", endpoint=""):
     """云端反推统一入口（延迟导入，不依赖网络库也能加载节点）。
 
     kind 含 DeepSeek → 走内置纯 Python 网关（进程内，图片走官方 file 通道）；
-    其余（自定义 OpenAI 端点）→ 标准 OpenAI vision 请求。
+    其余（自定义 OpenAI 端点）→ 按端点名字从本地库取 base/密钥/模型名再打标准 OpenAI vision 请求。
     """
     try:
         from .reverse_cloud import providers
@@ -1347,10 +1379,8 @@ def _cloud_caption(kind, pil, rule, user_text, base="", key="", model="", thinki
         providers = _il.import_module("reverse_cloud.providers")
     if "DeepSeek" in str(kind):
         return providers.run_caption("deepseek", pil, rule, user_text, thinking=thinking)
-    env_key = os.environ.get("ASSEMBLED_OPENAI_KEY", "")
     return providers.run_caption("openai", pil, rule, user_text,
-                                 openai_base=base, openai_key=key or env_key,
-                                 openai_model=model, stream=bool(stream), effort=effort or "")
+                                 stream=bool(stream), effort=effort or "", endpoint=endpoint)
 
 
 _LAYOUT_RULE_DEFAULT = (
@@ -1486,10 +1516,13 @@ class ReverseLayoutCaption:
                 # ---- 以下为云端新增项，只能排在旧项后面（见上面顺序注释）----
                 "provider": (["本地模型（transformers）", "DeepSeek 云端（内置网关）", "自定义 OpenAI 兼容端点"],
                              {"default": "本地模型（transformers）",
-                              "tooltip": "本地=进程内跑 models/LLM 下的模型；DeepSeek 云端=插件自带的纯 Python 网关（直连 DeepSeek 官方接口，图片走官方 file 通道，账密在节点面板「账号绑定」里填一次）；自定义=任意 OpenAI 兼容视觉端点"}),
-                "openai_base": ("STRING", {"default": "", "tooltip": "仅自定义端点模式用：请求地址，如 https://api.deepseek.com 或 https://api.openai.com/v1（自动补全 /v1/chat/completions）"}),
-                "openai_key": ("STRING", {"default": "", "tooltip": "仅自定义端点模式用：Bearer 密钥（也可用环境变量 ASSEMBLED_OPENAI_KEY）"}),
-                "openai_model": ("STRING", {"default": "deepseek-v4.1-flash", "tooltip": "仅自定义端点模式用的模型名（内置 DeepSeek 网关自动选自已在用的那个）"}),
+                              "tooltip": "本地=进程内跑 models/LLM 下的模型；DeepSeek 云端=插件自带的纯 Python 网关（直连 DeepSeek 官方接口，图片走官方 file 通道）；自定义=任意 OpenAI 兼容视觉端点"}),
+                # 只存**端点名字**：base / 密钥 / 模型名全部存在本机
+                # user/AssembledRecipes/openai_endpoints.json。以前它们是 widget，于是会跟着
+                # 工作流存盘、被写进每张出图 PNG 的 workflow 元数据、还进 /history。
+                "endpoint": (_endpoint_names(), {"default": _endpoint_default(),
+                                                 "tooltip": "仅自定义端点模式用：选一个本机端点（名字存在工作流里，地址/密钥/模型名只存本机）；"
+                                                           "在节点面板「自定义端点」页添加或修改"}),
                 "deepseek_thinking": ("BOOLEAN", {"default": True, "tooltip": "云端模式的思考开关（DeepSeek 官方只有这一个布尔）。强度档位见「思考强度」：选了档位就以它为准，选「不思考」才轮到这个开关"}),
                 # ---- 自定义端点专用（继续往后追加，不能插中间）----
                 "custom_stream": ("BOOLEAN", {"default": False, "tooltip": "仅自定义端点：流式逐字返回。默认非流式—反推要的是整块 JSON，流式只会多一层拼接；只有端点不支持非流式时才开"}),
@@ -1748,9 +1781,9 @@ class ReverseLayoutCaption:
 
     def caption(self, image, rule, user_prompt, provider="本地模型（transformers）", model_name=None,
                 max_new_tokens=4096, pre_clear=True, offload_after=True,
-                openai_base="", openai_key="", openai_model="deepseek-v4.1-flash", deepseek_thinking=True,
+                deepseek_thinking=True,
                 quant="4bit (NF4，显存最省)", tag_mode="全部（推荐 12B 级大模型）", batch_index=0,
-                custom_stream=False, custom_effort="不思考"):
+                custom_stream=False, custom_effort="不思考", endpoint=""):
         import torch
         provider_local = str(provider).startswith("本地")
         provider_ds = "DeepSeek" in str(provider)
@@ -1770,15 +1803,12 @@ class ReverseLayoutCaption:
                     # 内置纯 Python 网关：图片上传 + DeepSeek 补全（进程内）
                     text_out = _cloud_caption(provider, pil, rule, up_all, thinking=think)
                 else:
-                    # 思考强度优先：选了强度就把 reasoning_effort 发给端点，不再玩模型名后缀；
-                    # 没选强度时沿用旧行为（关掉思考就给模型名拼 -nothinking，内置网关那套命名）
-                    effort = "" if str(custom_effort or "") in ("", "不思考") else str(custom_effort)
-                    model_use = openai_model
-                    if not effort and not deepseek_thinking and "-nothinking" not in model_use:
-                        model_use = model_use.replace("-search", "") + "-nothinking"
+                    # 端点名字→本地库取 base/密钥/模型名；强度选了就以强度说话（发 reasoning_effort）
                     text_out = _cloud_caption(provider, pil, rule, up_all,
-                                              base=openai_base, key=openai_key, model=model_use,
-                                              stream=bool(custom_stream), effort=effort)
+                                              stream=bool(custom_stream),
+                                              effort="" if str(custom_effort or "") in ("", "不思考")
+                                              else str(custom_effort),
+                                              endpoint=str(endpoint or ""))
             except Exception as e:
                 raise RuntimeError(f"云端反推[{provider}] 失败: {e}") from e
             try:

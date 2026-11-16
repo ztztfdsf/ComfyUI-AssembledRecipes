@@ -15,13 +15,27 @@ import { app } from "../../scripts/app.js";
 
 const NODE_CLASS = "ReverseLayoutCaption (AssembledRecipes)";
 const PROP = "arReverseCloud";
-const LS_PASSWORD = "arReverseDeepseekPassword";
-const LS_ACCOUNT = "arReverseDeepseekAccount";
-const LS_DEVICE_ID = "arReverseDeepseekDeviceId";
+const LS_ACCOUNT = "arReverseDeepseekAccount";   // 只记上次输过哪个邮箱（不是秘密）
 const DS_API = "/assembled-recipes/ds"; // 内置网关的控制面（同源，走 ComfyUI 自已在的端口）
-const LS_MODELS = "arReverseOpenaiModels:"; // 自定义端点拉到的模型列表（按 base 分开缓存）
 
 const STYLE_ID = "ar-reverse-cloud-css";
+
+// 旧版把 DeepSeek 密码与 device_id 缓在浏览器 localStorage 里；真值本来就在本机
+// ds_gateway.json，这份缓存没意义而且多一份可读文件 → 见到就抹掉（一次性）。
+const LS_STALE = ["arReverseDeepseekPassword", "arReverseDeepseekDeviceId", "arReverseOpenaiModels"];
+function purgeStaleLocalStorage() {
+	for (const k of LS_STALE) {
+		try {
+			if (localStorage.getItem(k) !== null) localStorage.removeItem(k);
+		} catch (e) { /* 隐私模式等拿不到 localStorage，忽略 */ }
+	}
+	try {
+		for (let i = localStorage.length - 1; i >= 0; i--) {
+			const k = localStorage.key(i);
+			if (k && k.startsWith("arReverseOpenaiModels:")) localStorage.removeItem(k);
+		}
+	} catch (e) { /* 同上 */ }
+}
 const CSS = `
 /* ===== 面板壳（照抄画廊节点的防回环配方）=====
  * .dom-widget 容器高度由 LiteGraph 从 widget 测量回写；壳必须与内容尺寸解耦：
@@ -462,8 +476,6 @@ async function bindAccount(ui) {
 			body: JSON.stringify({ email: account, password, device_id: deviceId }),
 		});
 		localStorage.setItem(LS_ACCOUNT, account);
-		localStorage.setItem(LS_PASSWORD, password);
-		if (deviceId) localStorage.setItem(LS_DEVICE_ID, deviceId);
 		stateFor(ui.node).account = account;
 		saveState(ui.node);
 		if (data.ok) {
@@ -553,29 +565,160 @@ async function toggleService(ui) {
 	}
 }
 
-// ================= 自定义端点：模型列表 =================
+// ================= 本地端点库（地址/密钥/模型名只存本机）=================
+// 为什么这么设：base/key/model 当 widget 时，它们会跟着工作流存盘、被写进每张出图 PNG
+// 的 workflow 元数据（发图=发 key）、还进 /history。现在工作流只带端点**名字**。
+let EP = { current: "", endpoints: [], path: "" };
 
-// 拉到的列表按 base URL 分开缓在 localStorage（不进工作流文件）
-function cachedModels(base) {
-	if (!base) return [];
+async function loadEndpoints(ui) {
 	try {
-		const raw = JSON.parse(localStorage.getItem(LS_MODELS + base) || "[]");
-		return Array.isArray(raw) ? raw.filter((x) => typeof x === "string") : [];
+		const data = await jsonFetch(`${DS_API}/endpoints`, {
+			method: "POST", body: JSON.stringify({ action: "list" }),
+		});
+		if (data.ok) EP = data;
+		renderEndpoints(ui);
 	} catch (e) {
-		return [];
+		if (ui.epList) ui.epList.textContent = "端点库读不到：" + (e.message || e);
 	}
 }
 
+async function saveEndpoint(ui) {
+	const name = ui.epName.value.trim();
+	if (!name) { setStatus(ui, "err", "端点名字不能空"); return; }
+	const body = { action: "save", name, base: ui.epBase.value.trim(), model: ui.epModel.value.trim() };
+	const key = ui.epKey.value.trim();
+	if (key) body.key = key;              // 留空 = 不动已存的那把
+	ui.epSaveBtn.disabled = true;
+	setStatus(ui, "", "正在写进本机的端点库…");
+	try {
+		const data = await jsonFetch(`${DS_API}/endpoints`, { method: "POST", body: JSON.stringify(body) });
+		if (data.ok) {
+			EP = data;
+			ui.epKey.value = "";
+			renderEndpoints(ui);
+			syncEndpointWidget(ui);
+			setStatus(ui, "ok", `已保存端点 ${name}（密钥只存本机文件，工作流与出图元数据里只有名字）`);
+		} else setStatus(ui, "err", "保存失败：" + (data.error || "未知错"));
+	} catch (e) {
+		setStatus(ui, "err", "保存失败：" + (e.message || e));
+	} finally { ui.epSaveBtn.disabled = false; }
+}
+
+async function selectEndpoint(ui, name) {
+	try {
+		const data = await jsonFetch(`${DS_API}/endpoints`, {
+			method: "POST", body: JSON.stringify({ action: "select", name }),
+		});
+		if (data.ok) { EP = data; renderEndpoints(ui); syncEndpointWidget(ui); }
+		else setStatus(ui, "err", "切换失败：" + (data.error || "未知错"));
+	} catch (e) { setStatus(ui, "err", "切换失败：" + (e.message || e)); }
+}
+
+async function deleteEndpoint(ui, name) {
+	try {
+		const data = await jsonFetch(`${DS_API}/endpoints`, {
+			method: "POST", body: JSON.stringify({ action: "delete", name }),
+		});
+		if (data.ok) { EP = data; renderEndpoints(ui); setStatus(ui, "ok", `已删除端点 ${name}`); }
+		else setStatus(ui, "err", "删除失败：" + (data.error || "未知错"));
+	} catch (e) { setStatus(ui, "err", "删除失败：" + (e.message || e)); }
+}
+
+// 把选中的端点名写回 widget（工作流里只会出现这个名字）
+function syncEndpointWidget(ui, name) {
+	const w = widgetOf(ui.node, "endpoint");
+	const val = name || EP.current || (EP.endpoints[0] && EP.endpoints[0].name) || "";
+	if (!w || !val) return;
+	if (!w.options.values.includes(val)) w.options.values.push(val);
+	if (w.value !== val) { w.value = val; w.callback?.(val); saveState(ui.node); }
+	if (ui.epPick) ui.epPick.value = val;
+}
+
+function renderEndpoints(ui) {
+	if (!ui.epList) return;
+	ui.epList.textContent = "";
+	const rows = EP.endpoints || [];
+	if (!rows.length) {
+		ui.epList.append(el("div", "ar-hint", "端点库是空的——下面填名字/地址/密钥点「保存端点」。"));
+	} else {
+		rows.forEach((e) => {
+			const row = el("div", "ar-acct");
+			const dot = el("span", "ar-badge " + (e.name === EP.current ? "ok" : ""),
+				e.name === EP.current ? "在用" : "备用");
+			const mail = el("span", "ar-mail", e.name);
+			const pick = el("button", "ar-mini", "切到这个");
+			pick.addEventListener("click", () => selectEndpoint(ui, e.name));
+			const del = el("button", "ar-mini danger", "删除");
+			del.addEventListener("click", () => deleteEndpoint(ui, e.name));
+			const meta = el("div", "ar-meta",
+				`${e.base || "（没地址）"} · ${e.model || "（没选模型）"} · 密钥${e.has_key ? "已存 " + e.key_hint : "没填"}` +
+				((e.models || []).length ? ` · 拉过 ${e.models.length} 个模型` : ""));
+			row.append(dot, mail, pick, del, meta);
+			ui.epList.append(row);
+		});
+	}
+	const line = el("div", "ar-hint");
+	line.textContent = `本机 ${rows.length} 个端点，当前：${EP.current || "（没选）"}`;
+	ui.epList.append(line);
+	if (ui.epPath) ui.epPath.textContent = EP.path || "";
+	// 工作流里那个端点下拉的选项跟着本地库走
+	if (ui.epPick) {
+		const names = rows.map((x) => x.name);
+		const cur = String(widgetOf(ui.node, "endpoint")?.value || "") || EP.current;
+		const opts = cur && !names.includes(cur) ? [cur, ...names] : names;
+		ui.epPick.textContent = "";
+		for (const nm of opts) ui.epPick.append(el("option", "", nm));
+		if (opts.length) { ui.epPick.value = cur || opts[0]; ui.epPick.disabled = false; }
+		else { ui.epPick.append(el("option", "", "（还没端点）")); ui.epPick.disabled = true; }
+		const w = widgetOf(ui.node, "endpoint");
+		if (w) w.options.values = opts.slice();
+	}
+}
+
+// 拉模型列表：只传端点名，密钥由后端从本地库取（不过浏览器也不进工作流）
+async function fetchModels(ui) {
+	const name = ui.epPick?.value || EP.current || String(widgetOf(ui.node, "endpoint")?.value || "");
+	if (!name) {
+		setStatus(ui, "err", "先在端点库里选一个");
+		return;
+	}
+	ui.modelFetchBtn.disabled = true;
+	setStatus(ui, "", `正在拉 ${name} 的模型列表…`);
+	try {
+		const data = await jsonFetch(`${DS_API}/models`, {
+			method: "POST",
+			body: JSON.stringify({ endpoint: name }),
+		});
+		if (data.ok) {
+			const models = data.models || [];
+			setStatus(ui, "ok", `拿到 ${models.length} 个模型（${data.ms}ms）`);
+			if (models.length) {
+				const hit = models.find((m) => m === (EP.endpoints.find((e) => e.name === name) || {}).model) || models[0];
+				await jsonFetch(`${DS_API}/endpoints`, {
+					method: "POST",
+					body: JSON.stringify({ action: "save", name, model: hit }),
+				});
+				await loadEndpoints(ui);
+				setStatus(ui, "ok", `拿到 ${models.length} 个模型（${data.ms}ms），已选 ${hit}`);
+			}
+		} else {
+			setStatus(ui, "err", "拉取失败：" + (data.error || "未知错"));
+		}
+	} catch (e) {
+		setStatus(ui, "err", "拉取失败：" + (e.message || e));
+	} finally {
+		ui.modelFetchBtn.disabled = false;
+	}
+}
+
+// 模型下拉：选项来自本地库里缓存的那份（拉过一次就有）
 function renderModelSelect(ui) {
-	const node = ui.node;
-	const w = widgetOf(node, "openai_model");
-	const baseW = widgetOf(node, "openai_base");
-	const base = String(baseW?.value || "").trim();
-	const cur = String(w?.value ?? "");
+	const name = ui.epPick?.value || EP.current || String(widgetOf(ui.node, "endpoint")?.value || "");
+	const row = (EP.endpoints || []).find((e) => e.name === name);
 	const sel = ui.modelSel;
 	if (!sel) return;
-	const names = cachedModels(base);
-	// 当前值不在列表里（手填的 / 列表还没拉）也要能显示，不能静默丢
+	const names = (row && row.models) || [];
+	const cur = (row && row.model) || "";
 	const opts = cur && !names.includes(cur) ? [cur, ...names] : names;
 	sel.textContent = "";
 	if (!opts.length) {
@@ -588,53 +731,27 @@ function renderModelSelect(ui) {
 	sel.value = cur || (opts[0] || "");
 	if (ui.modelHint) {
 		ui.modelHint.textContent = opts.length
-			? `当前 ${cur || opts[0]} · 下拉里 ${opts.length} 个可选${names.length ? "" : "（只有手填值，点拉取可补全）"}`
-			: "点「拉取模型列表」从端点 GET /models 取模型；也可以展开下面手填。";
+			? `当前 ${cur || opts[0]} · 下拉里 ${opts.length} 个可选`
+			: "点「拉取模型列表」从端点 GET /models 取模型；也可以下面手填。";
 	}
 }
 
-function setModelValue(ui, value) {
-	const w = widgetOf(ui.node, "openai_model");
-	if (!w) return;
-	w.value = value;
-	w.callback?.(value);
-	saveState(ui.node);
-	renderModelSelect(ui);
-	setStatus(ui, "ok", "模型已选：" + value);
-}
-
-async function fetchModels(ui) {
-	const base = String(widgetOf(ui.node, "openai_base")?.value || "").trim();
-	const key = String(widgetOf(ui.node, "openai_key")?.value || "").trim();
-	if (!base) {
-		setStatus(ui, "err", "先填请求地址");
+async function setModelValue(ui, value) {
+	const name = ui.epPick?.value || EP.current || String(widgetOf(ui.node, "endpoint")?.value || "");
+	if (!name) {
+		setStatus(ui, "err", "先在端点库里选一个");
 		return;
 	}
-	ui.modelFetchBtn.disabled = true;
-	setStatus(ui, "", `正在 GET ${base}/models …`);
+	const row = (EP.endpoints || []).find((e) => e.name === name) || {};
 	try {
-		const data = await jsonFetch(`${DS_API}/models`, {
+		await jsonFetch(`${DS_API}/endpoints`, {
 			method: "POST",
-			body: JSON.stringify({ base, key }),
+			body: JSON.stringify({ action: "save", name, base: row.base || "", model: value }),
 		});
-		if (data.ok) {
-			localStorage.setItem(LS_MODELS + base, JSON.stringify(data.models || []));
-			setStatus(ui, "ok", `拿到 ${(data.models || []).length} 个模型（${data.ms}ms）`);
-			// 当前模型名不在列表里时自动选第一个，免得带着个端点不认的名字跑
-			const w = widgetOf(ui.node, "openai_model");
-			const cur = String(w?.value || "");
-			if ((data.models || []).length && !data.models.includes(cur)) {
-				setModelValue(ui, data.models[0]);
-				setStatus(ui, "ok", `拿到 ${data.models.length} 个模型（${data.ms}ms），已选 ${data.models[0]}`);
-			}
-		} else {
-			setStatus(ui, "err", "拉取失败：" + (data.error || "未知错"));
-		}
+		await loadEndpoints(ui);
+		setStatus(ui, "ok", `模型已存进本机端点库：${name} → ${value}`);
 	} catch (e) {
-		setStatus(ui, "err", "拉取失败：" + (e.message || e));
-	} finally {
-		ui.modelFetchBtn.disabled = false;
-		renderModelSelect(ui);
+		setStatus(ui, "err", "保存失败：" + (e.message || e));
 	}
 }
 
@@ -806,7 +923,7 @@ function buildPanel(node) {
 	fDev.append(el("label", "", "device_id（数美指纹，可留空沿用）"));
 	ui.deviceIdInput = el("input");
 	ui.deviceIdInput.placeholder = "BK…（真实浏览器抓的 89 字串）";
-	ui.deviceIdInput.value = localStorage.getItem(LS_DEVICE_ID) || "";
+	ui.deviceIdInput.placeholder = "BK…（真实浏览器抓的 89 字串；已绑过可留空沿用）";
 	fDev.append(ui.deviceIdInput);
 	r1.append(fDev);
 	acc.append(r1);
@@ -815,7 +932,8 @@ function buildPanel(node) {
 	fPw.append(el("label", "", "密码"));
 	ui.passwordInput = el("input");
 	ui.passwordInput.type = "password";
-	ui.passwordInput.value = localStorage.getItem(LS_PASSWORD) || "";
+	// 密码不回显也不缓：真值只存在本机 ds_gateway.json 里
+	ui.passwordInput.placeholder = "已绑过可留空（留空 = 不动已存的密码）";
 	fPw.append(ui.passwordInput);
 	r2.append(fPw);
 	ui.bindBtn = el("button", "ar-btn pri", "添加并试跑");
@@ -850,18 +968,29 @@ function buildPanel(node) {
 	body.append(pageDs);
 	refreshGatewayInfo(ui);
 
-	// ---- 自定义端点页 ----
+	// ---- 自定义端点页：端点库（地址/密钥/模型名只存本机）----
 	const pageCustom = el("div", "ar-page");
 	const cc = el("div", "ar-card");
 	cc.append(el("div", "cap", "OpenAI 兼容端点"));
-	const baseCtl = ctlText(ui, "openai_base", "请求地址（base URL）", { placeholder: "https://api.deepseek.com" });
-	// 地址一改，模型列表缓存就是另一个端点的了 → 重画下拉
-	baseCtl.querySelector("input").addEventListener("change", () => renderModelSelect(ui));
-	cc.append(baseCtl);
-	cc.append(ctlText(ui, "openai_key", "API 密钥", { placeholder: "sk-..." }));
+	ui.epList = el("div", "ar-accts");
+	cc.append(ui.epList);
+
+	// 工作流里只存这个端点名字
+	const fPick = el("div", "ar-f");
+	fPick.append(el("label", "", "工作流用的端点（只存名字）"));
+	ui.epPick = el("select");
+	ui.epPick.addEventListener("change", () => {
+		selectEndpoint(ui, ui.epPick.value);
+		syncEndpointWidget(ui, ui.epPick.value);
+		renderModelSelect(ui);
+	});
+	fPick.append(ui.epPick);
+	cc.append(fPick);
+
+	// 模型：下拉选 + 拉取（都写进本机库，不写 widget）
 	const mRow = el("div", "ar-row");
 	const fModel = el("div", "ar-f");
-	fModel.append(el("label", "", "模型（下拉选）"));
+	fModel.append(el("label", "", "模型（存本机）"));
 	ui.modelSel = el("select");
 	ui.modelSel.addEventListener("change", () => setModelValue(ui, ui.modelSel.value));
 	fModel.append(ui.modelSel);
@@ -875,16 +1004,57 @@ function buildPanel(node) {
 	cc.append(mRow);
 	ui.modelHint = el("div", "ar-hint");
 	cc.append(ui.modelHint);
-	const mManual = el("details", "ar-details");
-	mManual.append(el("summary", "", "手填模型名（列表里没有时用）"));
-	mManual.append(ctlText(ui, "openai_model", "模型名", { placeholder: "deepseek-v4.1-flash" }));
-	cc.append(mManual);
+
+	// 新增/修改端点
+	const form = el("details", "ar-details");
+	form.append(el("summary", "", "添加 / 修改端点"));
+	const fr1 = el("div", "ar-row");
+	const fName = el("div", "ar-f");
+	fName.append(el("label", "", "名字（写进工作流的就是它）"));
+	ui.epName = el("input");
+	ui.epName.placeholder = "chenxing.pro";
+	fName.append(ui.epName);
+	const fBase = el("div", "ar-f");
+	fBase.append(el("label", "", "请求地址"));
+	ui.epBase = el("input");
+	ui.epBase.placeholder = "https://…/v1";
+	fBase.append(ui.epBase);
+	fr1.append(fName, fBase);
+	form.append(fr1);
+	const fr2 = el("div", "ar-row");
+	const fKey = el("div", "ar-f");
+	fKey.append(el("label", "", "API 密钥（留空 = 不动已存的）"));
+	ui.epKey = el("input");
+	ui.epKey.type = "password";
+	ui.epKey.placeholder = "sk-…（只写进本机文件）";
+	fKey.append(ui.epKey);
+	const fModelName = el("div", "ar-f");
+	fModelName.append(el("label", "", "模型名（可手填）"));
+	ui.epModel = el("input");
+	ui.epModel.placeholder = "gemini-3.6-flash…";
+	fModelName.append(ui.epModel);
+	fr2.append(fKey, fModelName);
+	form.append(fr2);
+	const fr3 = el("div", "ar-row");
+	ui.epSaveBtn = el("button", "ar-btn pri", "保存端点");
+	ui.epSaveBtn.addEventListener("click", () => saveEndpoint(ui));
+	fr3.append(ui.epSaveBtn);
+	const epReload = el("button", "ar-btn", "重读端点库");
+	epReload.addEventListener("click", () => loadEndpoints(ui));
+	fr3.append(epReload);
+	form.append(fr3);
+	ui.epPath = el("div", "ar-hint");
+	form.append(ui.epPath);
+	cc.append(form);
+
 	cc.append(ctlSelect(ui, "custom_effort", "思考强度（五档）"));
 	cc.append(el("div", "ar-hint", "原值发给端点的 reasoning_effort；端点不认这个字段会自动去掉重打，不会当成“端点挂了”。"));
 	cc.append(ctlToggle(ui, "custom_stream", "流式返回（默认非流式）"));
-	cc.append(el("div", "ar-hint", "反推要的是整块 JSON，非流式最直接；只有端点不支持非流式时才开流式"));
+	cc.append(el("div", "ar-hint", "反推要的是整块 JSON，非流式最直接；只有端点不支持非流式时才开流式。"));
+	cc.append(el("div", "ar-hint", "地址/密钥/模型名只存本机文件，不进工作流、不进 PNG 元数据、不进日志；分享工作流或图都不会泄 key。"));
 	pageCustom.append(cc);
 	body.append(pageCustom);
+	loadEndpoints(ui);
 	renderModelSelect(ui);
 
 	body.append(ui.status);
@@ -919,7 +1089,7 @@ function buildPanel(node) {
 		saveState(node);
 		applyView();
 		if (st.provider === "ds") refreshGatewayInfo(ui);
-		if (st.provider === "custom") renderModelSelect(ui);
+		if (st.provider === "custom") { loadEndpoints(ui); renderModelSelect(ui); }
 	});
 
 	function applyProvider() {
@@ -939,6 +1109,10 @@ function buildPanel(node) {
 
 app.registerExtension({
 	name: "AssembledRecipes.ReverseCloudPanel",
+
+	async init() {
+		purgeStaleLocalStorage();
+	},
 
 	beforeRegisterNodeDef(nodeType, nodeData) {
 		if (nodeData?.name !== NODE_CLASS) return;

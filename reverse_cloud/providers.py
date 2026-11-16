@@ -175,12 +175,14 @@ def _openai_chat(base_url: str, api_key: str, model: str, system: str, user_text
 def run_caption(provider: str, pil, system_rule: str, user_text: str,
                 local_runner=None, openai_base: str = "", openai_key: str = "",
                 openai_model: str = "", thinking: bool = True,
-                stream: bool = False, effort: str = "") -> str:
+                stream: bool = False, effort: str = "", endpoint: str = "") -> str:
     """provider: local / deepseek / openai。
 
     local:    调 local_runner(pil, system_rule, user_text)（节点里现有的 transformers 路径）
     deepseek: 内置网关——真实图片上传 + DeepSeek 补全（进程内直调，不开端口也能用）
-    openai:   标准视觉 chat.completions（任意 OpenAI 兼容端点）
+    openai:   标准视觉 chat.completions（任意 OpenAI 兼容端点）；
+              给了 endpoint 就从本地端点库取 base/key/model（密钥不进工作流也不进日志），
+              直传的 base/key 只当覆盖项用。
     """
     if provider == "local":
         if local_runner is None:
@@ -193,6 +195,15 @@ def run_caption(provider: str, pil, system_rule: str, user_text: str,
             import gateway  # type: ignore
         return gateway.caption(pil, system_rule, user_text, thinking=thinking)
     if provider == "openai":
+        if endpoint and endpoint != "（工作流内联）":
+            try:
+                from . import endpoints
+            except ImportError:
+                import endpoints  # type: ignore
+            row = endpoints.resolve(endpoint)   # 取不到会报错并列出可用名字
+            openai_base = openai_base or row["base"]
+            openai_key = openai_key or (row.get("key") or "")
+            openai_model = openai_model or (row.get("model") or "")
         return _openai_chat(openai_base, openai_key, openai_model, system_rule, user_text, pil,
                             stream=stream, effort=effort)
     raise ProviderError(f"未知 provider: {provider}")
