@@ -110,6 +110,22 @@ details.ar-card[open]>summary { margin-bottom: 6px; }
 .ar-status.ok { color: #7bd88a; }
 .ar-status.err { color: #ff7373; }
 
+/* 账号池列表 */
+.ar-accts { display: flex; flex-direction: column; gap: 4px; margin: 2px 0 6px; }
+.ar-acct { display: grid; grid-template-columns: auto 1fr auto auto; gap: 6px; align-items: center;
+  padding: 4px 6px; background: rgba(255,255,255,.045); border-radius: 6px; font-size: 11px; }
+.ar-badge { font-size: 10px; padding: 1px 6px; border-radius: 999px; white-space: nowrap;
+  background: rgba(255,255,255,.10); color: #d8dee9; }
+.ar-badge.ok { background: rgba(96,190,110,.20); color: #86e08f; }
+.ar-badge.err { background: rgba(220,90,90,.22); color: #ff9090; }
+.ar-badge.busy { background: rgba(220,180,70,.20); color: #f0cf7a; }
+.ar-mail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .95; }
+.ar-meta { grid-column: 1 / -1; font-size: 10px; opacity: .55; margin: -2px 0 0 2px; }
+.ar-acct .ar-mini { font-size: 10px; padding: 2px 7px; border-radius: 5px; border: 1px solid rgba(255,255,255,.16);
+  background: rgba(255,255,255,.06); color: inherit; cursor: pointer; }
+.ar-acct .ar-mini:hover { filter: brightness(1.3); }
+.ar-acct .ar-mini.danger { border-color: rgba(220,90,90,.45); color: #ff9090; }
+
 .ar-page { display: flex; flex-direction: column; gap: 12px; }
 .ar-page.hidden { display: none; }
 `;
@@ -265,11 +281,76 @@ function ctlToggle(ui, name, labelText) {
 	return row;
 }
 
-// ================= 账号绑定 / 测试 =================
+// ================= 账号池（多账号轮巡）=================
 
 function setStatus(ui, cls, text) {
 	ui.status.textContent = text;
 	ui.status.className = "ar-status" + (cls ? " " + cls : "");
+}
+
+const STATE_TEXT = {
+	ready: ["可用", "ok"],
+	muted: ["禁言", "err"],
+	cooling: ["限流冷却", "busy"],
+	no_device_id: ["缺 device_id", "err"],
+};
+
+// 账号列表：每行一个，绿=可用、红=禁言（带解禁时间）、黄=限流冷却
+function renderAccounts(ui, st) {
+	if (!ui.acctList) return;
+	const rows = (st && st.accounts) || [];
+	ui.acctList.textContent = "";
+	if (!rows.length) {
+		ui.acctList.append(el("div", "ar-hint", "账号池是空的——下面填一个邮箱+密码点「添加并试跑」。多个账号会自动轮巡。"));
+		return;
+	}
+	rows.forEach((a) => {
+		const row = el("div", "ar-acct");
+		const [txt, cls] = STATE_TEXT[a.state] || [a.state, ""];
+		const dot = el("span", "ar-badge " + cls, txt);
+		if (a.state === "muted" && a.muted_until_text) dot.title = "解禁时间 " + a.muted_until_text;
+		if (a.state === "cooling" && a.cooldown_until) dot.title = "冷却到 " + fmtWhen(a.cooldown_until);
+		const mail = el("span", "ar-mail", a.email);
+		const meta = el("span", "ar-meta",
+			(a.served ? "跑过" + a.served + "次" : "还没跑过") +
+			(a.fail_streak ? " · 连败" + a.fail_streak : "") +
+			(!a.has_device_id ? " · 无 device_id" : ""));
+		if (a.state === "muted") meta.textContent += " · 到 " + a.muted_until_text;
+		const tBtn = el("button", "ar-mini", "试跑");
+		tBtn.addEventListener("click", () => testAccount(ui, a.email));
+		const xBtn = el("button", "ar-mini danger", "移除");
+		xBtn.addEventListener("click", () => removeAccount(ui, a.email));
+		row.append(dot, mail, tBtn, xBtn, meta);
+		ui.acctList.append(row);
+	});
+	const line = el("div", "ar-hint");
+	const total = rows.length;
+	if (st.ready > 0) {
+		line.textContent = `池内 ${total} 个，${st.ready} 个可用，按顺序轮巡（上一个跑完自动转下一个，风控压力摊开）` +
+			(st.last_account ? ` · 上一次用的是 ${st.last_account}` : "");
+	} else if (total === 1) {
+		line.textContent = "唯一账号不可用" + (st.recover_text ? `，最早 ${st.recover_text} 恢复` : "") +
+			"——再添加一个就能接着跑";
+	} else {
+		line.textContent = `池内 ${total} 个全部不可用` + (st.recover_text ? `，最早 ${st.recover_text} 恢复` : "");
+	}
+	ui.acctList.append(line);
+}
+
+function fmtWhen(ts) {
+	const d = new Date(ts * 1000);
+	return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+async function removeAccount(ui, email) {
+	setStatus(ui, "", "正在从账号池移除 " + email + "…");
+	try {
+		const data = await jsonFetch(`${DS_API}/unbind`, { method: "POST", body: JSON.stringify({ email }) });
+		setStatus(ui, data.ok ? "ok" : "err", data.ok ? `已移除 ${email}` : ("移除失败：" + (data.error || "未知错")));
+		refreshGatewayInfo(ui);
+	} catch (e) {
+		setStatus(ui, "err", "移除失败：" + (e.message || e));
+	}
 }
 
 async function bindAccount(ui) {
@@ -284,7 +365,7 @@ async function bindAccount(ui) {
 	ui.dot.className = "ar-dot busy";
 	setStatus(ui, "", "正在绑定账号到内置网关…");
 	try {
-		const data = await jsonFetch(`${DS_API}/bind`, {
+	const data = await jsonFetch(`${DS_API}/bind`, {
 			method: "POST",
 			body: JSON.stringify({ email: account, password, device_id: deviceId }),
 		});
@@ -295,10 +376,10 @@ async function bindAccount(ui) {
 		saveState(ui.node);
 		if (data.ok) {
 			ui.dot.className = "ar-dot ok";
-			setStatus(ui, "ok", `绑定成功，登录+试跑 ${data.ms}ms（回：${data.echo || "ok"}）`);
+			setStatus(ui, "ok", `已加入账号池并试跑成功，登录+一枪 ${data.ms}ms（回：${data.echo || "ok"}）`);
 		} else {
 			ui.dot.className = "ar-dot err";
-			setStatus(ui, "err", "绑定失败：" + (data.error || "未知错"));
+			setStatus(ui, "err", "这个账号不通：" + (data.error || "未知错") + "（已存进池子，可随时再试跑）");
 		}
 		refreshGatewayInfo(ui);
 	} catch (e) {
@@ -309,17 +390,17 @@ async function bindAccount(ui) {
 	}
 }
 
-async function testAccount(ui, { silent = false } = {}) {
+async function testAccount(ui, email) {
 	ui.testBtn.disabled = true;
 	ui.dot.className = "ar-dot busy";
-	if (!silent) setStatus(ui, "", "内置网关登录 + 跑一枪极小补全…");
+	setStatus(ui, "", email ? `正在试跑 ${email}…` : "内置网关登录 + 跑一枪极小补全（用第一个可用账号）…");
 	try {
 		const t0 = performance.now();
-		const data = await jsonFetch(`${DS_API}/test`, { method: "POST", body: "{}" });
+		const data = await jsonFetch(`${DS_API}/test`, { method: "POST", body: JSON.stringify({ email: email || "" }) });
 		const ms = Math.round(performance.now() - t0);
 		if (data.ok) {
 			ui.dot.className = "ar-dot ok";
-			setStatus(ui, "ok", `连通正常（${data.ms}ms，${data.model}）`);
+			setStatus(ui, "ok", `连通正常（${data.email || ""} · ${data.ms}ms，${data.model}）`);
 		} else {
 			ui.dot.className = "ar-dot err";
 			setStatus(ui, "err", "不通：" + (data.error || "未知错"));
@@ -351,11 +432,13 @@ async function refreshGatewayInfo(ui) {
 	}
 	if (ui.svcBtn) ui.svcBtn.textContent = st.running ? "停掉服务" : "拉起服务";
 	if (ui.dot && !ui.bindBtn.disabled && !ui.testBtn.disabled) {
-		ui.dot.className = "ar-dot " + (st.bound && st.running ? "ok" : st.running ? "" : "err");
+		// 灯色跟池子实况走：有可用账号=绿，服务在但池子全忙=红，服务没起=红
+		ui.dot.className = "ar-dot " + (st.running && st.ready > 0 ? "ok" : "err");
 	}
 	if (ui.accountInput && !ui.accountInput.value && st.email) ui.accountInput.value = st.email;
 	if (ui.deviceIdInput && !ui.deviceIdInput.value && st.has_device_id) ui.deviceIdInput.placeholder = "已绑过 device_id（留空则沿用）";
 	if (ui.svcLogs) ui.svcLogs.textContent = (st.logs || []).join("\n");
+	renderAccounts(ui, st);
 	return st;
 }
 
@@ -519,7 +602,9 @@ function buildPanel(node) {
 	// ---- 云端页 ----
 	const pageDs = el("div", "ar-page");
 	const acc = el("div", "ar-card");
-	acc.append(el("div", "cap", "DeepSeek 账号（账密存插件本地配置，不进日志也不进工作流文件）"));
+	acc.append(el("div", "cap", "DeepSeek 账号池（多个账号自动轮巡；账密存插件本地配置，不进日志也不进工作流文件）"));
+	ui.acctList = el("div", "ar-accts");
+	acc.append(ui.acctList);
 	const r1 = el("div", "ar-row");
 	const fAcc = el("div", "ar-f");
 	fAcc.append(el("label", "", "邮箱 / 手机号"));
@@ -543,13 +628,13 @@ function buildPanel(node) {
 	ui.passwordInput.value = localStorage.getItem(LS_PASSWORD) || "";
 	fPw.append(ui.passwordInput);
 	r2.append(fPw);
-	ui.bindBtn = el("button", "ar-btn pri", "绑定并试跑");
+	ui.bindBtn = el("button", "ar-btn pri", "添加并试跑");
 	ui.bindBtn.addEventListener("click", () => bindAccount(ui));
 	r2.append(ui.bindBtn);
 	acc.append(r2);
 	const r3 = el("div", "ar-row");
-	ui.testBtn = el("button", "ar-btn", "测试连通");
-	ui.testBtn.addEventListener("click", () => testAccount(ui));
+	ui.testBtn = el("button", "ar-btn", "试跑可用账号");
+	ui.testBtn.addEventListener("click", () => testAccount(ui, ""));
 	r3.append(ui.testBtn);
 	ui.svcBtn = el("button", "ar-btn", "服务状态待读");
 	ui.svcBtn.addEventListener("click", () => toggleService(ui));

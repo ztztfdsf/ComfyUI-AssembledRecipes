@@ -34,16 +34,19 @@ PORT_DEFAULT = 5812
 MODEL_MAIN = "deepseek-v4.1-flash"
 MODELS = [MODEL_MAIN, MODEL_MAIN + "-nothinking", MODEL_MAIN + "-search"]
 
-_CONFIG_LOCK = threading.Lock()
+# 可重入：_persist_account 拿锁后还要调 save_config（再拿一次），普通 Lock 会当场死锁（实测卡死过）
+_CONFIG_LOCK = threading.RLock()
 _STATE = {
     "server": None,
     "thread": None,
     "port": None,
-    "client": None,
+    "clients": {},
+    "cursor": 0,
     "error": "",
     "started_at": 0.0,
     "requests": 0,
     "last_ms": 0.0,
+    "last_account": "",
 }
 _LOG = deque(maxlen=200)
 
@@ -97,28 +100,175 @@ def gateway_base() -> str:
     return "http://127.0.0.1:%d/v1" % (load_config().get("port") or PORT_DEFAULT)
 
 
-# ============================ 账号客户端 ============================
+# ============================ 账号池（多账号轮巡）============================
+#
+# 一个 DeepSeek 账号的额度/风控是共享的（实测：单账号连打几小时会被 mute 3 天），
+# 所以这里把账号当池子用：
+#   · 平时按 cursor 往后转（round-robin），不拆死第一号——把风控压力摊开
+#   · 哪个账号被禁言 → 按上游给的 mute_until 直接跳过（到期自动回来）
+#   · 哪个账号被限流 → 短冷却（默认 120s）后跳过
+#   · 全池都不可用 → 报错文案里列出每个账号的状态与最早恢复时间
+# 账密只存本地 user/AssembledRecipes/ds_gateway.json，不进工作流、不进日志。
 
-def get_client() -> direct.DeepSeekClient:
+_COOLDOWN_S = 120.0        # 限流后该账号暂时不用的时长
+_MUTE_FALLBACK_S = 6 * 3600.0   # 上游没给 mute_until 时的保守估计
+
+
+def _blank_account() -> dict:
+    return {"email": "", "password": "", "device_id": "",
+            "added_at": time.time(), "muted_until": 0.0,
+            "cooldown_until": 0.0, "fail_streak": 0, "served": 0, "last_ok_at": 0.0}
+
+
+def accounts(cfg: dict | None = None) -> list:
+    """读账号列表；旧单账号形状（顶层 email/password）在这里一次性折进去并落盘。"""
+    cfg = load_config() if cfg is None else cfg
+    lst = cfg.get("accounts")
+    if not isinstance(lst, list):
+        lst = []
+        legacy = str(cfg.get("email") or cfg.get("account") or "").strip()
+        if legacy and cfg.get("password"):
+            a = _blank_account()
+            a.update({"email": legacy, "password": str(cfg["password"]),
+                      "device_id": str(cfg.get("device_id") or "")})
+            lst.append(a)
+            for k in ("email", "account", "password", "device_id"):
+                cfg.pop(k, None)
+            cfg["accounts"] = lst
+            save_config(cfg)
+            _log("旧单账号配置已折成账号池：%s" % legacy)
+        return lst
+    out = []
+    for a in lst:
+        if isinstance(a, dict) and str(a.get("email") or "").strip() and a.get("password"):
+            a.setdefault("device_id", "")
+            for k, dv in (("muted_until", 0.0), ("cooldown_until", 0.0), ("fail_streak", 0),
+                          ("served", 0), ("last_ok_at", 0.0), ("added_at", time.time())):
+                a.setdefault(k, dv)
+            out.append(a)
+    return out
+
+
+def _persist_account(acct: dict):
+    """把运行时状态（禁言/冷却/计数）写回配置，重启后还记得。"""
+    with _CONFIG_LOCK:
+        cfg = load_config()
+        lst = cfg.get("accounts")
+        if not isinstance(lst, list):
+            lst = accounts(cfg)          # 已经落盘成列表的形态
+            cfg["accounts"] = lst
+        hit = False
+        for row in lst:
+            if isinstance(row, dict) and str(row.get("email", "")).strip() == acct["email"]:
+                row.update({k: acct[k] for k in
+                            ("password", "device_id", "muted_until", "cooldown_until",
+                             "fail_streak", "served", "last_ok_at", "added_at") if k in acct})
+                hit = True
+                break
+        if not hit:
+            lst.append(acct)
+        cfg["accounts"] = lst
+        for k in ("email", "account", "password", "device_id"):
+            cfg.pop(k, None)
+        save_config(cfg)
+
+
+def account_state(a: dict, now: float | None = None) -> str:
+    now = time.time() if now is None else now
+    if float(a.get("muted_until") or 0) > now:
+        return "muted"
+    if float(a.get("cooldown_until") or 0) > now:
+        return "cooling"
+    if not str(a.get("device_id") or "").strip():
+        return "no_device_id"
+    return "ready"
+
+
+def _fmt_when(ts: float) -> str:
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(float(ts)).strftime("%m-%d %H:%M")
+
+
+def client_for(a: dict) -> direct.DeepSeekClient:
+    """一个账号一个长驻 client（token 缓存复用，避免每枪都登录）。"""
     cfg = load_config()
-    account = str(cfg.get("email") or cfg.get("account") or "").strip()
-    password = str(cfg.get("password") or "").strip()
-    device_id = str(cfg.get("device_id") or "").strip()
-    if not account or not password:
-        raise direct.DeepSeekError("还没有绑定 DeepSeek 账号（在节点面板的「账号绑定」里填一次）")
-    if not device_id:
-        raise direct.DeepSeekError("缺少 device_id：必须是真实浏览器抓到的数美指纹，编造的会被上游判 RISK_DEVICE_DETECTED")
-    client = _STATE.get("client")
-    if client and client.account == account and client.device_id == device_id:
-        return client
-    if client:
+    pool = _STATE.setdefault("clients", {})
+    key = a["email"]
+    c = pool.get(key)
+    if c and c.password == a["password"] and c.device_id == a["device_id"]:
+        return c
+    if c:
         try:
-            client.close()
+            c.close()
         except Exception:
             pass
-    client = direct.DeepSeekClient(account, password, device_id, proxy=cfg.get("proxy") or None)
-    _STATE["client"] = client
-    return client
+    c = direct.DeepSeekClient(a["email"], a["password"], a["device_id"],
+                              proxy=cfg.get("proxy") or None)
+    pool[key] = c
+    return c
+
+
+def with_account(fn, what: str):
+    """在账号池里挑一个能用的跑 fn(client, account)；禁言/限流就自动换下一个。
+
+    fn 的返回值原样传出；抛 DeepSeekError 时按类型记账：
+      muted → 记下 mute_until（上游给了就用真值），长期跳过
+      rate  → 短冷却，本轮跳过
+      其余  → 直接报（不是换账号能解决的事）
+    """
+    pool = accounts()
+    if not pool:
+        raise direct.DeepSeekError("还没有绑定 DeepSeek 账号（在节点面板「账号池」里添加）")
+    now = time.time()
+    order = list(pool)
+    cursor = int(_STATE.get("cursor") or 0) % len(order)
+    order = order[cursor:] + order[:cursor]
+    tried = []
+    for a in order:
+        st = account_state(a, now)
+        if st != "ready":
+            continue
+        tried.append(a["email"])
+        try:
+            out = fn(client_for(a), a)
+        except direct.DeepSeekError as e:
+            if e.muted:
+                until = float(getattr(e, "mute_until", 0) or 0) or (now + _MUTE_FALLBACK_S)
+                a["muted_until"] = until
+                a["fail_streak"] = int(a.get("fail_streak") or 0) + 1
+                _persist_account(a)
+                _log("%s 被禁言到 %s，转下一个账号" % (a["email"], _fmt_when(until)))
+                continue
+            if e.rate_limited:
+                a["cooldown_until"] = now + _COOLDOWN_S
+                a["fail_streak"] = int(a.get("fail_streak") or 0) + 1
+                _persist_account(a)
+                _log("%s 被限流，冷却 %ds 后转下一个" % (a["email"], int(_COOLDOWN_S)))
+                continue
+            raise
+        a["served"] = int(a.get("served") or 0) + 1
+        a["last_ok_at"] = time.time()
+        a["fail_streak"] = 0
+        a["cooldown_until"] = 0.0
+        # cursor 存的是“池里的下标”，不是旋转后 order 的下标（之前算错了导致
+        # 第二枪之后永远钉在同一个账号上，轮巡变成拆死一号）
+        _STATE["cursor"] = (pool.index(a) + 1) % len(pool)
+        _persist_account(a)
+        _STATE["last_account"] = a["email"]
+        return out
+    # 整池都不可用：把每个账号的状态摊开报出去，不要只说“失败了”
+    detail = []
+    for a in pool:
+        st = account_state(a, now)
+        if st == "muted":
+            detail.append("%s 禁言到 %s" % (a["email"], _fmt_when(a["muted_until"])))
+        elif st == "cooling":
+            detail.append("%s 限流冷却到 %s" % (a["email"], _fmt_when(a["cooldown_until"])))
+        elif st == "no_device_id":
+            detail.append("%s 缺 device_id" % a["email"])
+        else:
+            detail.append("%s 可用但本轮已试过" % a["email"])
+    raise direct.DeepSeekError("DeepSeek 账号池暂时全部不可用（%d 个）：%s" % (len(pool), "；".join(detail)))
 
 
 # ============================ 给反推节点的直接入口 ============================
@@ -171,16 +321,19 @@ def caption(pil, system_rule: str = "", user_text: str = "", thinking: bool = Tr
     parts.append("现在看上传的这张图，严格按上面规则输出布局 JSON（只输出 JSON，不要任何解释）。")
     prompt = "\n\n".join(parts)
 
-    client = get_client()
-    t0 = time.time()
-    file_id = client.upload_image(buf.getvalue(), filename="layout.jpg", content_type="image/jpeg")
-    result = client.completion(prompt, file_ids=[file_id], thinking=bool(thinking),
-                              ensure=_json_array_complete)
-    ms = round((time.time() - t0) * 1000.0, 1)
-    _STATE["last_ms"] = ms
-    _STATE["requests"] += 1
-    _log("caption ok %dms 出字%d 思考%s" % (ms, len(result["text"]), "on" if thinking else "off"))
-    return result["text"]
+    def job(client, acct):
+        t0 = time.time()
+        file_id = client.upload_image(buf.getvalue(), filename="layout.jpg", content_type="image/jpeg")
+        result = client.completion(prompt, file_ids=[file_id], thinking=bool(thinking),
+                                   ensure=_json_array_complete)
+        ms = round((time.time() - t0) * 1000.0, 1)
+        _STATE["last_ms"] = ms
+        _STATE["requests"] += 1
+        _log("caption ok %dms 出字%d 思考%s 账号%s" %
+              (ms, len(result["text"]), "on" if thinking else "off", acct["email"]))
+        return result["text"]
+
+    return with_account(job, "caption")
 
 
 # ============================ OpenAI 兼容层 ============================
@@ -233,43 +386,56 @@ def run_completion(body: dict) -> dict:
     if not prompt:
         raise direct.DeepSeekError("messages 里没有文本内容")
     model, thinking, search = _model_flags(body.get("model"))
-    client = get_client()
-    t0 = time.time()
-    file_ids = []
-    for blob in images[:5]:
-        file_ids.append(client.upload_image(blob))
-    result = client.completion(prompt, file_ids=file_ids, thinking=thinking, search=search)
-    ms = round((time.time() - t0) * 1000.0, 1)
-    _STATE["last_ms"] = ms
-    _STATE["requests"] += 1
-    _log("completion ok %dms 图%d张 出字%d" % (ms, len(file_ids), len(result["text"])))
-    return {
-        "id": "chatcmpl-" + secrets.token_hex(12),
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": result["text"]},
-            "finish_reason": "stop",
-        }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    }
+    def job(client, acct):
+        t0 = time.time()
+        file_ids = []
+        for blob in images[:5]:
+            file_ids.append(client.upload_image(blob))
+        result = client.completion(prompt, file_ids=file_ids, thinking=thinking, search=search)
+        ms = round((time.time() - t0) * 1000.0, 1)
+        _STATE["last_ms"] = ms
+        _STATE["requests"] += 1
+        _log("completion ok %dms 图%d张 出字%d 账号%s" %
+              (ms, len(file_ids), len(result["text"]), acct["email"]))
+        return {
+            "id": "chatcmpl-" + secrets.token_hex(12),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": result["text"]},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+    return with_account(job, "completion")
 
 
 def stream_completion(body: dict):
     """流式：按 OpenAI SSE 逐块吐字（上游本身就是逐 token 推的）。"""
     prompt, images = _extract_prompt_and_images(body)
     model, thinking, search = _model_flags(body.get("model"))
-    client = get_client()
-    file_ids = [client.upload_image(b) for b in images[:5]]
-    cid = "chatcmpl-" + secrets.token_hex(12)
     box = {"done": False, "err": None, "text": []}
+    holder = {}
+
+    def job(client, acct):        # 传图阶段可以换账号；一旦开始吐字就钉死当前账号
+        holder.update(client=client, acct=acct,
+                      file_ids=[client.upload_image(b) for b in images[:5]])
+        return True
+
+    with_account(job, "stream-setup")
+    client, acct = holder["client"], holder["acct"]
+    file_ids = holder["file_ids"]
+    cid = "chatcmpl-" + secrets.token_hex(12)
 
     def worker():
         try:
             client.completion(prompt, file_ids=file_ids, thinking=thinking, search=search,
                               on_delta=lambda s: box["text"].append(s))
+            _STATE["requests"] += 1
+            _log("stream ok 出字%d 账号%s" % (sum(len(x) for x in box["text"]), acct["email"]))
         except Exception as e:
             box["err"] = e
         finally:
@@ -381,13 +547,38 @@ class _Handler(BaseHTTPRequestHandler):
 
 def status_payload() -> dict:
     cfg = load_config()
+    pool = accounts()
+    now = time.time()
+    rows = []
+    for a in pool:
+        st = account_state(a, now)
+        rows.append({
+            "email": a["email"],
+            "state": st,
+            "has_device_id": bool(str(a.get("device_id") or "").strip()),
+            "muted_until": float(a.get("muted_until") or 0),
+            "muted_until_text": (_fmt_when(a["muted_until"]) if st == "muted" else ""),
+            "cooldown_until": float(a.get("cooldown_until") or 0),
+            "served": int(a.get("served") or 0),
+            "fail_streak": int(a.get("fail_streak") or 0),
+            "last_ok_at": float(a.get("last_ok_at") or 0),
+        })
+    ready = [r for r in rows if r["state"] == "ready"]
+    recover = min([r["muted_until"] for r in rows if r["state"] == "muted"]
+                  + [r["cooldown_until"] for r in rows if r["state"] == "cooling"]
+                  or [0.0])
     out = {
         "running": _STATE["server"] is not None,
         "port": _STATE["port"] or cfg.get("port") or PORT_DEFAULT,
         "base": gateway_base(),
-        "bound": bool(cfg.get("email") and cfg.get("password")),
-        "email": str(cfg.get("email") or ""),
-        "has_device_id": bool(cfg.get("device_id")),
+        "bound": bool(ready),
+        "accounts": rows,
+        "ready": len(ready),
+        "recover_at": recover,
+        "recover_text": (_fmt_when(recover) if recover > now else ""),
+        "last_account": _STATE.get("last_account") or "",
+        "email": (ready[0]["email"] if ready else (rows[0]["email"] if rows else "")),
+        "has_device_id": bool(ready and ready[0]["has_device_id"]),
         "models": MODELS,
         "requests": _STATE["requests"],
         "last_ms": _STATE["last_ms"],
@@ -404,33 +595,80 @@ def status_payload() -> dict:
 
 
 def bind(body: dict) -> dict:
+    """添加/更新一个账号（同邮箱就地更新密码与 device_id），加完立即试跑这一号。"""
     email = str(body.get("email") or body.get("account") or "").strip()
     password = str(body.get("password") or "").strip()
     device_id = str(body.get("device_id") or "").strip()
-    cfg = load_config()
     if not email or not password:
         return {"ok": False, "error": "邮箱/密码不能为空"}
-    cfg.update({"email": email, "password": password})
+    pool = accounts()
+    hit = next((a for a in pool if a["email"] == email), None)
+    is_new = hit is None
+    if is_new:
+        hit = _blank_account()
+        hit["email"] = email
+        pool.append(hit)
+    hit["password"] = password
     if device_id:
-        cfg["device_id"] = device_id
+        hit["device_id"] = device_id
+    hit["muted_until"] = 0.0
+    hit["cooldown_until"] = 0.0
+    hit["fail_streak"] = 0
+    cfg = {k: v for k, v in load_config().items() if k != "accounts"}
+    cfg["accounts"] = pool
     cfg.setdefault("api_key", api_key())
     cfg.setdefault("port", PORT_DEFAULT)
     save_config(cfg)
-    _STATE["client"] = None
-    _log("绑定账号 %s（密码已存本地配置，不进日志）" % email)
-    return test_connectivity()
+    _log("账号池 %s %s（池内 %d 个，密码只存本地）" % ("新增" if is_new else "更新", email, len(pool)))
+    return test_connectivity(email)
 
 
-def test_connectivity() -> dict:
+def unbind(email: str = "") -> dict:
+    """解绑：给了 email 只删那一个，没给就清空整池。"""
+    pool = accounts()
+    if email:
+        left = [a for a in pool if a["email"] != email]
+    else:
+        left = []
+    cfg = {k: v for k, v in load_config().items() if k != "accounts"}
+    cfg["accounts"] = left
+    save_config(cfg)
+    for key in ([email] if email else [a["email"] for a in pool]):
+        c = _STATE.get("clients", {}).pop(key, None)
+        if c:
+            try:
+                c.close()
+            except Exception:
+                pass
+    _log("已从账号池移除 %s（剩 %d 个）" % (email or "全部账号", len(left)))
+    return {"ok": True, "accounts": len(left)}
+
+
+def test_connectivity(email: str = "") -> dict:
+    """测一个账号（不填就用池里第一个可用的）。"""
     t0 = time.time()
+    pool = accounts()
+    if email:
+        pool = [a for a in pool if a["email"] == email] or pool
     try:
-        client = get_client()
+        if not pool:
+            raise direct.DeepSeekError("账号池是空的")
+        acct = next((a for a in pool if account_state(a) == "ready"), pool[0])
+        client = client_for(acct)
         client.login()
         result = client.completion("只回答两个字：收到")
         ms = round((time.time() - t0) * 1000.0, 1)
+        acct["fail_streak"] = 0
+        acct["cooldown_until"] = 0.0
+        acct["muted_until"] = 0.0
+        acct["last_ok_at"] = time.time()
+        acct["served"] = int(acct.get("served") or 0) + 1
+        _persist_account(acct)
         _STATE["error"] = ""
-        _log("连通正常 %dms" % ms)
-        return {"ok": True, "ms": ms, "model": MODEL_MAIN, "echo": result["text"][:20]}
+        _STATE["last_account"] = acct["email"]
+        _log("连通正常 %dms（%s）" % (ms, acct["email"]))
+        return {"ok": True, "ms": ms, "model": MODEL_MAIN, "email": acct["email"],
+                "echo": result["text"][:20]}
     except Exception as e:
         _STATE["error"] = str(e)[:300]
         _log("连通失败: %s" % (e,))
@@ -474,13 +712,19 @@ def stop():
 
 
 def stop_and_unbind():
-    """解除绑定同时把账号从本地配置抹掉（面板「解除绑定」按钮）。"""
-    cfg = load_config()
-    for k in ("email", "password", "device_id"):
-        cfg.pop(k, None)
+    """停服务 + 清空整池账密（面板「解除绑定」按钮）。"""
+    n = len(accounts())
+    cfg = {k: v for k, v in load_config().items() if k != "accounts"}
+    cfg["accounts"] = []
     save_config(cfg)
-    _STATE["client"] = None
-    _log("已解除账号绑定（本地配置里的账密已抹掉）")
+    for c in _STATE.get("clients", {}).values():
+        try:
+            c.close()
+        except Exception:
+            pass
+    _STATE["clients"] = {}
+    _STATE["cursor"] = 0
+    _log("已清空账号池（%d 个账号的本地账密已抹掉）" % n)
     return {"ok": True}
 
 
@@ -508,12 +752,23 @@ def register_routes():
 
     @routes.post("/assembled-recipes/ds/test")
     async def _test(request):
-        out = await asyncio.get_event_loop().run_in_executor(None, test_connectivity)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        email = str((body or {}).get("email") or "").strip()
+        out = await asyncio.get_event_loop().run_in_executor(None, test_connectivity, email)
         return aiohttp.web.json_response(out, dumps=dumps)
 
     @routes.post("/assembled-recipes/ds/unbind")
     async def _unbind(request):
-        out = await asyncio.get_event_loop().run_in_executor(None, stop_and_unbind)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        email = str((body or {}).get("email") or "").strip()
+        fn = (lambda: unbind(email)) if email else stop_and_unbind
+        out = await asyncio.get_event_loop().run_in_executor(None, fn)
         return aiohttp.web.json_response(out, dumps=dumps)
 
     @routes.post("/assembled-recipes/ds/service")

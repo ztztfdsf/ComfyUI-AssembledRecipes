@@ -46,9 +46,6 @@ _AUTH_RSA_PUB_B64 = (
     "5zweYaKv0rCVeqx8wIDAQAB"
 )
 
-_LOCK = threading.Lock()
-
-
 class _Accumulator:
     """SSE 结果累加器。
 
@@ -102,9 +99,14 @@ def _mute_readable(inner: dict) -> str:
 class DeepSeekError(RuntimeError):
     """带错误码的直连异常（biz_msg / code 原样带出，便于面板显示真因）。"""
 
-    def __init__(self, message, code=None):
+    def __init__(self, message, code=None, mute_until=None):
         super().__init__(message)
         self.code = code
+        self.mute_until = mute_until      # 上游给的解禁时间戳（有就能众账号轮巡时直接跳过）
+
+    @property
+    def muted(self) -> bool:
+        return bool(self.mute_until) or "user is muted" in str(self).lower()
 
     @property
     def rate_limited(self) -> bool:
@@ -128,13 +130,14 @@ _DEBUG = bool(os.environ.get("ASSEMBLED_DS_DEBUG"))
 
 
 def _with_retry(client, fn, what: str):
-    """两种可恢复故障的处理：
-      · token 失效 → 丢缓存、重新登录、重试（只给一次机会，避免登录风暴）
-      · 限流 → 15/30/60s 退避重试
-    其余错误原样报出。
+    """协议层只处理“同一个账号能自己恢复”的那一类：token 失效。
+
+    token 失效 → 丢缓存、重新登录、重试一次（只给一次，避免登录风暴）。
+    限流/禁言不在这里睡——那是“政策”，交给上层账号池决定（换下一个账号，
+    没得换才退避），否则单账号一被限流就要白等 15-60s。
     """
     relogged = False
-    for attempt, wait in enumerate(_RETRY_WAITS):
+    while True:
         try:
             return fn()
         except DeepSeekError as e:
@@ -143,12 +146,7 @@ def _with_retry(client, fn, what: str):
                 client.drop_token()
                 print("[DS网关] %s token 失效，已重新登录重试：%s" % (what, e), flush=True)
                 continue
-            if e.rate_limited:
-                print("[DS网关] %s 被限流，%ds 后重试（第%d次）" % (what, int(wait), attempt + 1), flush=True)
-                time.sleep(wait)
-                continue
             raise
-    return fn()
 
 
 # ============================ 出口代理 ============================
@@ -210,6 +208,7 @@ class DeepSeekClient:
         self.password = (password or "").strip()
         self.device_id = (device_id or "").strip()
         self.proxy = proxy or detect_proxy()
+        self._lock = threading.RLock()   # 本账号的 token 锁（不全局）
         self._token = ""
         self._token_ts = 0.0
         self._http = httpx.Client(timeout=httpx.Timeout(30.0, read=600.0),
@@ -252,8 +251,12 @@ class DeepSeekClient:
         if code not in (0, None):
             raise DeepSeekError("DeepSeek: %s" % (payload.get("msg") or code), code=code)
         if biz_code not in (0, None):
-            raise DeepSeekError(_mute_readable(inner) or "DeepSeek: %s" % (inner.get("biz_msg") or biz_code),
+            err = DeepSeekError(_mute_readable(inner) or "DeepSeek: %s" % (inner.get("biz_msg") or biz_code),
                                 code=biz_code)
+            biz = inner.get("biz_data") if isinstance(inner.get("biz_data"), dict) else {}
+            if str(inner.get("biz_msg") or "").strip() == "user is muted" and biz.get("mute_until"):
+                err.mute_until = float(biz["mute_until"])
+            raise err
         if biz is None:
             raise DeepSeekError("DeepSeek 响应缺 biz_data: " + json.dumps(payload, ensure_ascii=False)[:180])
         return biz
@@ -284,14 +287,15 @@ class DeepSeekClient:
         return token
 
     def ensure_token(self, max_age: float = 5 * 3600.0) -> str:
-        with _LOCK:
+        # 锁是每账号一把（不是全局）：多账号轮巡时，一个账号登录慢不能拖死其他账号
+        with self._lock:
             if not self._token or time.time() - self._token_ts > max_age:
                 return self.login()
             return self._token
 
     def drop_token(self) -> None:
         """丢掉缓存的 token（上游说它失效了就用这个，下一枪会重新登录）。"""
-        with _LOCK:
+        with self._lock:
             self._token = None
             self._token_ts = 0.0
 
@@ -434,7 +438,9 @@ class DeepSeekClient:
         inner = (payload.get("data") or {}) if isinstance(payload, dict) else {}
         hint = _mute_readable(inner)
         if hint:
-            raise DeepSeekError(hint, code=inner.get("biz_code"))
+            biz = inner.get("biz_data") if isinstance(inner.get("biz_data"), dict) else {}
+            raise DeepSeekError(hint, code=inner.get("biz_code"),
+                                mute_until=float(biz["mute_until"]) if biz.get("mute_until") else None)
         DeepSeekClient._unwrap(payload)   # biz_code 非 0 会在这里抛（带出上游原文）
         raise DeepSeekError("%s 没有返回事件流（content-type=%s）: %s"
                             % (what, ctype, json.dumps(payload, ensure_ascii=False)[:200]))

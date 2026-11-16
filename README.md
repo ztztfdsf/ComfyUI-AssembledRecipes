@@ -121,11 +121,29 @@ git clone https://github.com/ztztfdsf/ComfyUI-AssembledRecipes
   所以本实现不需要 `curl_cffi`/uTLS 之类。device_id 只能自己抓（浏览器 F12 看 `deviceprofile/v4`），
   插件不能代劳。
 - **出口铁律**：客户端启动时自动读环境变量 → Windows 系统代理；**找不到代理直接报错**，绝不裸走真实 IP。
-- 短时间连打多枪会回 `TOO_MANY_REQUESTS`，已内置 15/30/60s 退避重试。
+- 短时间连打多枪会回 `TOO_MANY_REQUESTS`；单账号时自己退避重试，多账号时直接转下一个。
+- 上游报错不走事件流而是回一个 `application/json` 信封（实测禁言就是这个形状），
+  插件会当场抛出来并把 `mute_until` 翻成具体时间，不会静默交空正文。
 
-凭据存放（重要）：邮箱/密码/device_id 存在
+凭据存放（重要）：账号池（邮箱/密码/device_id）存
 `<ComfyUI>/user/AssembledRecipes/ds_gateway.json`（本地文件，插件自管），
-**不写进工作流 JSON、不进日志、不进提示词**。日志里只会出现邮箱脱敏后的形式与耗时。
+**不写进工作流 JSON、不进日志、不进提示词**。日志里只会出现邮箱与耗时。
+
+### 多账号轮巡
+
+一个 DeepSeek 账号的额度与风控是共享的（实测单账号连续用几小时会被 `user is muted`
+禁言 3 天），所以网关把账号当**池子**用，面板「DeepSeek 云端」页里可以加任意多个：
+
+| 情况 | 行为 |
+|---|---|
+| 平时 | 按顺序轮巡，每成功一枪就把游标推到下一个——不拆死一号，风控压力摊开 |
+| 某号被禁言 | 按上游给的 `mute_until` 记账并跳过，到期自动回来（面板行上直接写“禁言 · 到 11-19 09:54”） |
+| 某号被限流 | 进 120s 短冷却后跳过（协议层不再自己睡 15-60s，有下一个号就用下一个） |
+| 整池不可用 | 报错文案把**每个账号**的状态与最早恢复时间列出来，不会只说“失败了” |
+| 缺 device_id 的号 | 不参与轮巡（上去也必被 RISK_DEVICE_DETECTED 打回来） |
+
+状态（禁言/冷却/成功次数）持久化在同一个配置文件里，重启 ComfyUI 不会忘。
+`POST /assembled-recipes/ds/unbind` 带 `email` 只删那一个，不带就清空整池。
 
 同时它还开了一个 OpenAI 兼容服务（`http://127.0.0.1:5812/v1`，仅监听本机，`Authorization: Bearer <配置里的 key>`），
 带 `stream` 与 base64 图片；反推节点本体走进程内直调，不依赖这个端口。
