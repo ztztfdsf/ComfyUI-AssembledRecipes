@@ -270,3 +270,103 @@ def extract_json_array(text: str):
                     break
         # 内层走完没闭合，继续找下一个 [
     return None
+
+
+def salvage_objects(text: str):
+    """模型把框一个个吐出来、但整份没套数组外壳（实测 gemma-4-E2B 就这样）。
+
+    这不是「没按格式回答」到不可用：顶层 {…} 对象逐个扫出来再包一层 [ ] 就能用。
+    只认顶层对象（字符串感知扫描，不会被 desc 里的括号带偏），且必须至少一个。
+    """
+    s = (text or "").strip()
+    objs, depth, start = [], 0, -1
+    in_str = esc = False
+    for i, c in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                try:
+                    v = json.loads(s[start:i + 1])
+                except ValueError:
+                    v = None
+                if isinstance(v, dict):
+                    objs.append(v)
+                start = -1
+    return objs if objs and all(("bbox" in o) for o in objs) else None
+
+
+def check_layout(text: str):
+    """云端返回的正文到底是不是一份能用的布局 JSON。
+
+    返回 (boxes, problem, note)：problem 非 None = 不可用，调用方必须直接停链路
+    （而不是把一堆废话交给下游清洗节点静默变空布局）；note 是「修好了什么」的说明，
+    要打印出来——修过的东西不能悄悄修。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None, "模型返回空正文", ""
+    arr = extract_json_array(raw)
+    note = ""
+    if arr is None:
+        # 截断优先判：少掉的是内容不是噪声，宁可停也不要拿半份布局去出图
+        if raw.count("[") > raw.count("]"):
+            got = len(salvage_objects(raw) or [])
+            return None, ("JSON 数组没闭合（输出被 token 上限截断）" +
+                          ("，前 %d 个框是完整的但后面的框已经丢了" % got if got else "")), ""
+        # 没截断、只是整份没套数组外壳（gemma-4-E2B 实测这样）：纯机械问题，救回来
+        salv = salvage_objects(raw)
+        if salv:
+            return salv, None, "模型没套数组外壳，已按顶层对象补齐（%d 个框）" % len(salv)
+        return None, "正文里抠不出 JSON 数组（模型没按格式回答）", ""
+    bad = []
+    for i, o in enumerate(arr):
+        b = o.get("bbox")
+        if not isinstance(b, (list, tuple)) or len(b) != 4:
+            bad.append("第%d个框缺 bbox" % (i + 1))
+        elif not str(o.get("desc", "")).strip():
+            bad.append("第%d个框缺 desc" % (i + 1))
+    if bad:
+        return None, "框字段不完整：" + "、".join(bad[:4]), ""
+    return arr, None, note
+
+
+def prompt_provenance(rule: str, user_text: str, **params) -> str:
+    """把「这次到底喂了什么提示词」写成一段可贴进报错/日志的说明。
+
+    user_prompt 是上游 Any Switch 合并进来的一个字符串，节点本身不知道它来自画廊还是手写框，
+    所以这里按形状判：逗号分隔的小写 tag 串 → 画廊标签；否则 → 手写/选择器词。
+    """
+    import hashlib
+
+    def _h(v):
+        return hashlib.sha1(str(v).encode("utf-8", "ignore")).hexdigest()[:8]
+
+    r = str(rule or "")
+    u = str(user_text or "")
+    tags = [x.strip() for x in u.replace("\n", ",").split(",") if x.strip()]
+    is_tags = len(tags) >= 3 and all(
+        (not t.startswith("<")) and (t == t.lower() or " " not in t) for t in tags[:6])
+    src = "画廊标签（%d 个 tag）" % len(tags) if is_tags else "手写/选择器提示词"
+    lines = ["提示词来源与形状："]
+    lines.append("  rule 规则：%d 字（sha1 %s），首行「%s」" %
+                 (len(r), _h(r), (r.splitlines() or [""])[0][:40]))
+    lines.append("  user_prompt：%s，%d 字（sha1 %s）" % (src, len(u), _h(u)))
+    lines.append("  内容：%s" % (u[:200].replace("\n", " ") + ("…" if len(u) > 200 else "")))
+    for k, v in params.items():
+        if v is not None and v != "":
+            lines.append("  %s：%s" % (k, v))
+    return "\n".join(lines)

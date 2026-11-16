@@ -1010,7 +1010,14 @@ class ReverseJsonSanitize:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"text": ("STRING", {"tooltip": "接反推节点的描述输出"})}}
+        return {"required": {"text": ("STRING", {"tooltip": "接反推节点的描述输出"})},
+                # 旧行为是“一个框都没洗出来 → 输出 []，整条链路当没反推继续出图”，
+                # 看上去 success 但白跑一张，而且没人告诉你提示词到底喂对了没。
+                # 默认改成直接停；要回到老行为自己选“输出空布局继续”。
+                # 放 optional：API 调用不传也能跑（旧 prompt 不会因新增参数被拒）。
+                "optional": {"on_empty": (["报错停止（默认）", "输出空布局继续出图"],
+                                          {"default": "报错停止（默认）",
+                                           "tooltip": "洗出来 0 个框时怎么办：报错停止（不要静默白跑一张）/ 输出空布局继续（当没反推）"})}}
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("json",)
@@ -1184,7 +1191,7 @@ class ReverseJsonSanitize:
             return True
         return False
 
-    def sanitize(self, text):
+    def sanitize(self, text, on_empty="报错停止（默认）"):
         report = []
         raw = text or ""
         s = raw.strip()
@@ -1286,6 +1293,15 @@ class ReverseJsonSanitize:
             msg_dup = len(out) - len(uniq)
             out = uniq
         msg = f"保留 {len(out)} 个框"
+        if not out and (raw or "").strip() and on_empty.startswith("报错"):
+            # 上游确实给了东西、这里却一个框都洗不出来 = 反推输出不可用，直接停
+            raise ValueError(
+                "反推JSON清洗：上游给了 %d 字反推输出，但一个可用框都没洗出来（已按「%s」停止）。\n"
+                "原文开头：%s\n"
+                "常见原因：① 云端/本地模型没按格式回答（喷了散文或思考文本）；"
+                "② 输出被 token 上限截断到连一个完整框都没有；③ 框字段不合规（缺 bbox/desc）。\n"
+                "要呾受这种情形（当没反推继续出图），把本节点 on_empty 改成「输出空布局继续出图」。"
+                % (len(raw), on_empty, raw[:240].replace(chr(10), " ")))
         if msg_dup:
             msg += f"，去重 {msg_dup} 个同坐标框"
         if dropped:
@@ -1360,6 +1376,41 @@ def _effort_to_thinking(effort, default=True):
             _sys.path.insert(0, _pd)
         providers = _il.import_module("reverse_cloud.providers")
     return providers.effort_to_thinking(effort, default)
+
+
+def _sha8(text) -> str:
+    """短摘要：日志里用来对“这次用的到底是哪份提示词”，不往日志灌全文。"""
+    import hashlib
+    return hashlib.sha1(str(text or "").encode("utf-8", "ignore")).hexdigest()[:8]
+
+
+def _dump_cloud_failure(provider: str, provenance: str, text: str, secs: float, problem: str) -> str:
+    """格式不合格时把完整现场落盘，方便事后对着原文看模型到底喷了什么。
+
+    只落 provider/参数/原文，不写任何凭据。
+    """
+    try:
+        root = folder_paths.get_user_directory()
+    except Exception:
+        root = os.path.join(os.path.expanduser("~"), ".config", "comfy")
+    folder = os.path.join(root, "AssembledRecipes", "reverse_errors")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        name = time.strftime("%Y%m%d-%H%M%S") + "-%s.json" % re.sub(r"[^0-9A-Za-z]+", "_", str(provider))[:24]
+        path = os.path.join(folder, name)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "provider": provider,
+                "problem": problem,
+                "seconds": round(secs, 2),
+                "output_chars": len(text or ""),
+                "provenance": provenance,
+                "raw_output": text or "",
+            }, f, ensure_ascii=False, indent=2)
+        return path
+    except Exception as e:
+        return "（落盘失败：%s）" % e
 
 
 def _cloud_caption(kind, pil, rule, user_text, thinking=True,
@@ -1535,11 +1586,11 @@ class ReverseLayoutCaption:
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("text",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("text", "prompt_used")
     FUNCTION = "caption"
     CATEGORY = "AssembledRecipes"
-    DESCRIPTION = "自研布局反推：进程内直载 Qwen3-VL（transformers），无外部进程、黑框绝迹。下游接「配方·反推JSON清洗」。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
+    DESCRIPTION = "自研布局反推：进程内直载 models/LLM 下的 VLM，无外部进程。输出 text=布局 JSON（格式不合格直接停链路），prompt_used=本次实际喂了什么。  —— github.com/ztztfdsf/ComfyUI-AssembledRecipes"
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -1766,7 +1817,8 @@ class ReverseLayoutCaption:
         if not os.path.isdir(path):
             raise RuntimeError(f"DeepSeek 精修模式需要本地粗稿模型，但找不到 {path}")
         # 复用 caption() 的本地全流程：直接递归调自己、provider=本地
-        text, = self.caption(
+        # caption 现在返两个输出（text, prompt_used），这里只取正文
+        text, _prov = self.caption(
             image=self._pil_to_image(pil), rule=rule, user_prompt="", provider="本地模型（transformers）",
             model_name=model_name, max_new_tokens=max_new_tokens, pre_clear=pre_clear,
             offload_after=offload_after, quant=quant, tag_mode=tag_mode, batch_index=batch_index)
@@ -1812,18 +1864,45 @@ class ReverseLayoutCaption:
             except Exception as e:
                 raise RuntimeError(f"云端反推[{provider}] 失败: {e}") from e
             try:
-                from .reverse_cloud.providers import extract_json_array
+                from .reverse_cloud.providers import check_layout, prompt_provenance
             except ImportError:
                 import importlib as _il, sys as _sys, os as _os
                 _pd = _os.path.dirname(_os.path.abspath(__file__))
                 if _pd not in _sys.path:
                     _sys.path.insert(0, _pd)
-                extract_json_array = _il.import_module("reverse_cloud.providers").extract_json_array
-            arr = extract_json_array(text_out)
-            if arr is not None:
-                text_out = json.dumps(arr, ensure_ascii=False)
-            print(f"[AssembledRecipes] 云端反推[{provider}]: {time.time() - t0:.1f}s | 输出 {len(text_out)} 字符", flush=True)
-            return (text_out,)
+                _pv = _il.import_module("reverse_cloud.providers")
+                check_layout, prompt_provenance = _pv.check_layout, _pv.prompt_provenance
+            # 格式不对就直接停，不要把一堆废话交给下游清洗节点静默变空布局：
+            # 旧行为是“云端喷了非 JSON / 被截断 → 清洗保留 0 框 → 整条链路当没反推继续出图”，
+            # 看上去 success，实际白跑一张。
+            boxes, problem, note = check_layout(text_out)
+            if note:
+                print(f"[AssembledRecipes] 云端反推[{provider}] 格式已修：{note}", flush=True)
+            prov = prompt_provenance(
+                rule, up_all,
+                provider=provider,
+                thinking=(think if provider_ds else None),
+                effort=(custom_effort or None),
+                stream=(None if provider_ds else bool(custom_stream)),
+                endpoint=(None if provider_ds else str(endpoint or "")),
+            )
+            if problem:
+                dump = _dump_cloud_failure(provider, prov, text_out, time.time() - t0, problem)
+                raise RuntimeError(
+                    "云端反推[%s] 格式不合格，已停止链路：%s\n"
+                    "用时 %.1fs，输出 %d 字，结尾片段：%r\n%s\n"
+                    "模型原文开头：%s\n"
+                    "（完整原文已落盘：%s）"
+                    % (provider, problem, time.time() - t0, len(text_out or ""),
+                       (text_out or "")[-60:], prov,
+                       (text_out or "")[:300].replace(chr(10), " "), dump))
+            # 直接吃 check_layout 的结果（它已经处理过截断判定与补外壳），
+            # 不再二次 extract——上一版在这里对 None 求 len 当场炸了整单
+            text_out = json.dumps(boxes, ensure_ascii=False)
+            print(f"[AssembledRecipes] 云端反推[{provider}]: {time.time() - t0:.1f}s | "
+                  f"{len(boxes)} 个框{('（' + note + '）' if note else '')} | rule {len(rule)}字 sha1={_sha8(rule)} | "
+                  f"user_prompt {len(up_all)}字 sha1={_sha8(up_all)}", flush=True)
+            return (text_out, prov)
 
         # ---------- 本地路径（原逻辑不动） ----------
         path = os.path.join(folder_paths.models_dir, "LLM", model_name)
@@ -2095,7 +2174,34 @@ class ReverseLayoutCaption:
         img_size = f"{pil.width}x{pil.height}" if pil is not None else "?"
         print(f"[AssembledRecipes] 布局反推: {first} | 图 {img_size} | 提示 {n_prompt} tok + 输出 {n_new} tok ({n_new / max(gen_s, 0.1):.1f} tok/s) | 上卡 {up_s:.1f}s | 推理 {gen_s:.1f}s "
               f"| 退卡 {off_s:.1f}s | 空闲 {free0:.0f}→{free1:.0f}MB | 文本 {len(text_out)} 字符{trunc}{retry_note}", flush=True)
-        return (text_out,)
+        # 本地路也一致：一个 JSON 数组都抠不出来 = 模型说胡话，直接停，
+        # 呮不得“清洗保留 0 框 → 当没反推继续出图”这种静默降级（截断但能抠出框的仍旧交给清洗修）
+        try:
+            from .reverse_cloud.providers import check_layout as _cl, prompt_provenance as _pp
+        except ImportError:
+            import importlib as _il, sys as _sys
+            _pd2 = os.path.dirname(os.path.abspath(__file__))
+            if _pd2 not in _sys.path:
+                _sys.path.insert(0, _pd2)
+            _pv2 = _il.import_module("reverse_cloud.providers")
+            _cl, _pp = _pv2.check_layout, _pv2.prompt_provenance
+        local_prov = _pp(rule, up, provider="本地模型", model=model_name,
+                        quant=quant, max_new_tokens=int(max_new_tokens), tag_mode=tag_mode)
+        _b, _prob, _note = _cl(text_out)
+        if _note:
+            # 救回来了就必须把正文换成补好外壳的数组——只打日志不改 text_out 的话，
+            # 下游清洗拿到的还是那串没外壳的对象，照样洗成 0 框
+            text_out = json.dumps(_b, ensure_ascii=False)
+            print(f"[AssembledRecipes] 本地反推[{model_name}] 格式已修：{_note}", flush=True)
+        elif _prob:
+            dump = _dump_cloud_failure("本地模型[%s]" % model_name, local_prov, text_out,
+                                       time.time() - t0, _prob)
+            raise RuntimeError(
+                "本地反推[%s] 格式不合格，已停止链路：%s" + chr(92) + "n%s" + chr(92) + "n"
+                "模型原文开头：%s" + chr(92) + "n（完整原文已落盘：%s）"
+                % (model_name, _prob, local_prov,
+                   (text_out or "")[:300].replace(chr(10), " "), dump))
+        return (text_out, local_prov)
 
 
 
