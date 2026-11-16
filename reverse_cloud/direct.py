@@ -62,7 +62,6 @@ class _Accumulator:
         self.parts = []        # 正文，按到达顺序（patch 非推理 + 裸 v）
         self.table_answer = {}  # 分片表里的 RESPONSE 分片
         self.think = {}         # 分片表 / patch 里的推理分片
-        self.typed = False      # 收到过带 id 的正文（影响 on_delta 去重）
         self.message_id = None
         self.auto_continue = False
         self.finished = False
@@ -461,7 +460,6 @@ class DeepSeekClient:
                         acc.think[int(m.group(1))] = val  # 推理单独存，不污染正文
                     else:
                         acc.parts.append(val)
-                        acc.typed = True
                         if on_delta:
                             on_delta(val)
                 continue
@@ -485,8 +483,3 @@ class DeepSeekClient:
                         acc.think[fid] = content
                     else:
                         acc.table_answer[fid] = content
-                        acc.typed = True
-
-    def _auto_continue(self, session_id, message_id, answer, headers):
-        """上游 auto_continue=true 时按官方客户端方式续写（兼容旧入口）。"""
-        return answer + self._continue_round(session_id, message_id)
