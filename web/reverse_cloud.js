@@ -613,6 +613,7 @@ async function loadEndpoints(ui) {
 			if (ui.epBase && !ui.epBase.value) ui.epBase.value = EP.base;
 			if (ui.epKey) ui.epKey.placeholder = EP.has_key ? "已存 · 留空不动" : "sk-…";
 			renderModelSelect(ui);
+			refreshModeDot(ui);   // 地址/模型回来了才能正确判灯
 		}
 	} catch (e) {
 		if (ui.epBase) ui.epBase.placeholder = "读不到本机端点配置：" + (e.message || e);
@@ -968,9 +969,7 @@ function buildPanel(node) {
 	cc.append(testRow);
 	pageCustom.append(cc);
 	body.append(pageCustom);
-	loadEndpoints(ui);
-	renderModelSelect(ui);
-	setTimeout(() => refreshModeDot(ui), 600);
+	loadEndpoints(ui).then(() => refreshModeDot(ui));
 
 	body.append(ui.status);
 
