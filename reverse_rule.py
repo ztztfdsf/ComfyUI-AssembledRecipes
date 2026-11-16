@@ -124,8 +124,8 @@ LAYOUT_RULE = r"""# 角色
      笔直指向谁，例如 with a pointer tail on its bottom edge pointing straight DOWN to Character 1's head。
      气泡框要贴近说话人自己的头顶上方或左右肩侧，不要悬在别人的脑门正上方。
   2. 画面外的第一人称视角说话或内心吐槽：tail-less oval thought bubble，并明确写
-     with NO pointer tail pointing to the girl / the man，否则尾巴会就近连到画面内任意一张脸上。
-  3. 客观旁白、人物姓名年龄设定牌：sharp-cornered white rectangular box with a thin black border (no bubble tail)，
+     and make sure no tail of any kind reaches toward either figure，否则尾巴会就近连到画面内任意一张脸上。
+  3. 客观旁白、人物姓名年龄设定牌：white narration rectangle with sharp corners and a fine dark outline, with no tail at all，
      不要用圆角椭圆框，以免和对话气泡混淆。
   4. 怒吼/惊叫这类剧烈情绪：2~6 个字的短促台词用 jagged burst speech bubble；
      超过 15 字的多列长句不要用锯齿框（锯齿会向内吞掉约三成排版面积导致截字），改用加宽的 rounded bubble 并把框拉宽。
