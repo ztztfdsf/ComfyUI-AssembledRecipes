@@ -14,6 +14,9 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
+import re
+import time
 from urllib.parse import urlsplit
 
 
@@ -95,12 +98,53 @@ def list_models(base_url: str, api_key: str = "", timeout: float = 30.0) -> list
     return sorted(set(out))
 
 
-def _looks_like_rejected_effort(text: str) -> bool:
-    """端点拒接 reasoning_effort 的常见回词（不少兼容层只认 minimal/low/medium/high）。"""
+_PARAM_WORDS = ("reasoning_effort", "reasoning", "thinking", "enable_thinking",
+                "thinking_budget", "chat_template_kwargs", "budget_tokens")
+_REJECT_WORDS = ("invalid", "unknown", "unsupported", "not supported", "extra inputs",
+                 "extra fields", "unexpected", "unrecognized", "not permitted", "not allowed",
+                 "invalid value", "is not allowed", "不支持", "无法识别", "参数错误")
+
+
+def _looks_like_rejected_param(text: str) -> bool:
+    """端点拒接某个「思考参数」的常见回词（各家 400 文案五花八门，只认关键词）。"""
     t = (text or "").lower()
-    return ("reasoning_effort" in t or "reasoning" in t) and any(
-        k in t for k in ("invalid", "unknown", "unsupported", "not supported", "extra inputs",
-                        "unexpected", "unrecognized", "not permitted", "not allowed", "invalid value"))
+    return any(k in t for k in _PARAM_WORDS) and any(k in t for k in _REJECT_WORDS)
+
+
+def _looks_like_rejected_effort(text: str) -> bool:
+    """向后兼容的旧名字（只针对 reasoning_effort）。"""
+    return _looks_like_rejected_param(text) and "reasoning_effort" in (text or "").lower()
+
+
+# ---------------------------------------------------------------- 拒答识别
+_REFUSAL_STRONG = (
+    "我无法协助", "无法协助", "我不能处理", "不能处理", "我不会为", "不会为这类", "无法提供",
+    "不会生成", "不能生成", "抱歉，我", "很抱歉", "拒绝", "无法满足", "不合适处理", "涉及敏感",
+    "i can't", "i cannot", "i can\'t assist", "cannot assist", "can\'t assist", "i won\'t",
+    "i am unable", "i\'m unable", "not able to help", "unable to help", "cannot help with",
+    "i must decline", "against my guidelines", "violates", "content policy", "safety policy",
+)
+
+
+def looks_like_refusal(text: str) -> bool:
+    """模型拒答 vs 格式不合格：拒答是「一段人话、没有 JSON 结构」。"""
+    t = (text or "").strip()
+    if not t or len(t) > 1500:
+        return False
+    if "{" in t or "[" in t:
+        return False
+    low = t.lower()
+    return any(k.lower() in low for k in _REFUSAL_STRONG)
+
+
+def classify_failure(text: str) -> tuple:
+    """给上层一个确定分类：(kind, 人话说明)。kind: refusal / empty / format。"""
+    t = (text or "").strip()
+    if not t:
+        return ("empty", "模型返回空正文")
+    if looks_like_refusal(t):
+        return ("refusal", "模型拒答（内容安全过滤），不是格式问题")
+    return ("format", "正文里抠不出 JSON 数组（模型没按格式回答）")
 
 
 def coerce_text(v) -> str:
@@ -145,12 +189,163 @@ def coerce_text(v) -> str:
     return str(v)
 
 
+# ---------------------------------------------------------------- 思考强度方言
+# 各家「让模型想多久」的请求格式完全不同：同一个 reasoning_effort 在别家就是 400。
+# 下表形状照各家官方文档抄（2026-11 核对），不是猜的：
+#   reasoning_effort      OpenAI GPT-5 系 Chat Completions：low/medium/high（新模型另有 none/minimal/xhigh）
+#   reasoning_obj         OpenAI Responses 风格 / OpenRouter 统一参数：{"reasoning": {"effort": ...}}
+#   openrouter_budget     OpenRouter 另一条路：{"reasoning": {"max_tokens": N}}
+#   thinking_budget       Anthropic：{"thinking": {"type": "enabled", "budget_tokens": N}}（最小 1024）
+#   thinking_type         DeepSeek 官方 / GLM / Kimi / MiniMax / 豆包：{"thinking": {"type": "enabled"}}
+#   enable_thinking       Qwen-DashScope：{"enable_thinking": true, "thinking_budget": N}
+#   chat_template_kwargs  vLLM / SGLang 本地部署：{"chat_template_kwargs": {"enable_thinking": true}}
+# Gemini 原生只有 generationConfig.thinkingConfig.thinkingBudget，它的 OpenAI 兼容层不开放该字段，
+# 所以兼容模式按 reasoning_effort / 无参数处理，不做假支持。
+EFFORT_UNSET = "不思考"
+EFFORT_LEVELS = ("不思考", "minimal", "low", "medium", "high", "max")
+EFFORT_BUDGET = {"minimal": 1024, "low": 2048, "medium": 4096, "high": 8192, "max": 16384}
+EFFORT_OPENAI = {"minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "max": "high"}
+DIALECTS = ("reasoning_effort", "reasoning_obj", "thinking_budget", "thinking_type",
+            "enable_thinking", "chat_template_kwargs", "openrouter_budget")
+DIALECT_LABELS = {
+    "reasoning_effort": 'reasoning_effort="high"',
+    "reasoning_obj": 'reasoning={"effort":"high"}',
+    "openrouter_budget": 'reasoning={"max_tokens":8192}',
+    "thinking_budget": 'thinking={"type":"enabled","budget_tokens":8192}',
+    "thinking_type": 'thinking={"type":"enabled"}',
+    "enable_thinking": 'enable_thinking=true + thinking_budget=8192',
+    "chat_template_kwargs": 'chat_template_kwargs={"enable_thinking":true}',
+}
+
+
+def thinking_fields(dialect: str, effort: str) -> dict:
+    """按方言生成要 merge 进请求体的思考参数。"""
+    if not effort or effort == EFFORT_UNSET:
+        return {}
+    if effort not in EFFORT_BUDGET:
+        raise ProviderError("思考强度不认识：%r（可选 %s）" % (effort, " / ".join(EFFORT_LEVELS)))
+    budget = EFFORT_BUDGET[effort]
+    if dialect == "reasoning_effort":
+        return {"reasoning_effort": EFFORT_OPENAI[effort]}
+    if dialect == "reasoning_obj":
+        return {"reasoning": {"effort": EFFORT_OPENAI[effort]}}
+    if dialect == "openrouter_budget":
+        return {"reasoning": {"max_tokens": budget}}
+    if dialect == "thinking_budget":
+        return {"thinking": {"type": "enabled", "budget_tokens": budget}}
+    if dialect == "thinking_type":
+        return {"thinking": {"type": "enabled"}}
+    if dialect == "enable_thinking":
+        return {"enable_thinking": True, "thinking_budget": budget}
+    if dialect == "chat_template_kwargs":
+        return {"chat_template_kwargs": {"enable_thinking": True}}
+    return {}
+
+
+def _dialect_cache_file() -> str:
+    try:
+        from . import endpoints
+    except ImportError:
+        import endpoints  # type: ignore
+    return os.path.join(os.path.dirname(endpoints.config_path()), "thinking_dialects.json")
+
+
+def _cache_read() -> dict:
+    p = _dialect_cache_file()
+    try:
+        with io.open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _cache_write(d: dict) -> None:
+    p = _dialect_cache_file()
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with io.open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, p)
+    except Exception as e:  # 缓存写不进去不影响出图
+        print("[AssembledRecipes] 思考方言缓存写入失败：%s" % e, flush=True)
+
+
+def _cache_key(base_url: str, model: str) -> str:
+    return "%s|%s" % ((base_url or "").strip().rstrip("/").lower(), (model or "").strip())
+
+
+def remember_dialect(base_url: str, model: str, dialect: str) -> None:
+    d = _cache_read()
+    d[_cache_key(base_url, model)] = {"dialect": dialect, "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    _cache_write(d)
+
+
+def recall_dialect(base_url: str, model: str) -> str:
+    row = _cache_read().get(_cache_key(base_url, model)) or {}
+    return str(row.get("dialect") or "")
+
+
+def record_refusal(base_url: str, model: str, text: str) -> None:
+    """面板要能看见「上次为什么没出框」：是模型拒答，不是格式问题。"""
+    d = _cache_read()
+    k = _cache_key(base_url, model)
+    row = d.get(k) or {}
+    row["refusal"] = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "text": (text or "")[:300]}
+    d[k] = row
+    _cache_write(d)
+
+
+def thinking_state() -> dict:
+    """给面板：每个端点上次命中的方言 + 最近一次拒答。"""
+    out = {}
+    for k, row in (_cache_read() or {}).items():
+        if not isinstance(row, dict):
+            continue
+        dia = row.get("dialect") or ""
+        out[k] = {"dialect": dia,
+                  "label": DIALECT_LABELS.get(dia, dia or "未探测"),
+                  "at": row.get("at") or "",
+                  "refusal": row.get("refusal") or None}
+    return out
+
+
+def dialect_candidates(base_url: str, model: str) -> list:
+    """尝试顺序：缓存命中优先，其次按域名/模型名启发，最后一律兜到 reasoning_effort。"""
+    hit = recall_dialect(base_url, model)
+    host = (urlsplit(base_url or "").hostname or "").lower()
+    m = (model or "").lower()
+    if "openrouter" in host:
+        base = ["reasoning_obj", "openrouter_budget", "reasoning_effort"]
+    elif "anthropic" in host or m.startswith("claude"):
+        base = ["thinking_budget", "reasoning_effort"]
+    elif any(k in host for k in ("dashscope", "aliyuncs", "qwen")) or "qwen" in m:
+        base = ["enable_thinking", "thinking_type", "reasoning_effort"]
+    elif any(k in host for k in ("bigmodel", "z.ai", "moonshot", "minimax", "volces", "volcengine")):
+        base = ["thinking_type", "reasoning_effort", "enable_thinking", "thinking_budget"]
+    else:
+        # 未知域名（第三方网关，如本机在用的 chenxing.pro）：reasoning_effort 优先——
+        # 这类网关绝大多数就是 OpenAI 兼容层，认它；发 thinking{type} 反而会被它们
+        # 转成上游请求然后回一个不带参数名的 422/400 泛错（实测）。
+        # 模型名只当兜底顺序的提示，不当首选。
+        base = ["reasoning_effort", "reasoning_obj", "thinking_type", "thinking_budget",
+                "enable_thinking", "chat_template_kwargs"]
+        if "glm" in m or "kimi" in m or "minimax" in m or "doubao" in m:
+            base = ["thinking_type"] + [d for d in base if d != "thinking_type"]
+    order = ([hit] if hit else []) + [d for d in base if d != hit]
+    return [d for d in order if d in DIALECTS]
+
+
 def _openai_chat(base_url: str, api_key: str, model: str, system: str, user_text: str,
                  pil, temperature: float = 1.0, timeout: float = 300.0,
                  data_url: str | None = None, stream: bool = False,
                  effort: str = "") -> str:
-    """标准 OpenAI 视觉补全。默认非流式（反推要整块 JSON，流式只会多一层拼接）；
-    effort 非空时带 reasoning_effort（o系列 / 部分网关认这个字段）。"""
+    """标准 OpenAI 视觉补全。默认非流式（反推要整块 JSON，流式只会多一层拼接）。
+
+    思考强度按方言逐个试：命中就记进本机缓存，下次直接用它，不再多打一枪。
+    全部方言被拒时**报错**而不是静默去掉参数——思考开没开是用户看得见的功能，
+    悄悄降级等于骗人。"""
     url = _endpoint(base_url, "chat/completions")
     content: list = [{"type": "text", "text": user_text}]
     if pil is not None:
@@ -163,59 +358,84 @@ def _openai_chat(base_url: str, api_key: str, model: str, system: str, user_text
         "temperature": temperature,
         "stream": bool(stream),
     }
-    if effort and effort != "不思考":
-        body["reasoning_effort"] = effort
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    with _client(url, timeout) as cli:
-        if not stream:
-            r = cli.post(url, json=body, headers=headers)
-            if r.status_code != 200:
-                # 端点不认 reasoning_effort → 去掉它再打一次，不拿这个当成“端点挂了”
-                if "reasoning_effort" in body and _looks_like_rejected_effort(r.text):
-                    body.pop("reasoning_effort", None)
-                    print("[AssembledRecipes] 端点不认 reasoning_effort=%s，已去掉该字段重试（HTTP %s）"
-                          % (effort, r.status_code), flush=True)
-                    r = cli.post(url, json=body, headers=headers)
-            if r.status_code != 200:
-                raise ProviderError(f"OpenAI 端点 HTTP {r.status_code}: {r.text[:300]}")
-            try:
-                raw = r.json()["choices"][0]["message"]["content"]
-            except Exception as e:
-                raise ProviderError(f"OpenAI 响应解析失败: {e} :: {r.text[:300]}")
-            if isinstance(raw, (list, tuple)):
-                print("[AssembledRecipes] 端点把 content 返回成 %d 段数组，已拼接成一段正文"
-                      % len(raw), flush=True)
-            return coerce_text(raw)
-        # 流式：逐行拼 delta（部分网关会额外吏 reasoning_content，不能当正文）
-        chunks, bad = [], 0
-        with cli.stream("POST", url, json=body, headers=headers) as r:
-            if r.status_code != 200:
-                raw = r.read()
-                raise ProviderError(f"OpenAI 端点 HTTP {r.status_code}: {raw[:300]}")
-            for line in r.iter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if payload == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(payload)
-                except ValueError:
-                    bad += 1
-                    continue
-                for ch in obj.get("choices") or []:
-                    delta = ch.get("delta") or {}
-                    # content 可能是字符串，也可能是 parts 数组（含 thinking 段）
-                    piece = coerce_text(delta.get("content")) or coerce_text(ch.get("text"))
-                    if piece:
-                        chunks.append(piece)
-        text = "".join(chunks)
-        if not text:
-            raise ProviderError(f"流式没拿到正文（{bad} 行解不进去）——这个端点可能不支持 stream，改回非流式")
-        return text
 
+    if effort and effort != EFFORT_UNSET:
+        trials = [(d, thinking_fields(d, effort)) for d in dialect_candidates(base_url, model)]
+    else:
+        trials = [("", {})]
+
+    rejected = []
+    with _client(url, timeout) as cli:
+        for dialect, fields in trials:
+            trial = dict(body)
+            trial.update(fields)
+            if not stream:
+                r = cli.post(url, json=trial, headers=headers)
+                if r.status_code == 200:
+                    if dialect:
+                        remember_dialect(base_url, model, dialect)
+                        print("[AssembledRecipes] 思考强度 %s → 方言 %s（%s）"
+                              % (effort, dialect, DIALECT_LABELS.get(dialect, dialect)), flush=True)
+                    try:
+                        raw = r.json()["choices"][0]["message"]["content"]
+                    except Exception as e:
+                        raise ProviderError(f"OpenAI 响应解析失败: {e} :: {r.text[:300]}")
+                    if isinstance(raw, (list, tuple)):
+                        print("[AssembledRecipes] 端点把 content 返回成 %d 段数组，已拼接成一段正文"
+                              % len(raw), flush=True)
+                    return coerce_text(raw)
+                # 400/422 = 参数层面被拒；有的网关只回 {"error":"openai_error"} 不点名，
+                # 所以不能只靠关键词判断，状态码也要算进去，否则会误报「端点挂了」。
+                if fields and (r.status_code in (400, 422) or _looks_like_rejected_param(r.text)):
+                    rejected.append((dialect, r.status_code, r.text[:160]))
+                    print("[AssembledRecipes] 方言 %s 被拒（HTTP %s），换下一种"
+                          % (dialect, r.status_code), flush=True)
+                    continue
+                raise ProviderError(f"OpenAI 端点 HTTP {r.status_code}: {r.text[:300]}")
+            # 流式
+            with cli.stream("POST", url, json=trial, headers=headers) as r:
+                if r.status_code != 200:
+                    raw = r.read()
+                    txt = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+                    if fields and (r.status_code in (400, 422) or _looks_like_rejected_param(txt)):
+                        rejected.append((dialect, r.status_code, txt[:160]))
+                        print("[AssembledRecipes] 方言 %s 被拒（HTTP %s），换下一种"
+                              % (dialect, r.status_code), flush=True)
+                        continue
+                    raise ProviderError(f"OpenAI 端点 HTTP {r.status_code}: {txt[:300]}")
+                if dialect:
+                    remember_dialect(base_url, model, dialect)
+                chunks, bad = [], 0
+                for line in r.iter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(payload)
+                    except ValueError:
+                        bad += 1
+                        continue
+                    for ch in obj.get("choices") or []:
+                        delta = ch.get("delta") or {}
+                        piece = coerce_text(delta.get("content")) or coerce_text(ch.get("text"))
+                        if piece:
+                            chunks.append(piece)
+            text = "".join(chunks)
+            if not text:
+                raise ProviderError(
+                    f"流式没拿到正文（{bad} 行解不进去）——这个端点可能不支持 stream，改回非流式")
+            return text
+
+    lines = "; ".join("%s → HTTP %s %s" % (d, c, t.replace(chr(10), " ")) for d, c, t in rejected)
+    raise ProviderError(
+        "思考强度 %r 送不出去：试过的方言全被端点拒接（%s）。"
+        "把「思考强度」改成「不思考」再跑，或者告诉我这个端点认哪种参数，我加进方言表。"
+        % (effort, lines or "无"))
 
 # ---------------------------------------------------------------- 统一入口
 

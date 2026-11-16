@@ -877,3 +877,12 @@ def register_routes():
         fn = start if str(body.get("action")) == "start" else stop
         out = await asyncio.get_event_loop().run_in_executor(None, fn)
         return aiohttp.web.json_response(out, dumps=dumps)
+
+    @routes.get("/assembled-recipes/ds/thinking")
+    async def _thinking(request):
+        """面板用：每个端点上次命中的思考方言 + 最近一次拒答（不返回任何密钥）。"""
+        try:
+            from . import providers as _pv
+        except ImportError:
+            import providers as _pv  # type: ignore
+        return aiohttp.web.json_response({"ok": True, "state": _pv.thinking_state()}, dumps=dumps)

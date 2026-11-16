@@ -1855,8 +1855,9 @@ class ReverseLayoutCaption:
             except Exception as e:
                 raise RuntimeError(f"云端反推[{provider}] 失败: {e}") from e
             try:
-                from .reverse_cloud.providers import (check_layout, coerce_text,
-                                                     parse_layout, prompt_provenance)
+                from .reverse_cloud.providers import (check_layout, classify_failure, coerce_text,
+                                                     parse_layout, prompt_provenance,
+                                                     record_refusal)
             except ImportError:
                 import importlib as _il, sys as _sys, os as _os
                 _pd = _os.path.dirname(_os.path.abspath(__file__))
@@ -1865,6 +1866,7 @@ class ReverseLayoutCaption:
                 _pv = _il.import_module("reverse_cloud.providers")
                 check_layout, coerce_text, parse_layout, prompt_provenance = (
                     _pv.check_layout, _pv.coerce_text, _pv.parse_layout, _pv.prompt_provenance)
+                classify_failure, record_refusal = _pv.classify_failure, _pv.record_refusal
             # 有的 OpenAI 兼容端点把 message.content 返回成 parts 数组
             # （[{"type": "text", "text": "…"}]），一路传到 check_layout 会炸成
             # AttributeError: 'list' object has no attribute 'strip'，这里统一收成字符串。
@@ -1885,6 +1887,31 @@ class ReverseLayoutCaption:
             )
             if problem:
                 dump = _dump_cloud_failure(provider, prov, text_out, time.time() - t0, problem)
+                kind, human = classify_failure(text_out)
+                if kind == "refusal":
+                    # 拒答和「格式不合格」不是一回事：一个是模型不肯干，一个是模型没写好。
+                    # 历史上两者都报「格式不合格」，容易让人以为在修解析器，白找一圈。
+                    try:
+                        _b = _m = ""
+                        if not provider_ds and endpoint:
+                            from .reverse_cloud import endpoints as _ep
+                            _row = _ep.resolve(str(endpoint))
+                            _b, _m = _row.get("base") or "", _row.get("model") or ""
+                        record_refusal(_b, _m, text_out)
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        "云端反推[%s] %s，已停止链路。\n"
+                        "用时 %.1fs，输出 %d 字。\n"
+                        "模型原文：%s\n"
+                        "怎么办（按性价比排序）：\n"
+                        "  ① 把「思考强度」改成「不思考」——high/max 会让模型先自我审查一遍，拒答率明显更高；\n"
+                        "  ② 换端点或换模型（当前 %s）；\n"
+                        "  ③ 换一张图。\n"
+                        "%s\n（完整原文已落盘：%s）"
+                        % (provider, human, time.time() - t0, len(text_out or ""),
+                           (text_out or "")[:200].replace(chr(10), " "),
+                           str(endpoint or provider), prov, dump))
                 raise RuntimeError(
                     "云端反推[%s] 格式不合格，已停止链路：%s\n"
                     "用时 %.1fs，输出 %d 字，结尾片段：%r\n%s\n"

@@ -970,6 +970,11 @@ function buildPanel(node) {
 	cc.append(mRow);
 
 	cc.append(ctlSelect(ui, "custom_effort", "思考强度（五档）"));
+	// 思考参数方言：各家请求格式不同（reasoning_effort / thinking{type} / enable_thinking …），
+	// 这一行显示本端点上次自动探测命中的是哪种，以及最近一次拒答（不显示任何密钥）。
+	ui.thinkLine = el("div", "ar-note", "思考参数：未探测");
+	cc.append(ui.thinkLine);
+	refreshThinkState(ui);
 	cc.append(ctlToggle(ui, "custom_stream", "流式返回（默认非流式）"));
 	const testRow = el("div", "ar-row");
 	ui.customTestBtn = el("button", "ar-btn", "测试连通");
@@ -981,6 +986,28 @@ function buildPanel(node) {
 	loadEndpoints(ui).then(() => refreshModeDot(ui));
 
 	body.append(ui.status);
+
+	// 面板上那一行「思考参数：…」的数据源（同源路由，后端 providers.thinking_state）
+	async function refreshThinkState(ui) {
+		if (!ui || !ui.thinkLine) return;
+		try {
+			const r = await fetch("/assembled-recipes/ds/thinking");
+			const j = await r.json();
+			const stt = (j && j.state) || {};
+			// 本机端点库里那一条的真实名字（EP_NAME_ROW），或者库里第一条
+			const row = stt[EP_NAME_ROW] || Object.values(stt)[0];
+			let txt = "思考参数：未探测（下次跑一枪自动选方言）";
+			if (row) {
+				txt = "思考参数：" + (row.label || row.dialect || "未探测");
+				if (row.refusal && row.refusal.at) {
+					txt += "　｜　上次被拒答 " + row.refusal.at + "（降思考强度或换端点）";
+				}
+			}
+			ui.thinkLine.textContent = txt;
+		} catch (e) {
+			ui.thinkLine.textContent = "思考参数：读取失败（后端没起？）";
+		}
+	}
 
 	const PROVIDER_MAP = { local: "本地模型（transformers）", ds: "DeepSeek 云端（内置网关）", custom: "自定义 OpenAI 兼容端点" };
 
