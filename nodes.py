@@ -1446,12 +1446,15 @@ class ReverseLayoutCaption:
 
     @classmethod
     def INPUT_TYPES(cls):
+        # ⚠ widget 顺序 = 旧工作流 widgets_values 的位置顺序，不能乱插。
+        # 前 9 个（rule / user_prompt / model_name / max_new_tokens / pre_clear /
+        # offload_after / quant / tag_mode / batch_index）是历史上就存在的布局，
+        # 任何新控件只能往后追加。把 provider 这类新项插到中间会让旧档整体
+        # 错位一格（实测：max_new_tokens 收到布尔、batch_index 收到字符串，
+        # 直接 int() 崩），所以云端那几项全部排在末尾。
         return {
             "required": {
                 "image": ("IMAGE", {"tooltip": "要反推的图"}),
-                "provider": (["本地模型（transformers）", "DeepSeek 云端（内置网关）", "自定义 OpenAI 兼容端点"],
-                             {"default": "本地模型（transformers）",
-                              "tooltip": "本地=进程内跑 models/LLM 下的模型；DeepSeek 云端=插件自带的纯 Python 网关（直连 DeepSeek 官方接口，图片走官方 file 通道，账密在节点面板「账号绑定」里填一次）；自定义=任意 OpenAI 兼容视觉端点"}),
                 "rule": ("STRING", {"multiline": True, "default": _LAYOUT_RULE_DEFAULT, "tooltip": "反推规则（system 提示词）"}),
                 "user_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "画廊提示词等角色参考资料，遇到不认识的角色用它补全"}),
                 "model_name": (_list_llm_models(), {"tooltip": "本地模式用的模型：ComfyUI/models/LLM/ 下的目录（新放进去的需重启 ComfyUI）；云端模式用不到它"}),
@@ -1460,16 +1463,20 @@ class ReverseLayoutCaption:
                 "offload_after": ("BOOLEAN", {"default": True, "tooltip": "反推完本模型退卡回内存（内存常驻，下次上卡免盘读）"}),
             },
             "optional": {
-                "openai_base": ("STRING", {"default": "", "tooltip": "仅自定义端点模式用：请求地址，如 https://api.deepseek.com 或 https://api.openai.com/v1（自动补全 /v1/chat/completions）"}),
-                "openai_key": ("STRING", {"default": "", "tooltip": "仅自定义端点模式用：Bearer 密钥（也可用环境变量 ASSEMBLED_OPENAI_KEY）"}),
-                "openai_model": ("STRING", {"default": "deepseek-v4.1-flash", "tooltip": "仅自定义端点模式用的模型名（内置 DeepSeek 网关自动选自已在用的那个）"}),
-                "deepseek_thinking": ("BOOLEAN", {"default": True, "tooltip": "云端模式：开思考（更准但更慢；关掉快 30-50%）"}),
-                # 放在后面：旧工作流 widgets_values 保持对齐；缺省=4bit
+                # 这三个是旧布局里的尾巴，位置不能动；云端那几项是新增的，全部排到它们后面
                 "quant": (["4bit (NF4，显存最省)", "8bit", "none (bf16，原精度)"], {"default": "4bit (NF4，显存最省)", "tooltip": "量化方式。4bit 显存最省（12B 在 16GB 卡上只有它能跑）；8bit / bf16 只有小模型或大显存卡才装得下，不够时节点会直接报错不等加载"}),
                 # 大模型（如 Gemma4-12B）有能力自己从一堆 tag 里筛出画面真实内容，
                 # 小模型容易看到多少 tag 就框多少个，所以做成开关。
                 "tag_mode": (["全部（推荐 12B 级大模型）", "精简（只给前几个 tag）"], {"default": "全部（推荐 12B 级大模型）", "tooltip": "画廊 tag 喂多少给模型。全部=画质/装束细节更准，但小模型容易“看到多少 tag 就框多少个”；精简=只给开头的作品/角色名，防暴框"}),
                 "batch_index": ("INT", {"default": 0, "min": 0, "max": 63, "tooltip": "上游一次送来多张图时（画廊多选）用第几张，0=第一张。日志会打印「收到 N 张，本次用第 X 张」和原图尺寸，可据此核对是不是你要的那张"}),
+                # ---- 以下为云端新增项，只能排在旧项后面（见上面顺序注释）----
+                "provider": (["本地模型（transformers）", "DeepSeek 云端（内置网关）", "自定义 OpenAI 兼容端点"],
+                             {"default": "本地模型（transformers）",
+                              "tooltip": "本地=进程内跑 models/LLM 下的模型；DeepSeek 云端=插件自带的纯 Python 网关（直连 DeepSeek 官方接口，图片走官方 file 通道，账密在节点面板「账号绑定」里填一次）；自定义=任意 OpenAI 兼容视觉端点"}),
+                "openai_base": ("STRING", {"default": "", "tooltip": "仅自定义端点模式用：请求地址，如 https://api.deepseek.com 或 https://api.openai.com/v1（自动补全 /v1/chat/completions）"}),
+                "openai_key": ("STRING", {"default": "", "tooltip": "仅自定义端点模式用：Bearer 密钥（也可用环境变量 ASSEMBLED_OPENAI_KEY）"}),
+                "openai_model": ("STRING", {"default": "deepseek-v4.1-flash", "tooltip": "仅自定义端点模式用的模型名（内置 DeepSeek 网关自动选自已在用的那个）"}),
+                "deepseek_thinking": ("BOOLEAN", {"default": True, "tooltip": "云端模式：开思考（更准但更慢；关掉快 30-50%）"}),
             },
         }
 

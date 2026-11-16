@@ -84,6 +84,21 @@ class _Accumulator:
         return "".join(self.think[k] for k in sorted(self.think))
 
 
+def _mute_readable(inner: dict) -> str:
+    """上游回 biz_msg="user is muted" 时，把 mute_until 翻成人话（所有端点共用）。"""
+    if not isinstance(inner, dict) or str(inner.get("biz_msg") or "").strip() != "user is muted":
+        return ""
+    biz = inner.get("biz_data") if isinstance(inner.get("biz_data"), dict) else {}
+    until = biz.get("mute_until")
+    if not until:
+        return "DeepSeek: 账号被禁言（user is muted），上游没给了时间"
+    import datetime as _dt
+    when = _dt.datetime.fromtimestamp(float(until))
+    left = (float(until) - time.time()) / 3600.0
+    return ("DeepSeek 把这个账号禁言了，%s 才解（上游原文 user is muted，还剩 %.0f 小时）"
+            % (when.strftime("%m-%d %H:%M"), max(0.0, left)))
+
+
 class DeepSeekError(RuntimeError):
     """带错误码的直连异常（biz_msg / code 原样带出，便于面板显示真因）。"""
 
@@ -96,21 +111,43 @@ class DeepSeekError(RuntimeError):
         text = str(self).upper()
         return "TOO_MANY_REQUESTS" in text or "RATE" in text
 
+    @property
+    def auth_failed(self) -> bool:
+        """token 失效（上游会直接回 Authorization Failed / invalid token，实测登录一次后
+        旧 token 就作废，而客户端只按 5h 龄期缓存 → 隔一阵子第一枪必挂）。"""
+        text = str(self).upper()
+        return ("AUTHORIZATION FAILED" in text or "INVALID TOKEN" in text
+                or "UNAUTHORIZED" in text or "TOKEN_EXPIRED" in text
+                or "HTTP 401" in text or "HTTP 403" in text
+                or "NOT LOGGED IN" in text)
+
 
 # 上游限流时的退避重试（实测短时间连打多枪会回 TOO_MANY_REQUESTS）
 _RETRY_WAITS = (15.0, 30.0, 60.0)
 _DEBUG = bool(os.environ.get("ASSEMBLED_DS_DEBUG"))
 
 
-def _with_rate_retry(fn, what: str):
+def _with_retry(client, fn, what: str):
+    """两种可恢复故障的处理：
+      · token 失效 → 丢缓存、重新登录、重试（只给一次机会，避免登录风暴）
+      · 限流 → 15/30/60s 退避重试
+    其余错误原样报出。
+    """
+    relogged = False
     for attempt, wait in enumerate(_RETRY_WAITS):
         try:
             return fn()
         except DeepSeekError as e:
-            if not e.rate_limited:
-                raise
-            print("[DS网关] %s 被限流，%ds 后重试（第%d次）" % (what, int(wait), attempt + 1), flush=True)
-            time.sleep(wait)
+            if e.auth_failed and not relogged:
+                relogged = True
+                client.drop_token()
+                print("[DS网关] %s token 失效，已重新登录重试：%s" % (what, e), flush=True)
+                continue
+            if e.rate_limited:
+                print("[DS网关] %s 被限流，%ds 后重试（第%d次）" % (what, int(wait), attempt + 1), flush=True)
+                time.sleep(wait)
+                continue
+            raise
     return fn()
 
 
@@ -215,7 +252,8 @@ class DeepSeekClient:
         if code not in (0, None):
             raise DeepSeekError("DeepSeek: %s" % (payload.get("msg") or code), code=code)
         if biz_code not in (0, None):
-            raise DeepSeekError("DeepSeek: %s" % (inner.get("biz_msg") or biz_code), code=biz_code)
+            raise DeepSeekError(_mute_readable(inner) or "DeepSeek: %s" % (inner.get("biz_msg") or biz_code),
+                                code=biz_code)
         if biz is None:
             raise DeepSeekError("DeepSeek 响应缺 biz_data: " + json.dumps(payload, ensure_ascii=False)[:180])
         return biz
@@ -251,6 +289,12 @@ class DeepSeekClient:
                 return self.login()
             return self._token
 
+    def drop_token(self) -> None:
+        """丢掉缓存的 token（上游说它失效了就用这个，下一枪会重新登录）。"""
+        with _LOCK:
+            self._token = None
+            self._token_ts = 0.0
+
     # ---- PoW ----
     def pow_header(self, target_path: str, force: bool = True) -> str:
         """取一份新 challenge 并求解。
@@ -278,8 +322,8 @@ class DeepSeekClient:
     def upload_image(self, data: bytes, filename: str = "layout.jpg",
                      content_type: str = "image/jpeg", wait_ready_s: float = 90.0) -> str:
         """上传 PIL 图，返回 file_id（内部轮询到解析 SUCCESS）。"""
-        return _with_rate_retry(
-            lambda: self._upload_once(data, filename, content_type, wait_ready_s), "upload_file")
+        return _with_retry(
+            self, lambda: self._upload_once(data, filename, content_type, wait_ready_s), "upload_file")
 
     def _upload_once(self, data, filename, content_type, wait_ready_s) -> str:
         self.ensure_token()
@@ -324,7 +368,8 @@ class DeepSeekClient:
         被限流时整轮重做；ensure(text) 返回 False（例如 JSON 被拦腰截断）时
         自动走 /api/v0/chat/continue 续写，最多 max_continue 轮。
         """
-        result = _with_rate_retry(
+        result = _with_retry(
+            self,
             lambda: self._completion_once(prompt, session_id, parent_message_id,
                                           file_ids, thinking, search, on_delta),
             "completion")
@@ -365,8 +410,34 @@ class DeepSeekClient:
             if resp.status_code != 200:
                 raw = resp.read()
                 raise DeepSeekError("continue HTTP %s: %s" % (resp.status_code, raw[:200]))
+            self._guard_error_envelope(resp, "continue")
             self._consume_sse(resp, acc)
         return acc.text()
+
+    @staticmethod
+    def _guard_error_envelope(resp, what: str) -> None:
+        """上游出错时不回事件流，而回一个 application/json 错误信封。
+
+        实测样本（账号被禁言）：
+          {"code":0,"data":{"biz_code":5,"biz_msg":"user is muted",
+           "biz_data":{"is_muted":1,"mute_until":1795053265.0,"msg":null}}}
+        不拦的话流里一个字节都没有，节点会静默交出空正文 → 下游 0 框，没人知道为什么。
+        """
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if "application/json" not in ctype:
+            return
+        raw = resp.read()
+        try:
+            payload = json.loads((raw or b"").decode("utf-8", "ignore") or "{}")
+        except ValueError:
+            raise DeepSeekError("%s 返回非流内容(%s): %s" % (what, ctype, raw[:180]))
+        inner = (payload.get("data") or {}) if isinstance(payload, dict) else {}
+        hint = _mute_readable(inner)
+        if hint:
+            raise DeepSeekError(hint, code=inner.get("biz_code"))
+        DeepSeekClient._unwrap(payload)   # biz_code 非 0 会在这里抛（带出上游原文）
+        raise DeepSeekError("%s 没有返回事件流（content-type=%s）: %s"
+                            % (what, ctype, json.dumps(payload, ensure_ascii=False)[:200]))
 
     def _completion_once(self, prompt, session_id, parent_message_id, file_ids,
                          thinking, search, on_delta) -> dict:
@@ -395,6 +466,7 @@ class DeepSeekClient:
             if resp.status_code != 200:
                 raw = resp.read()
                 raise DeepSeekError("completion HTTP %s: %s" % (resp.status_code, raw[:200]))
+            self._guard_error_envelope(resp, "completion")
             self._consume_sse(resp, acc, on_delta)
         answer = acc.text()
         if acc.auto_continue and acc.message_id:
