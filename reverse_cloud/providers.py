@@ -103,6 +103,48 @@ def _looks_like_rejected_effort(text: str) -> bool:
                         "unexpected", "unrecognized", "not permitted", "not allowed", "invalid value"))
 
 
+def coerce_text(v) -> str:
+    """把各家返回的「正文」统一成 str。
+
+    为什么需要它：标准 OpenAI 的 message.content 是字符串，但不少兼容端点（含视觉多段
+    输出、部分网关）会返回 parts 数组：[{"type": "text", "text": "..."}]。
+    直接把这个 list 往下传，会在 check_layout 里炸成
+    AttributeError: 'list' object has no attribute 'strip'（2026-11-16 实测）。
+    """
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (list, tuple)):
+        out = []
+        for part in v:
+            if isinstance(part, str):
+                out.append(part)
+                continue
+            if isinstance(part, dict):
+                # 思考段必须跳过：有的网关把 reasoning_effort 的产物作为独立 part 返回
+                # （{"type": "thinking", "thinking": "...", "closed": true}），
+                # 混进正文会把 JSON 泡成"思考过程 + 正文"，check_layout 直接判不合格。
+                ptype = str(part.get("type") or "").lower()
+                if ptype in ("thinking", "reasoning", "reasoning_content", "analysis"):
+                    continue
+                t = part.get("text")
+                if t is None:
+                    t = part.get("content")
+                if isinstance(t, dict):
+                    t = t.get("text")
+                out.append(coerce_text(t))
+                continue
+            out.append(coerce_text(part))
+        return "".join(out)
+    if isinstance(v, dict):
+        for k in ("text", "content", "output_text", "caption", "message"):
+            if k in v:
+                return coerce_text(v[k])
+        return ""
+    return str(v)
+
+
 def _openai_chat(base_url: str, api_key: str, model: str, system: str, user_text: str,
                  pil, temperature: float = 1.0, timeout: float = 300.0,
                  data_url: str | None = None, stream: bool = False,
@@ -139,9 +181,13 @@ def _openai_chat(base_url: str, api_key: str, model: str, system: str, user_text
             if r.status_code != 200:
                 raise ProviderError(f"OpenAI 端点 HTTP {r.status_code}: {r.text[:300]}")
             try:
-                return r.json()["choices"][0]["message"]["content"] or ""
+                raw = r.json()["choices"][0]["message"]["content"]
             except Exception as e:
                 raise ProviderError(f"OpenAI 响应解析失败: {e} :: {r.text[:300]}")
+            if isinstance(raw, (list, tuple)):
+                print("[AssembledRecipes] 端点把 content 返回成 %d 段数组，已拼接成一段正文"
+                      % len(raw), flush=True)
+            return coerce_text(raw)
         # 流式：逐行拼 delta（部分网关会额外吏 reasoning_content，不能当正文）
         chunks, bad = [], 0
         with cli.stream("POST", url, json=body, headers=headers) as r:
@@ -161,7 +207,8 @@ def _openai_chat(base_url: str, api_key: str, model: str, system: str, user_text
                     continue
                 for ch in obj.get("choices") or []:
                     delta = ch.get("delta") or {}
-                    piece = delta.get("content") or ch.get("text") or ""
+                    # content 可能是字符串，也可能是 parts 数组（含 thinking 段）
+                    piece = coerce_text(delta.get("content")) or coerce_text(ch.get("text"))
                     if piece:
                         chunks.append(piece)
         text = "".join(chunks)
@@ -315,7 +362,7 @@ def parse_layout(text: str):
        · 旧版/模型偷懒：裸数组 [...]，此时 summary 为空串
     解析不出来返回 None。不做字段校验（校验在 check_layout）。
     """
-    raw = (text or "").strip()
+    raw = coerce_text(text).strip()
     if not raw:
         return None
     # 剥 markdown 围栏
@@ -365,7 +412,7 @@ def check_layout(text: str):
     （而不是把一堆废话交给下游清洗节点静默变空布局）；note 是「修好了什么」的说明，
     要打印出来——修过的东西不能悄悄修。
     """
-    raw = (text or "").strip()
+    raw = coerce_text(text).strip()
     if not raw:
         return None, "模型返回空正文", ""
     parsed = parse_layout(raw)

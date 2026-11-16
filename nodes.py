@@ -1855,15 +1855,20 @@ class ReverseLayoutCaption:
             except Exception as e:
                 raise RuntimeError(f"云端反推[{provider}] 失败: {e}") from e
             try:
-                from .reverse_cloud.providers import check_layout, parse_layout, prompt_provenance
+                from .reverse_cloud.providers import (check_layout, coerce_text,
+                                                     parse_layout, prompt_provenance)
             except ImportError:
                 import importlib as _il, sys as _sys, os as _os
                 _pd = _os.path.dirname(_os.path.abspath(__file__))
                 if _pd not in _sys.path:
                     _sys.path.insert(0, _pd)
                 _pv = _il.import_module("reverse_cloud.providers")
-                check_layout, parse_layout, prompt_provenance = (
-                    _pv.check_layout, _pv.parse_layout, _pv.prompt_provenance)
+                check_layout, coerce_text, parse_layout, prompt_provenance = (
+                    _pv.check_layout, _pv.coerce_text, _pv.parse_layout, _pv.prompt_provenance)
+            # 有的 OpenAI 兼容端点把 message.content 返回成 parts 数组
+            # （[{"type": "text", "text": "…"}]），一路传到 check_layout 会炸成
+            # AttributeError: 'list' object has no attribute 'strip'，这里统一收成字符串。
+            text_out = coerce_text(text_out)
             # 格式不对就直接停，不要把一堆废话交给下游清洗节点静默变空布局：
             # 旧行为是“云端喷了非 JSON / 被截断 → 清洗保留 0 框 → 整条链路当没反推继续出图”，
             # 看上去 success，实际白跑一张。
