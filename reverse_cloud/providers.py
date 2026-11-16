@@ -341,7 +341,14 @@ def parse_layout(text: str):
                     items = json.loads(items)
                 except ValueError:
                     items = None
-            return str(v.get("summary") or "").strip(), (items if isinstance(items, list) else [])
+            summ = v.get("summary")
+            # 官方 schema 里 summary 是对象 {"caption": ..., "canvas": ..., "meta": [...]}；
+            # 直接 str() 会把整坨 dict 塞进 summary 输出口，下游拼提示词就会看到 {'caption': '...'}，
+            # 所以对象形态先取 caption，取不到再退化成用户给的 summary 字符串
+            if isinstance(summ, dict):
+                summ = (summ.get("caption") or summ.get("summary")
+                        or summ.get("description") or "")
+            return str(summ or "").strip(), (items if isinstance(items, list) else [])
     arr = extract_json_array(raw)
     if arr is not None:
         return "", arr
