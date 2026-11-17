@@ -878,6 +878,28 @@ def register_routes():
         out = await asyncio.get_event_loop().run_in_executor(None, fn)
         return aiohttp.web.json_response(out, dumps=dumps)
 
+    @routes.get("/assembled-recipes/ds/extra")
+    async def _extra_get(request):
+        """面板读本机的「额外要求」（不进工作流，也不进出图 PNG 元数据）。"""
+        try:
+            from . import endpoints as _ep
+        except ImportError:
+            import endpoints as _ep  # type: ignore
+        return aiohttp.web.json_response({"ok": True, "text": _ep.read_extra()}, dumps=dumps)
+
+    @routes.post("/assembled-recipes/ds/extra")
+    async def _extra_set(request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            from . import endpoints as _ep
+        except ImportError:
+            import endpoints as _ep  # type: ignore
+        path = _ep.write_extra(str(body.get("text") or ""))
+        return aiohttp.web.json_response({"ok": True, "path": path}, dumps=dumps)
+
     @routes.get("/assembled-recipes/ds/thinking")
     async def _thinking(request):
         """面板用：每个端点上次命中的思考方言 + 最近一次拒答（不返回任何密钥）。"""

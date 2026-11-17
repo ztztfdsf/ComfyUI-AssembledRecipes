@@ -1827,6 +1827,16 @@ class ReverseLayoutCaption:
         import torch
         # 额外要求一进来就并进规则：三条 provider 路径、provenance、日志全都吃同一份，
         # 不允许某条路漏掉（以前云端/本地各拼一套，漏一次就查半天）
+        # 额外要求存本机（user/AssembledRecipes/extra_requirement.txt）：
+        # 不进工作流、不进 /history、也不进出图 PNG 的 workflow 元数据。
+        # 工作流里那一格永远留空；万一老工作流还留着文本，读不到文件时才退回用它。
+        try:
+            from .reverse_cloud import endpoints as _epx
+            _local_extra = _epx.read_extra()
+        except Exception:
+            _local_extra = ""
+        if (_local_extra or "").strip():
+            extra_requirement = _local_extra
         rule = _merge_extra_rule(rule, extra_requirement)
         provider_local = str(provider).startswith("本地")
         provider_ds = "DeepSeek" in str(provider)

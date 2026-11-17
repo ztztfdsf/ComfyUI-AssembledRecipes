@@ -185,3 +185,33 @@ def public_view() -> dict:
         } for e in rows],
         "path": config_path(),
     }
+
+
+# ---------------------------------------------------------------- 额外要求（本机存盘）
+# 这段文本是「每次想说的临时约束」，主人明确要求存本地、不进工作流、也不进出图 PNG 元数据：
+# 工作流里那一格永远留空，节点在每次执行时从本文件读。
+def extra_path() -> str:
+    return os.path.join(os.path.dirname(config_path()), "extra_requirement.txt")
+
+
+def read_extra() -> str:
+    p = extra_path()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def write_extra(text: str) -> str:
+    p = extra_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text or "")
+    os.replace(tmp, p)
+    try:
+        os.chmod(p, 0o600)
+    except OSError:
+        pass
+    return p

@@ -844,13 +844,48 @@ function buildPanel(node) {
 	cTag.append(ctlSelect(ui, "tag_mode", "喂给模型多少标签"));
 	pageMain.append(cTag);
 
-	// 额外要求：放在规则上面，且不进折叠区——这是每次现写的临时约束，要一眼看到
+	// 额外要求：放规则上面、不进折叠区——这是每次现写的临时约束，要一眼看到。
+	// 但内容存本机（/assembled-recipes/ds/extra），**不进工作流、不进 PNG 元数据**：
+	// 工作流里那一格永远留空，执行时节点自己读本机文件。
 	const cExtra = el("div", "ar-card");
-	cExtra.append(el("div", "cap", "额外要求"));
-	cExtra.append(ctlText(ui, "extra_requirement", "本次额外要求（拼在规则末尾，冲突时以这里为准）", {
-		multiline: true,
-		placeholder: "例：只框人物不框背景；画面文字必须逐字保留",
-	}));
+	cExtra.append(el("div", "cap", "额外要求（存本机，不进工作流）"));
+	const extraTa = el("textarea");
+	extraTa.rows = 4;
+	extraTa.placeholder = "例：只框人物不框背景；画面文字必须逐字保留";
+	cExtra.append(extraTa);
+	ui.extraTa = extraTa;
+	(async () => {
+		try {
+			const j = await (await fetch("/assembled-recipes/ds/extra")).json();
+			const local = (j && j.text) || "";
+			const w = widgetOf(ui.node, "extra_requirement");
+			const wv = String((w && w.value) || "");
+			if (!local.trim() && wv.trim()) {
+				// 一次性迁移：老工作流里存着的文本搬到本机文件，然后把工作流里那格清空
+				await fetch("/assembled-recipes/ds/extra", {
+					method: "POST", headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ text: wv }),
+				});
+				extraTa.value = wv;
+				if (w) { w.value = ""; w.callback?.(""); saveState(ui.node); }
+			} else {
+				extraTa.value = local;
+				if (w && wv) { w.value = ""; saveState(ui.node); }
+			}
+		} catch (e) {
+			extraTa.placeholder = "读不到本机额外要求：" + (e.message || e);
+		}
+	})();
+	let extraTimer = null;
+	extraTa.addEventListener("input", () => {
+		clearTimeout(extraTimer);
+		extraTimer = setTimeout(() => {
+			fetch("/assembled-recipes/ds/extra", {
+				method: "POST", headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ text: extraTa.value }),
+			}).catch(() => {});
+		}, 400);
+	});
 	pageMain.append(cExtra);
 
 	const c3 = el("details", "ar-card");
