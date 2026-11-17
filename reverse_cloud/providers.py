@@ -117,13 +117,22 @@ def _looks_like_rejected_effort(text: str) -> bool:
 
 
 # ---------------------------------------------------------------- 拒答识别
+# 「拒答」与「没按格式写」必须分开：前者换图/降思考强度/换端点，后者是提示词或解析问题。
+# 判据要收紧——只看 "I cannot …" 会把「我看不到图」这类废话误判成拒答（实测踩过），
+# 所以强特征单独命中，弱特征必须同时出现题材/政策类理由词。
 _REFUSAL_STRONG = (
-    "我无法协助", "无法协助", "我不能处理", "不能处理", "我不会为", "不会为这类", "无法提供",
-    "不会生成", "不能生成", "抱歉，我", "很抱歉", "拒绝", "无法满足", "不合适处理", "涉及敏感",
-    "i can't", "i cannot", "i can\'t assist", "cannot assist", "can\'t assist", "i won\'t",
-    "i am unable", "i\'m unable", "not able to help", "unable to help", "cannot help with",
-    "i must decline", "against my guidelines", "violates", "content policy", "safety policy",
+    "我无法协助", "无法协助", "不能协助", "我不会为", "我不会提供", "无法提供这类",
+    "不能生成", "不会生成", "拒绝提供", "拒绝协助", "不予协助", "涉及敏感",
+    "i can't assist", "i cannot assist", "cannot assist", "can't assist",
+    "i can't help with", "i cannot help with", "cannot help with",
+    "i won't", "i will not", "unable to assist", "must decline",
+    "content policy", "safety policy", "against my guidelines", "violates my",
+    "not able to help with", "won't be able to help",
 )
+_REFUSAL_SOFT = ("cannot", "can't", "unable", "抱歉", "很抱歉", "拒绝", "无法")
+_REFUSAL_REASON = ("未成年", "未成年", "儿童", "幼", "性", "sexual", "minor", "child",
+                   "nudity", "naked", "explicit", "policy", "guideline", "safety",
+                   "appropriate", "不适", "敏感", "审查")
 
 
 def looks_like_refusal(text: str) -> bool:
@@ -134,7 +143,10 @@ def looks_like_refusal(text: str) -> bool:
     if "{" in t or "[" in t:
         return False
     low = t.lower()
-    return any(k.lower() in low for k in _REFUSAL_STRONG)
+    if any(k in low for k in _REFUSAL_STRONG):
+        return True
+    # 弱特征（cannnot / 抱歉 / 无法）必须配题材或政策理由，否则「我看不到图」会被误判
+    return any(k in low for k in _REFUSAL_SOFT) and any(k in low for k in _REFUSAL_REASON)
 
 
 def classify_failure(text: str) -> tuple:
@@ -144,7 +156,7 @@ def classify_failure(text: str) -> tuple:
         return ("empty", "模型返回空正文")
     if looks_like_refusal(t):
         return ("refusal", "模型拒答（内容安全过滤），不是格式问题")
-    return ("format", "正文里抠不出 JSON 数组（模型没按格式回答）")
+    return ("format", "回复里找不到可用的布局 JSON（模型没按格式回答）")
 
 
 def coerce_text(v) -> str:
@@ -606,50 +618,94 @@ def salvage_objects(text: str):
     return objs if objs and all(("bbox" in o) for o in objs) else None
 
 
+def _scan_json_blocks(text: str):
+    """字符串感知地扫出所有顶层 JSON 块（{...} 或 [...]），允许前后夹任意散文。
+
+    为什么不用正则：desc 里常带括号、引号、甚至别的 JSON 片段，正则必然吃偏；
+    这里按括号栈配对，且字符串内部（含转义）完全跳过。
+    """
+    out, stack = [], []
+    in_str = esc = False
+    for i, c in enumerate(text or ""):
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c in "{[":
+            stack.append((c, i))
+        elif c in "}]":
+            if not stack:
+                continue
+            opened, start = stack.pop()
+            if (opened, c) not in (("{", "}"), ("[", "]")):
+                continue
+            if not stack:
+                out.append(text[start:i + 1])
+    return out
+
+
+def extract_layout_json(text: str):
+    """从「思考块 + 散文 + 一个 JSON」这种回复里把那份布局 JSON 抠出来。
+
+    主人定的口径：回复里不限制写说明文字，但只允许有一个 JSON；解析只认那一个，
+    其余内容一概不管。所以这里按**内容**挑（有 items/summary 的对象，或元素都带 bbox 的数组），
+    不看位置——散文里冒出花括号也不会被误当成 JSON（解不开就换下一个候选块）。
+    返回 (obj, kind)，kind 是 "dict" / "list"，抠不到返回 (None, "")。
+    """
+    raw = strip_thinking(text)
+    if not raw:
+        return None, ""
+    dicts, lists = [], []
+    for blk in sorted(_scan_json_blocks(raw), key=len, reverse=True):
+        try:
+            v = json.loads(blk)
+        except ValueError:
+            continue
+        if isinstance(v, dict) and ("items" in v or "summary" in v):
+            dicts.append(v)
+        elif isinstance(v, list) and v and all(
+                isinstance(o, dict) and "bbox" in o for o in v):
+            lists.append(v)
+    if dicts:
+        return dicts[0], "dict"
+    if lists:
+        return lists[0], "list"
+    return None, ""
+
+
 def parse_layout(text: str):
     """把反推正文解析成 (summary, items)。两种形状都收：
        · 新版（现行默认规则要求的）：{"summary": "...", "items": [...]}
        · 旧版/模型偷懒：裸数组 [...]，此时 summary 为空串
     解析不出来返回 None。不做字段校验（校验在 check_layout）。
+    说明文字、思考块、markdown 围栏都不影响：只把那份 JSON 抠出来。
     """
-    raw = strip_thinking(text)
-    if not raw:
-        return None
-    # 剥 markdown 围栏
-    if "```" in raw:
-        for part in raw.split("```"):
-            q = part.strip()
-            if q.lower().startswith("json"):
-                q = q[4:].strip()
-            if q[:1] in ("[", "{"):
-                raw = q
-                break
-    # 先试对象（新版）
-    i, j = raw.find("{"), raw.rfind("}")
-    if i >= 0 and j > i:
-        try:
-            v = json.loads(raw[i:j + 1])
-        except ValueError:
-            v = None
-        if isinstance(v, dict) and ("items" in v or "summary" in v):
-            items = v.get("items")
-            if isinstance(items, str):
-                try:
-                    items = json.loads(items)
-                except ValueError:
-                    items = None
-            summ = v.get("summary")
-            # 官方 schema 里 summary 是对象 {"caption": ..., "canvas": ..., "meta": [...]}；
-            # 直接 str() 会把整坨 dict 塞进 summary 输出口，下游拼提示词就会看到 {'caption': '...'}，
-            # 所以对象形态先取 caption，取不到再退化成用户给的 summary 字符串
-            if isinstance(summ, dict):
-                summ = (summ.get("caption") or summ.get("summary")
-                        or summ.get("description") or "")
-            return str(summ or "").strip(), (items if isinstance(items, list) else [])
-    arr = extract_json_array(raw)
-    if arr is not None:
-        return "", arr
-    salv = salvage_objects(raw) if raw.count("[") <= raw.count("]") else None
+    obj, kind = extract_layout_json(text)
+    if kind == "dict":
+        items = obj.get("items")
+        if isinstance(items, str):
+            try:
+                items = json.loads(items)
+            except ValueError:
+                items = None
+        summ = obj.get("summary")
+        # 官方 schema 里 summary 是对象 {"caption": ..., "canvas": ..., "meta": [...]}；
+        # 直接 str() 会把整坨 dict 塞进 summary 输出口，下游拼提示词会看到 {'caption': '...'}，
+        # 所以对象形态先取 caption，取不到再退化成字符串
+        if isinstance(summ, dict):
+            summ = (summ.get("caption") or summ.get("summary")
+                    or summ.get("description") or "")
+        return str(summ or "").strip(), (items if isinstance(items, list) else [])
+    if kind == "list":
+        return "", obj
+    # 兜底：框都吐了、只是整份没套外壳（gemma-4-E2B 实测这样）
+    salv = salvage_objects(strip_thinking(text))
     if salv:
         return "", salv
     return None
@@ -673,15 +729,15 @@ def check_layout(text: str):
         arr = parsed[1]
     if arr is None:
         # 截断优先判：少掉的是内容不是噪声，宁可停也不要拿半份布局去出图
-        if raw.count("[") > raw.count("]"):
+        if any(raw.count(a) > raw.count(b) for a, b in (("{", "}"), ("[", "]"))):
             got = len(salvage_objects(raw) or [])
-            return None, ("JSON 数组没闭合（输出被 token 上限截断）" +
+            return None, ("JSON 没闭合（输出被 token 上限截断）" +
                           ("，前 %d 个框是完整的但后面的框已经丢了" % got if got else "")), ""
         # 没截断、只是整份没套数组外壳（gemma-4-E2B 实测这样）：纯机械问题，救回来
         salv = salvage_objects(raw)
         if salv:
             return salv, None, "模型没套数组外壳，已按顶层对象补齐（%d 个框）" % len(salv)
-        return None, "正文里抠不出 JSON 数组（模型没按格式回答）", ""
+        return None, "回复里找不到可用的布局 JSON（模型没按格式回答）", ""
     bad = []
     for i, o in enumerate(arr):
         b = o.get("bbox")
