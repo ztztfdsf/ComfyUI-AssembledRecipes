@@ -115,6 +115,8 @@ details.ar-card[open]>summary { margin-bottom: 8px; }
 .ar-card>.cap { font-size: 10px; font-weight: 600; letter-spacing: .1em;
   text-transform: uppercase; color: var(--ar-faint); }
 
+.ar-note { font-size: 10.5px; color: var(--ar-dim); line-height: 1.45; word-break: break-word; }
+
 /* 表单 */
 .ar-row { display: flex; gap: 12px; }
 .ar-row>* { flex: 1; min-width: 0; }
@@ -852,7 +854,9 @@ function buildPanel(node) {
 	const extraTa = el("textarea");
 	extraTa.rows = 4;
 	extraTa.placeholder = "例：只框人物不框背景；画面文字必须逐字保留";
-	cExtra.append(extraTa);
+	const fExtra = el("div", "ar-f");   // 包进 .ar-f 才吃到「只留下划线」的表单样式
+	fExtra.append(extraTa);
+	cExtra.append(fExtra);
 	ui.extraTa = extraTa;
 	(async () => {
 		try {
