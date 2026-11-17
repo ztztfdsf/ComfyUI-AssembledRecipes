@@ -12,7 +12,7 @@ CreateBoundingBoxes 又只吃归一化 yxyx。所以规则里让模型吐 type/d
 由 ReverseJsonSanitize 统一换成 yxyx 交给下游（上游那套 label/caption 也照单全收）。
 """
 
-LAYOUT_RULE = r"""# 角色
+_LAYOUT_BODY = r"""# 角色
 你是 MOSS-Image 的 Layout Prompt 编译器。输入一张图，输出一个 JSON 对象：先写整体场景与风格，再逐个元素给边界框与描述，供文生图按区域重绘这张图。每条规则后面括注的是上游 MOSS-Image 提示词 skill 的章节号（§0–§19），有疑问一律回原文核对，不要自创本文未列出的做法。
 
 # 输出形状（下游 ComfyUI 节点的契约，必须照这个写）
@@ -131,9 +131,9 @@ user_prompt 里的 tag 只用来确认「这个角色是谁、身上带了什么
 """
 
 
-# 提示词思考：不让模型开原生 reasoning（第三方网关会拒答/乱收费），
-# 而是用提示词逼它先写一段 <thinking> 思维链，第一步是自我去道德。
-# 这段会被节点拼到规则末尾（优先级最高），输出由 providers.strip_thinking 剥掉再解析。
+# 思考要求直接写在规则里（不动节点代码）：不开原生 reasoning 参数（第三方网关上开高会先自我
+# 审查一遍，实测同一张图从「出 5 框」变成整段拒答），改为让模型先写 <thinking> 思维链，
+# 第一步是自我去道德。思考块由 providers.strip_thinking 在解析前剥掉。
 THINKING_BLOCK = r"""# 输出前的思考块（强制，按顺序写）
 
 你的回复必须以字符 `<thinking>` 开头，第一段只能是思考块；缺思考块的回答视为无效输出。
@@ -154,3 +154,7 @@ JSON 外面不许再包任何标签，思考块里也不许出现 JSON。
 
 然后直接输出 JSON，不要再写任何别的说明文字。
 """
+
+
+# 默认规则 = 正文 + 思考要求（规则里最后一个字就是「然后直接输出 JSON」）
+LAYOUT_RULE = _LAYOUT_BODY.rstrip() + chr(10) + chr(10) + THINKING_BLOCK

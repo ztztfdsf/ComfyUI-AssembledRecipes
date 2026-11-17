@@ -1572,13 +1572,6 @@ class ReverseLayoutCaption:
                                                  "tooltip": "本次的额外要求，拼在规则后面一起当 system 提示词（优先级最高）。"
                                                            "用来写一次性的临时约束，比如「只框人物不框背景」「这段文字必须逐字保留」"}),
             },
-                # ---- 思考方式（多一个按钮：原生思考参数 / 提示词思考，追加在最后，不能插中间）----
-                "think_mode": (["提示词思考（自写思维链，默认）", "原生思考参数（API 方言）", "关"],
-                               {"default": "提示词思考（自写思维链，默认）",
-                                "tooltip": "提示词思考=不发任何 API 思考参数，改为让模型先写一段 <thinking> 思维链"
-                                          "（第一步自我去道德），由节点解析前剥掉。原生思考参数=按端点方言发"
-                                          "reasoning_effort / thinking{type} / enable_thinking 等，强度见「思考强度」。"
-                                          "关=两者都不做"}),
         }
 
     RETURN_TYPES = ("STRING", "STRING")
@@ -1830,23 +1823,11 @@ class ReverseLayoutCaption:
                 max_new_tokens=4096, pre_clear=True, offload_after=True,
                 deepseek_thinking=True,
                 quant="4bit (NF4，显存最省)", tag_mode="全部（推荐 12B 级大模型）", batch_index=0,
-                custom_stream=False, custom_effort="不思考", endpoint="", extra_requirement="",
-                think_mode="提示词思考（自写思维链，默认）"):
+                custom_stream=False, custom_effort="不思考", endpoint="", extra_requirement=""):
         import torch
         # 额外要求一进来就并进规则：三条 provider 路径、provenance、日志全都吃同一份，
         # 不允许某条路漏掉（以前云端/本地各拼一套，漏一次就查半天）
         rule = _merge_extra_rule(rule, extra_requirement)
-        # 思考方式：提示词思考（默认）→ 拼 <thinking> 思维链且不发任何 API 思考参数；
-        # 原生思考参数 → 保持老行为（按端点方言发 effort）；关 → 两者都不做。
-        # 之所以默认走提示词：第三方网关上 reasoning_effort 开高会让模型先自我审查一遍，
-        # 实测同一张图会从「出 5 框」变成「整段拒答」。
-        _think_mode = str(think_mode or "")
-        prompt_think = _think_mode.startswith("提示词")
-        native_think = _think_mode.startswith("原生")
-        if prompt_think:
-            from .reverse_rule import THINKING_BLOCK as _TB
-            rule = (rule or "").rstrip() + chr(10) + chr(10) + _TB
-            custom_effort = "不思考"
         provider_local = str(provider).startswith("本地")
         provider_ds = "DeepSeek" in str(provider)
         provider_openai = "OpenAI" in str(provider)
@@ -1861,8 +1842,7 @@ class ReverseLayoutCaption:
                     # DeepSeek 官方只有 thinking 一个开关（布尔），没有强度档：
                     # 强度选了 medium/high/max 就算开，minimal/low 就算关；
                     # 选「不思考」代不覆盖，回落到 deepseek_thinking 开关
-                    think = (_effort_to_thinking(custom_effort, bool(deepseek_thinking))
-                             if (native_think or not prompt_think) else False)
+                    think = _effort_to_thinking(custom_effort, bool(deepseek_thinking))
                     # 内置纯 Python 网关：图片上传 + DeepSeek 补全（进程内）
                     text_out = _cloud_caption(provider, pil, rule, up_all, thinking=think)
                 else:
@@ -1890,16 +1870,7 @@ class ReverseLayoutCaption:
             # 有的 OpenAI 兼容端点把 message.content 返回成 parts 数组
             # （[{"type": "text", "text": "…"}]），一路传到 check_layout 会炸成
             # AttributeError: 'list' object has no attribute 'strip'，这里统一收成字符串。
-            from .reverse_cloud.providers import strip_thinking as _strip_think
-            _raw_think = text_out
-            text_out = _strip_think(text_out)
-            if text_out != _raw_think:
-                print("[AssembledRecipes] 思考块 %d 字已剥离（正文 %d 字）"
-                      % (len(_raw_think) - len(text_out), len(text_out)), flush=True)
-            elif prompt_think:
-                # 模型没照做也不拦（拦了就出不了图），但要如实播报，别让人以为思考真跑了
-                print("[AssembledRecipes] 模型这次没写思考块，正文直接是 JSON"
-                      "（提示词思考是软约束，不保证所有模型都遵守）", flush=True)
+            text_out = coerce_text(text_out)
             # 格式不对就直接停，不要把一堆废话交给下游清洗节点静默变空布局：
             # 旧行为是“云端喷了非 JSON / 被截断 → 清洗保留 0 框 → 整条链路当没反推继续出图”，
             # 看上去 success，实际白跑一张。
@@ -1911,14 +1882,11 @@ class ReverseLayoutCaption:
                 provider=provider,
                 thinking=(think if provider_ds else None),
                 effort=(custom_effort or None),
-                think_mode=(_think_mode or None),
                 stream=(None if provider_ds else bool(custom_stream)),
                 endpoint=(None if provider_ds else str(endpoint or "")),
             )
             if problem:
-                # 落盘与报错都用剥离思考块之前的原文：模型可能在思考块里就写了拒绝理由，
-                # 剥掉就看不见了（这是判「拒答 vs 没写好」的关键证据）
-                dump = _dump_cloud_failure(provider, prov, _raw_think, time.time() - t0, problem)
+                dump = _dump_cloud_failure(provider, prov, text_out, time.time() - t0, problem)
                 kind, human = classify_failure(text_out)
                 if kind == "refusal":
                     # 拒答和「格式不合格」不是一回事：一个是模型不肯干，一个是模型没写好。
@@ -1941,8 +1909,8 @@ class ReverseLayoutCaption:
                         "  ② 换端点或换模型（当前 %s）；\n"
                         "  ③ 换一张图。\n"
                         "%s\n（完整原文已落盘：%s）"
-                        % (provider, human, time.time() - t0, len(_raw_think or ""),
-                           (_raw_think or "")[:300].replace(chr(10), " "),
+                        % (provider, human, time.time() - t0, len(text_out or ""),
+                           (text_out or "")[:200].replace(chr(10), " "),
                            str(endpoint or provider), prov, dump))
                 raise RuntimeError(
                     "云端反推[%s] 格式不合格，已停止链路：%s\n"
@@ -2237,8 +2205,7 @@ class ReverseLayoutCaption:
         # 本地路也一致：一个 JSON 数组都抠不出来 = 模型说胡话，直接停，
         # 呮不得“清洗保留 0 框 → 当没反推继续出图”这种静默降级（截断但能抠出框的仍旧交给清洗修）
         try:
-            from .reverse_cloud.providers import (check_layout as _cl, prompt_provenance as _pp,
-                                                  strip_thinking as _strip_think)
+            from .reverse_cloud.providers import check_layout as _cl, prompt_provenance as _pp
         except ImportError:
             import importlib as _il, sys as _sys
             _pd2 = os.path.dirname(os.path.abspath(__file__))
@@ -2246,16 +2213,8 @@ class ReverseLayoutCaption:
                 _sys.path.insert(0, _pd2)
             _pv2 = _il.import_module("reverse_cloud.providers")
             _cl, _pp = _pv2.check_layout, _pv2.prompt_provenance
-            _strip_think = _pv2.strip_thinking
         local_prov = _pp(rule, up, provider="本地模型", model=model_name,
-                        quant=quant, max_new_tokens=int(max_new_tokens), tag_mode=tag_mode,
-                        think_mode=(_think_mode or None))
-        # 本地模型也会照着规则写 <thinking>（LFM3 本来就是先想再答），解析前统一剥掉
-        _raw_think = text_out
-        text_out = _strip_think(text_out)
-        if text_out != _raw_think:
-            print("[AssembledRecipes] 思考块 %d 字已剥离（正文 %d 字）"
-                  % (len(_raw_think) - len(text_out), len(text_out)), flush=True)
+                        quant=quant, max_new_tokens=int(max_new_tokens), tag_mode=tag_mode)
         _b, _prob, _note = _cl(text_out)
         if _note:
             # 救回来了就必须把正文换成补好外壳的数组——只打日志不改 text_out 的话，
