@@ -31,7 +31,16 @@ def models_root() -> str:
         import folder_paths
         return os.path.join(folder_paths.models_dir, "wd14")
     except Exception:
-        return ""
+        pass
+    # 不在 ComfyUI 进程里（例如写训练集打标脚本）时按插件位置回推：
+    # <ComfyUI>/custom_nodes/<插件>/reverse_cloud/tagger.py → <ComfyUI>/models/wd14
+    here = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        here = os.path.dirname(here)
+        cand = os.path.join(here, "models", "wd14")
+        if os.path.isdir(cand):
+            return cand
+    return ""
 
 
 def list_taggers() -> list:
