@@ -1924,7 +1924,7 @@ class ReverseLayoutCaption:
                            str(endpoint or provider), prov, dump))
                 raise RuntimeError(
                     "云端反推[%s] 格式不合格，已停止链路：%s\n"
-                    "用时 %.1fs，输出 %d 字，结尾片段：%r\n%s\n"
+                    "用时 %.1fs，输出 %d 字，结尾片段：%s\n%s\n"
                     "模型原文开头：%s\n"
                     "（完整原文已落盘：%s）"
                     % (provider, problem, time.time() - t0, len(text_out or ""),
@@ -2235,8 +2235,8 @@ class ReverseLayoutCaption:
             dump = _dump_cloud_failure("本地模型[%s]" % model_name, local_prov, text_out,
                                        time.time() - t0, _prob)
             raise RuntimeError(
-                "本地反推[%s] 格式不合格，已停止链路：%s" + chr(92) + "n%s" + chr(92) + "n"
-                "模型原文开头：%s" + chr(92) + "n（完整原文已落盘：%s）"
+                ("本地反推[%s] 格式不合格，已停止链路：%s\n%s\n"
+                 "模型原文开头：%s\n（完整原文已落盘：%s）")
                 % (model_name, _prob, local_prov,
                    (text_out or "")[:300].replace(chr(10), " "), dump))
         return (text_out, local_prov)
@@ -2276,6 +2276,145 @@ class BlankToNone:
             return (s,)
         return (None,)
 
+
+class TaggerTriple:
+    """本地打标三件套：短提示词 Tags / 一句话长描述 / 反推布局 JSON，写进同一份文件。
+
+    为什么在本机跑：训练数据打标，模型词表都在本地（models/wd14/<model_id>），
+    ONNX Runtime CPU 推理 2~3 秒一张，不占显存、不联网、不经过任何在线审查层。
+    长描述与布局 JSON 来自反推节点（把它的 text 输出接到 layout_text）；
+    这个节点不重复跑 VLM——反推已经做过一遍，再跑一次纯属浪费。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        try:
+            from .reverse_cloud import tagger as _tg
+        except ImportError:
+            import importlib as _il, sys as _sys, os as _os
+            _pd = _os.path.dirname(_os.path.abspath(__file__))
+            if _pd not in _sys.path:
+                _sys.path.insert(0, _pd)
+            _tg = _il.import_module("reverse_cloud.tagger")
+        return {"required": {
+            "image": ("IMAGE", {"tooltip": "要打标的图"}),
+            "tagger": (_tg.list_taggers(),
+                       {"tooltip": "models/wd14 下的本地 ONNX 打标模型（WD14 系）"}),
+            "th_general": ("FLOAT", {"default": 0.35, "min": 0.01, "max": 0.99, "step": 0.01,
+                                     "tooltip": "通用标签阈值（外观/场景/动作）"}),
+            "th_character": ("FLOAT", {"default": 0.85, "min": 0.01, "max": 0.99, "step": 0.01,
+                                       "tooltip": "角色标签阈值（比通用高很多：角色名认错会把整张图带偏）"}),
+            "trigger_word": ("STRING", {"default": "@YUAN",
+                                        "tooltip": "触发词，永远排在最前（Anima 约定：@画师/触发词放最前）"}),
+            "layout_text": ("STRING", {"multiline": True, "default": "",
+                                       "tooltip": "接反推节点的 text 输出（布局 JSON）。右键盘一下可改成输入口。"
+                                                  "不接也能跑，只是长描述与第三段会是空的"}),
+            "max_tags": ("INT", {"default": 0, "min": 0, "max": 500, "step": 1,
+                                 "tooltip": "最多保留几个 tag，0=不限"}),
+            "write_file": ("BOOLEAN", {"default": True, "tooltip": "把三段写成一份 .txt"}),
+            "out_dir": ("STRING", {"default": "",
+                                   "tooltip": "落盘目录，留空= output/打标/；相对路径按 ComfyUI 输出目录算"}),
+            "file_prefix": ("STRING", {"default": "",
+                                       "tooltip": "文件名前缀（留空则用图片内容 sha1 前 12 位）"}),
+            "skip_existing": ("BOOLEAN", {"default": True,
+                                          "tooltip": "目标 .txt 已存在就跳过（批量重跑时不覆盖已人工改过的 caption）"}),
+        }}
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("tags", "caption", "layout", "file")
+    FUNCTION = "run"
+    CATEGORY = "AssembledRecipes"
+    DESCRIPTION = ("本地 WD14 ONNX 打标：输出 ①短提示词 Tags（触发词在最前）②一句话自然语言长描述 "
+                   "③反推布局 JSON，并写进同一份 .txt（三行）。  "
+                   "—— github.com/ztztfdsf/ComfyUI-AssembledRecipes")
+
+    def run(self, image, tagger, th_general=0.35, th_character=0.85, trigger_word="@YUAN",
+            layout_text="", max_tags=0, write_file=True, out_dir="", file_prefix="",
+            skip_existing=True):
+        import hashlib
+        import os
+        import time
+
+        import numpy as np
+        from PIL import Image
+
+        try:
+            from .reverse_cloud import tagger as TG
+        except ImportError:
+            import importlib as _il, sys as _sys
+            _pd = os.path.dirname(os.path.abspath(__file__))
+            if _pd not in _sys.path:
+                _sys.path.insert(0, _pd)
+            TG = _il.import_module("reverse_cloud.tagger")
+
+        # IMAGE 张量 → PIL 列表。批量进来就逐张打标、逐张落盘（一张一个 .txt），
+        # 全部返回第一张的三段，file 输出给出全部路径（换行分隔）。
+        arr = image
+        try:
+            if hasattr(arr, "detach"):
+                arr = arr.detach().cpu().numpy()
+            arr = np.asarray(arr)
+        except Exception:
+            pass
+        if arr.ndim == 3:
+            arr = arr[None, ...]
+        frames = []
+        for k in range(arr.shape[0]):
+            a8 = (np.clip(arr[k], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+            frames.append(a8)
+        tiles = [Image.fromarray(a8).convert("RGB") for a8 in frames]
+
+        t0 = time.time()
+        per = []
+        for k, pil in enumerate(tiles):
+            tags = TG.tag_image(pil, tagger, th_general=float(th_general),
+                                th_character=float(th_character), max_tags=int(max_tags))
+            line = TG.compose_tags(tags, trigger_word)
+            per.append(line)
+            print("[AssembledRecipes] 打标[%s] 第%d/%d 张 %.1fs，%d 个 tag：%s"
+                  % (tagger, k + 1, len(tiles), time.time() - t0, len(tags), line[:140]),
+                  flush=True)
+        tags_line = per[0]
+
+        layout_line = (layout_text or "").strip()
+        summary = TG.caption_from_layout(layout_line) if layout_line else ""
+        nl_line = TG.one_sentence(summary)
+        if layout_line and not nl_line:
+            print("[AssembledRecipes] 布局 JSON 里没取到 summary，长描述留空", flush=True)
+
+        path = ""
+        if write_file:
+            d = (out_dir or "").strip()
+            if not d:
+                try:
+                    import folder_paths
+                    d = os.path.join(folder_paths.get_output_directory(), "打标")
+                except Exception:
+                    d = os.path.join(os.getcwd(), "打标")
+            elif not os.path.isabs(d):
+                try:
+                    import folder_paths
+                    d = os.path.join(folder_paths.get_output_directory(), d)
+                except Exception:
+                    d = os.path.abspath(d)
+            paths = []
+            for k, a8 in enumerate(frames):
+                stem = (file_prefix or "").strip() or hashlib.sha1(
+                    np.ascontiguousarray(a8).tobytes()).hexdigest()[:12]
+                if len(frames) > 1:
+                    stem = "%s_%03d" % (stem, k + 1)
+                fp = os.path.join(d, stem + ".txt")
+                if skip_existing and os.path.isfile(fp):
+                    print("[AssembledRecipes] 已有 caption，跳过：%s" % fp, flush=True)
+                    paths.append(fp)
+                    continue
+                paths.append(TG.write_caption_file(fp, per[k], nl_line, layout_line))
+            path = chr(10).join(paths)
+            print("[AssembledRecipes] 三件套已落盘 %d 份：%s" % (len(paths), path), flush=True)
+
+        return (tags_line, nl_line, layout_line, path)
+
+
 NODE_CLASS_MAPPINGS = {
     "StreamToggle (AssembledRecipes)": StreamToggle,
     "DeepClean (AssembledRecipes)": DeepClean,
@@ -2284,6 +2423,7 @@ NODE_CLASS_MAPPINGS = {
     "ReverseJsonSanitize (AssembledRecipes)": ReverseJsonSanitize,
     "ReverseLayoutCaption (AssembledRecipes)": ReverseLayoutCaption,
     "BlankToNone (AssembledRecipes)": BlankToNone,
+    "TaggerTriple (AssembledRecipes)": TaggerTriple,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "StreamToggle (AssembledRecipes)": "逐层流水开关",
@@ -2293,6 +2433,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ReverseJsonSanitize (AssembledRecipes)": "反推JSON清洗",
     "ReverseLayoutCaption (AssembledRecipes)": "布局反推",
     "BlankToNone (AssembledRecipes)": "配方·空串转无",
+    "TaggerTriple (AssembledRecipes)": "打标三件套（本地 WD14）",
 }
 
 
